@@ -2,6 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+This file is for working **on** the build server. For putting a *new project* onto it
+(create → trigger → deploy → expose), see [docs/adding-a-project.md](docs/adding-a-project.md).
+
 ## What this is
 
 A self-hosted CI/CD server (Go + SQLite + Docker, no external dependencies beyond the
