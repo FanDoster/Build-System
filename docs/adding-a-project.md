@@ -325,15 +325,14 @@ the box, not just yours.
 Put a personal access token in `clone_token`. It is injected as the userinfo component
 of the clone URL for both the clone and the poller's `git ls-remote` probe.
 
-> **⚠ Known broken on modern git.** The code in this repo produces
-> `https://<token>@github.com/...` — username only. Git 2.45 and later require **both**
-> a username and a password for HTTP Basic auth, and fail with
-> `could not read Password for 'https://***@github.com'` (with `GIT_TERMINAL_PROMPT=0`
-> it cannot even prompt). The working form is `https://<token>:<token>@github.com/...`,
-> i.e. `url.UserPassword(token, token)` in `injectToken`. That fix was applied on the
-> server at some point but, like the email code, was never committed — and
-> `TestInjectToken` in this repo currently *asserts the broken form*, so it will need
-> updating alongside. Until then, expect private-repo clones to fail.
+The injected URL is `https://<token>:<token>@github.com/...` — the token in **both**
+positions. That is not redundancy: git 2.45 and later require a username *and* a
+password for HTTP Basic auth, and a username-only URL makes git prompt, which with
+`GIT_TERMINAL_PROMPT=0` fails as `could not read Password for 'https://***@github.com'`.
+GitHub accepts a PAT in either position, so this needs no per-forge username. Don't
+"simplify" it back.
+
+Use a fine-grained PAT with read access to the specific repo; `gh auth token` prints one.
 
 Tokens are **scrubbed from stored logs** — both the raw and percent-encoded forms are
 masked, in complete lines, so a token cannot be split across a flush and survive. This

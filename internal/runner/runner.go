@@ -443,12 +443,22 @@ func ScrubSecret(s, secret string) string { return scrubSecret(s, secret) }
 
 // injectToken adds a credential to an HTTP(S) clone URL, percent-encoding it
 // so tokens containing special characters survive.
+//
+// Both halves are the token deliberately. Git 2.45 and later require a
+// username AND a password for HTTP Basic auth: a username-only URL makes git
+// prompt for the password, and with GIT_TERMINAL_PROMPT=0 that surfaces as
+//
+//	fatal: could not read Password for 'https://***@github.com': terminal prompts disabled
+//
+// GitHub accepts a PAT in either position, so token:token authenticates
+// without needing a per-forge username. Do not "simplify" this back to
+// url.User.
 func injectToken(rawURL, token string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
 		return rawURL
 	}
-	u.User = url.User(token)
+	u.User = url.UserPassword(token, token)
 	return u.String()
 }
 

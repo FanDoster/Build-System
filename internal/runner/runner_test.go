@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -9,15 +10,34 @@ func TestInjectToken(t *testing.T) {
 	cases := []struct {
 		url, token, want string
 	}{
-		{"https://github.com/u/repo.git", "abc123", "https://abc123@github.com/u/repo.git"},
+		// token:token, not token@ — git >= 2.45 rejects username-only Basic
+		// auth and prompts for a password, which GIT_TERMINAL_PROMPT=0 turns
+		// into "could not read Password".
+		{"https://github.com/u/repo.git", "abc123", "https://abc123:abc123@github.com/u/repo.git"},
 		// Special characters must be percent-encoded so the URL stays valid.
-		{"https://github.com/u/repo.git", "a:b@c/d", "https://a%3Ab%40c%2Fd@github.com/u/repo.git"},
+		{"https://github.com/u/repo.git", "a:b@c/d", "https://a%3Ab%40c%2Fd:a%3Ab%40c%2Fd@github.com/u/repo.git"},
 		// Non-HTTP(S) URLs are left untouched.
 		{"git@github.com:u/repo.git", "abc123", "git@github.com:u/repo.git"},
 	}
 	for _, c := range cases {
 		if got := injectToken(c.url, c.token); got != c.want {
 			t.Errorf("injectToken(%q, %q) = %q, want %q", c.url, c.token, got, c.want)
+		}
+	}
+}
+
+// A token now appears twice in a clone URL; scrubbing has to catch both
+// halves, in raw and percent-encoded form, or a failed clone leaks it into a
+// stored log.
+func TestScrubSecretMasksInjectedURL(t *testing.T) {
+	for _, token := range []string{"ghp_abc123", "a:b@c/d"} {
+		injected := injectToken("https://github.com/u/repo.git", token)
+		out := scrubSecret("fatal: unable to access '"+injected+"': 403", token)
+		if strings.Contains(out, token) {
+			t.Errorf("raw token leaked for %q: %s", token, out)
+		}
+		if enc := url.User(token).String(); enc != token && strings.Contains(out, enc) {
+			t.Errorf("encoded token leaked for %q: %s", token, out)
 		}
 	}
 }
