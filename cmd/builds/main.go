@@ -119,6 +119,13 @@ func recoverOrphanedBuilds(database *db.DB, buildCh chan *models.Build) {
 	if n, err := database.RepairInterruptedDurations(); err == nil && n > 0 {
 		log.Printf("Recovery: cleared bogus finish times on %d interrupted builds", n)
 	}
+	// Sweep builds left behind by project deletes that never cascaded (the
+	// foreign-key pragma was silently off). Harmless once the cascade works.
+	if n, err := database.DeleteOrphanedBuilds(); err != nil {
+		log.Printf("Recovery: failed to delete orphaned builds: %v", err)
+	} else if n > 0 {
+		log.Printf("Recovery: deleted %d orphaned builds (project no longer exists)", n)
+	}
 
 	pending, err := database.ListBuildsByStatus(models.StatusPending)
 	if err != nil {

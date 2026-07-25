@@ -22,7 +22,12 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 
-	conn, err := sql.Open("sqlite", path+"?_journal_mode=WAL&_foreign_keys=on")
+	// PRAGMA syntax is driver-specific: modernc.org/sqlite reads `_pragma=name(value)`
+	// and SILENTLY IGNORES unknown query params (the mattn/go-sqlite3 spelling
+	// `_journal_mode=WAL&_foreign_keys=on` left this DB on journal=delete with
+	// foreign keys OFF, so ON DELETE CASCADE never fired). Verify with
+	// TestPragmasApplied if this string is ever touched.
+	conn, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -417,6 +422,21 @@ func (d *DB) RepairInterruptedDurations() (int64, error) {
 		 WHERE status=? AND finished_at IS NOT NULL
 		   AND log LIKE '%[ERROR] Build interrupted by server restart%'`,
 		models.StatusFailed,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// DeleteOrphanedBuilds removes build rows whose project no longer exists.
+// They accumulated while the foreign-key pragma was silently off, so
+// DELETE FROM projects never cascaded. Every read path JOINs projects, which
+// made these rows invisible in the UI while they kept their logs on disk.
+// Idempotent, and a no-op once the cascade is doing its job.
+func (d *DB) DeleteOrphanedBuilds() (int64, error) {
+	res, err := d.conn.Exec(
+		`DELETE FROM builds WHERE project_id NOT IN (SELECT id FROM projects)`,
 	)
 	if err != nil {
 		return 0, err

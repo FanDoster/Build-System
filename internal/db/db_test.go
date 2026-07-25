@@ -154,6 +154,87 @@ func TestDeleteProjectCascadesBuilds(t *testing.T) {
 	if _, err := d.GetBuild(b.ID); err == nil {
 		t.Error("build survived project deletion (ON DELETE CASCADE not effective)")
 	}
+	// GetBuild JOINs projects, so an orphaned row reads as deleted whether or
+	// not the cascade fired. Count the raw row to actually test the cascade.
+	var n int
+	if err := d.conn.QueryRow(`SELECT COUNT(*) FROM builds WHERE id = ?`, b.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Error("orphaned build row left behind: ON DELETE CASCADE did not fire")
+	}
+}
+
+// TestPragmasApplied guards the connection DSN. The pragma spelling is
+// driver-specific and modernc.org/sqlite ignores unrecognized params without
+// error, so a wrong DSN degrades silently rather than failing to open.
+func TestPragmasApplied(t *testing.T) {
+	d := openTestDB(t)
+
+	var journal string
+	if err := d.conn.QueryRow(`PRAGMA journal_mode`).Scan(&journal); err != nil {
+		t.Fatal(err)
+	}
+	if journal != "wal" {
+		t.Errorf("journal_mode = %q, want %q", journal, "wal")
+	}
+
+	var fk int
+	if err := d.conn.QueryRow(`PRAGMA foreign_keys`).Scan(&fk); err != nil {
+		t.Fatal(err)
+	}
+	if fk != 1 {
+		t.Errorf("foreign_keys = %d, want 1 (ON DELETE CASCADE depends on it)", fk)
+	}
+
+	var busy int
+	if err := d.conn.QueryRow(`PRAGMA busy_timeout`).Scan(&busy); err != nil {
+		t.Fatal(err)
+	}
+	if busy == 0 {
+		t.Error("busy_timeout = 0, want a nonzero timeout")
+	}
+}
+
+func TestDeleteOrphanedBuilds(t *testing.T) {
+	d := openTestDB(t)
+	p := newProject(t, d)
+
+	keep := &models.Build{ProjectID: p.ID, Status: models.StatusSuccess}
+	if err := d.CreateBuild(keep); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a row stranded by a project delete from before the foreign-key
+	// pragma worked. The constraint now rejects such an insert, so drop it for
+	// the setup only — this is exactly the state the sweep exists to clean up.
+	if _, err := d.conn.Exec(`PRAGMA foreign_keys=off`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.conn.Exec(
+		`INSERT INTO builds (project_id, status, log) VALUES (?, ?, ?)`,
+		p.ID+999, models.StatusSuccess, "stale log",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.conn.Exec(`PRAGMA foreign_keys=on`); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := d.DeleteOrphanedBuilds()
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("deleted %d rows, want 1", n)
+	}
+	if _, err := d.GetBuild(keep.ID); err != nil {
+		t.Errorf("live build was swept: %v", err)
+	}
+
+	// Idempotent: a second pass has nothing left to do.
+	if n, err := d.DeleteOrphanedBuilds(); err != nil || n != 0 {
+		t.Errorf("second sweep: n=%d err=%v, want 0/nil", n, err)
+	}
 }
 
 func TestFailStaleRunningPreservesUnknownFinishTime(t *testing.T) {
