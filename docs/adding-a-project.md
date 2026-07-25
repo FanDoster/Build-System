@@ -323,8 +323,17 @@ the box, not just yours.
 ## Private repositories
 
 Put a personal access token in `clone_token`. It is injected as the userinfo component
-of the clone URL (`https://<token>@github.com/...`) for both the clone and the poller's
-`git ls-remote` probe.
+of the clone URL for both the clone and the poller's `git ls-remote` probe.
+
+> **⚠ Known broken on modern git.** The code in this repo produces
+> `https://<token>@github.com/...` — username only. Git 2.45 and later require **both**
+> a username and a password for HTTP Basic auth, and fail with
+> `could not read Password for 'https://***@github.com'` (with `GIT_TERMINAL_PROMPT=0`
+> it cannot even prompt). The working form is `https://<token>:<token>@github.com/...`,
+> i.e. `url.UserPassword(token, token)` in `injectToken`. That fix was applied on the
+> server at some point but, like the email code, was never committed — and
+> `TestInjectToken` in this repo currently *asserts the broken form*, so it will need
+> updating alongside. Until then, expect private-repo clones to fail.
 
 Tokens are **scrubbed from stored logs** — both the raw and percent-encoded forms are
 masked, in complete lines, so a token cannot be split across a flush and survive. This
@@ -385,10 +394,49 @@ for a deploy failure → `docker logs builds` for the build server itself.
   which makes Watchtower recreate the build server, which interrupts whatever ran next.
   In-flight builds are re-queued rather than lost, but expect the interruption.
 - **Deleting a project deletes its builds** (cascade). There's no undo.
-- **`BUILDS_NOTIFY_EMAIL` in `/opt/docker/builds/docker-compose.yml` does nothing** —
-  no code reads it. Don't copy it into a new service expecting notifications.
 - **The registry needs auth.** Anonymous `GET registry.fandoster.com/v2/` returning 401
   is normal, not a fault.
+- **Build-completion emails are currently not being sent** — see below. Don't promise
+  them to anyone until the code is back in the repo.
+
+---
+
+## Email notifications (currently missing from the code)
+
+`/opt/docker/builds/docker-compose.yml` sets `BUILDS_NOTIFY_EMAIL=danfoster@fandoster.com`,
+and build-completion emails genuinely used to work — the host's Postfix log shows
+successful deliveries from `builds@fandoster.com` as recently as **2026-07-25 13:35 UTC**:
+
+```
+Subject: [builds] windows-fpl ✔ SUCCEEDED (52s)
+```
+
+**But that code is not in this repository and never has been.** `sendNotification()` and
+the `Runner.NotifyEmail` field existed only in the working copy on the server; no commit
+on any branch has ever contained them (`git log --all -S sendNotification` is empty). A
+deploy does `git reset --hard origin/main`, so the next one overwrote the binary with a
+build that has no mail code in it. Nothing has been sent since.
+
+**Do not "clean up" the env var.** It is the last pointer to the feature. The
+surrounding infrastructure is all still in place and working:
+
+- Postfix on the host, listening on `127.0.0.1:25` and `172.17.0.1:25`, with
+  `mynetworks` including the Docker bridge ranges `172.17.0.0/16` and `172.18.0.0/16`
+- a UFW rule allowing the bridge interface to reach port 25
+- an SPF record in Route53 authorising the box: `ip4:172.239.117.248`
+
+So restoring it is a code change only. Two constraints, both learned painfully and
+recorded in the Hermes `server-email-notifications` skill on the server:
+
+- **Use `net.Dialer` + `smtp.NewClient`, not `smtp.SendMail`.** The stdlib helper
+  negotiates STARTTLS whenever the server advertises it, and Postfix here offers a
+  self-signed certificate that Go rejects. Plain TCP to `172.17.0.1:25` is accepted
+  because the bridge subnets are in `mynetworks`.
+- **Send from `builds@fandoster.com`** and let Postfix relay via the Google Workspace
+  MX; the SPF record is what stops it being classed as unsolicited.
+
+Same story for one other fix — see the clone-token warning under
+[Private repositories](#private-repositories).
 
 ---
 
