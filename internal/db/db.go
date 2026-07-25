@@ -415,6 +415,16 @@ func scanBuildSummary(s scanner) (*models.Build, error) {
 	return b, nil
 }
 
+// GetBuildSummary is GetBuild with Log left empty — for callers that want the
+// row's metadata (project name, commit, timestamps) and would otherwise pull a
+// whole build log into memory to read three fields off it.
+func (d *DB) GetBuildSummary(id int64) (*models.Build, error) {
+	return scanBuildSummary(d.conn.QueryRow(
+		`SELECT `+buildSummaryCols+`
+		 FROM builds b JOIN projects p ON p.id = b.project_id
+		 WHERE b.id = ?`, id))
+}
+
 // ListRecentBuildSummaries is ListRecentBuilds with Log left empty.
 func (d *DB) ListRecentBuildSummaries(limit int) ([]models.Build, error) {
 	if limit <= 0 {

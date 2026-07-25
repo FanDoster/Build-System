@@ -396,47 +396,53 @@ for a deploy failure → `docker logs builds` for the build server itself.
 - **Deleting a project deletes its builds** (cascade). There's no undo.
 - **The registry needs auth.** Anonymous `GET registry.fandoster.com/v2/` returning 401
   is normal, not a fault.
-- **Build-completion emails are currently not being sent** — see below. Don't promise
-  them to anyone until the code is back in the repo.
-
 ---
 
-## Email notifications (currently missing from the code)
+## Email notifications
 
-`/opt/docker/builds/docker-compose.yml` sets `BUILDS_NOTIFY_EMAIL=danfoster@fandoster.com`,
-and build-completion emails genuinely used to work — the host's Postfix log shows
-successful deliveries from `builds@fandoster.com` as recently as **2026-07-25 13:35 UTC**:
+Every build that finishes — succeeded, failed or canceled — emails the address in
+`BUILDS_NOTIFY_EMAIL`. You get this for free on a new project; there is nothing
+per-project to configure.
 
 ```
-Subject: [builds] windows-fpl ✔ SUCCEEDED (52s)
+Subject: [builds] my-app ✔ SUCCEEDED (52s)
+
+Project:  my-app
+Status:   SUCCEEDED
+Commit:   1bfe15b9 — Polled: new commit on main
+Duration: 52s
+View:     https://fandoster.com/builds/builds/65
 ```
 
-**But that code is not in this repository and never has been.** `sendNotification()` and
-the `Runner.NotifyEmail` field existed only in the working copy on the server; no commit
-on any branch has ever contained them (`git log --all -S sendNotification` is empty). A
-deploy does `git reset --hard origin/main`, so the next one overwrote the binary with a
-build that has no mail code in it. Nothing has been sent since.
+Delivery is the pipeline already running on the box, not a third-party service: the
+container connects to the host's **Postfix** over the Docker bridge (`172.17.0.1:25`),
+which relays to the Google Workspace MX for `fandoster.com`. The parts that make it work
+live outside this repo — `mynetworks` covering the bridge ranges `172.17.0.0/16` and
+`172.18.0.0/16`, a UFW rule opening port 25 on the bridge, and an SPF record authorising
+`ip4:172.239.117.248`. Break any of those and mail stops with no code change.
 
-**Do not "clean up" the env var.** It is the last pointer to the feature. The
-surrounding infrastructure is all still in place and working:
+Two settings in `/opt/docker/builds/docker-compose.yml` control it:
 
-- Postfix on the host, listening on `127.0.0.1:25` and `172.17.0.1:25`, with
-  `mynetworks` including the Docker bridge ranges `172.17.0.0/16` and `172.18.0.0/16`
-- a UFW rule allowing the bridge interface to reach port 25
-- an SPF record in Route53 authorising the box: `ip4:172.239.117.248`
+| Variable | Effect |
+| --- | --- |
+| `BUILDS_NOTIFY_EMAIL` | Recipient. **Unset or empty disables all notifications.** |
+| `BUILDS_PUBLIC_URL` | Base URL for the `View:` link, e.g. `https://fandoster.com/builds`. Unset just omits the line — the server has no way to know its own external address. |
 
-So restoring it is a code change only. Two constraints, both learned painfully and
-recorded in the Hermes `server-email-notifications` skill on the server:
+Two failure modes worth recognising, because neither is visible from the build itself
+(mail is fire-and-forget, so a broken relay never fails a build):
 
-- **Use `net.Dialer` + `smtp.NewClient`, not `smtp.SendMail`.** The stdlib helper
-  negotiates STARTTLS whenever the server advertises it, and Postfix here offers a
-  self-signed certificate that Go rejects. Plain TCP to `172.17.0.1:25` is accepted
-  because the bridge subnets are in `mynetworks`.
-- **Send from `builds@fandoster.com`** and let Postfix relay via the Google Workspace
-  MX; the SPF record is what stops it being classed as unsolicited.
+- **Nothing arrives at all.** Check `docker logs builds | grep notify` for the error,
+  then `/var/log/mail.log` on the host. `connect from unknown[172.18.0.x]` followed by a
+  TLS complaint means something reintroduced `smtp.SendMail`, which negotiates STARTTLS
+  against Postfix's self-signed cert.
+- **Mail is accepted but lands in spam**, usually because the SPF record changed or the
+  sender was moved off `builds@fandoster.com`.
 
-Same story for one other fix — see the clone-token warning under
-[Private repositories](#private-repositories).
+> **History, so it doesn't repeat.** This feature was written directly on the server and
+> never committed. A deploy runs `git reset --hard origin/main`, so it was silently
+> erased and mail stopped for several hours before anyone noticed. It has since been
+> reimplemented in `internal/runner/notify.go` with tests. **If you fix something on the
+> box, commit it** — nothing on the server will warn you.
 
 ---
 

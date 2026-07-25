@@ -39,6 +39,19 @@ type Runner struct {
 	Bus     *logbus.Bus
 	Timeout time.Duration
 
+	// NotifyEmail receives build-completion mail (BUILDS_NOTIFY_EMAIL).
+	// Empty disables notifications entirely. See notify.go for the transport
+	// and the server-side setup it depends on.
+	NotifyEmail string
+	// PublicURL is the externally reachable base of this server, e.g.
+	// "https://fandoster.com/builds", used for the link in that mail. The
+	// server cannot infer it — it only ever sees proxied requests — so when it
+	// is unset the mail simply carries no link.
+	PublicURL string
+	// SMTPAddr overrides the relay. Exposed for tests; production uses the
+	// host's Postfix over the Docker bridge.
+	SMTPAddr string
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -60,6 +73,7 @@ func New(database *db.DB, jobs <-chan *models.Build, bus *logbus.Bus) *Runner {
 		Jobs:            jobs,
 		Bus:             bus,
 		Timeout:         DefaultBuildTimeout,
+		SMTPAddr:        defaultSMTPAddr,
 		JanitorInterval: 30 * time.Second,
 		ctx:             ctx,
 		cancel:          func() { cancel(context.Canceled) },
@@ -360,10 +374,19 @@ func (r *Runner) runBuild(ctx context.Context, build *models.Build, startedAt ti
 }
 
 // finish writes the terminal DB row and broadcasts the transition.
+//
+// This is the only place a build reaches a terminal state through the worker,
+// which makes it the right hook for notifications. Two paths deliberately do
+// not pass through here and so send no mail: a requeue after a restart (not
+// terminal — the build is coming back), and the janitor's stale sweep (the
+// build server was not running when that build died).
 func (r *Runner) finish(buildID int64, status models.BuildStatus, startedAt time.Time) {
 	r.DB.FinishBuild(buildID, status)
 	finishedAt := time.Now().UTC()
 	r.Bus.PublishStatus(buildID, status, &startedAt, &finishedAt)
+	// Fire and forget: mail must never delay the worker picking up the next
+	// build, and a dead relay must never turn a green build red.
+	go r.notify(buildID, status, startedAt, finishedAt)
 }
 
 // timeoutHint annotates command failures caused by cancellation, which

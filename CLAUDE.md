@@ -44,6 +44,9 @@ BUILDS_DB=/tmp/builds.db BUILDS_ADDR=:8899 go run ./cmd/builds
 | `BUILDS_BASE_PATH` | `""` | e.g. `/builds` when behind a path-stripping proxy |
 | `BUILDS_BUILD_TIMEOUT` | `30m` | Go duration |
 | `BUILDS_PASSWORD` / `BUILDS_PASSWORD_HASH` | unset | Unset **disables auth entirely** (the server logs a loud warning). Hash (bcrypt) wins when both are set. |
+| `BUILDS_NOTIFY_EMAIL` | unset | Recipient of build-completion mail. Unset disables it. |
+| `BUILDS_PUBLIC_URL` | `""` | e.g. `https://fandoster.com/builds`. Only used for the link in that mail — the server never sees its own external URL. |
+| `BUILDS_SMTP_ADDR` | `172.17.0.1:25` | The host's Postfix over the Docker bridge. Override is for tests. |
 
 ## Architecture
 
@@ -109,6 +112,32 @@ exact JSON the socket pushes.
 against `Host`/`X-Forwarded-Host`, because WebSocket has no CORS: without it any page
 on the internet could open a socket carrying the operator's cookie. A `proxy_pass` that
 leaves `Host` as the upstream address makes every browser fail that check.
+
+### Build-completion email
+
+`internal/runner/notify.go` mails the outcome of every build that reaches a terminal
+state through `finish()`. It depends on server-side setup that is **not in this repo**:
+Postfix on the host with the Docker bridge ranges in `mynetworks`, a UFW rule opening
+port 25 on the bridge, and an SPF record authorising the host's IP. Change any of those
+and mail stops with no change to this code.
+
+Two constraints are load-bearing, both learned the hard way:
+
+- **Never `smtp.SendMail`.** It negotiates STARTTLS whenever the server advertises it,
+  and this Postfix presents a self-signed certificate that Go rejects. `notify.go`
+  dials plain TCP and drives `smtp.NewClient` itself. `TestNotifySendsCompletionMail`
+  fails loudly if a STARTTLS attempt ever reappears.
+- **Send from `builds@fandoster.com`.** The SPF record covers that domain; anything
+  else gets filed as unsolicited.
+
+Mail is fire-and-forget from `finish()` — a dead relay must never turn a green build
+red, and must never delay the next build. Two paths deliberately send nothing: a
+restart requeue (not terminal) and the janitor's stale sweep (the server wasn't running
+when that build died).
+
+This feature was lost once already: it was written directly on the server, never
+committed, and the next deploy's `git reset --hard origin/main` erased it silently.
+Nothing warns you about that — if you fix something on the box, commit it.
 
 ### Things that will bite you
 

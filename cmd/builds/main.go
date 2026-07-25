@@ -52,8 +52,20 @@ func main() {
 		}
 		r.Timeout = d
 	}
+	// Build-completion email via the host's Postfix (see internal/runner/notify.go).
+	// Unset BUILDS_NOTIFY_EMAIL disables it.
+	r.NotifyEmail = os.Getenv("BUILDS_NOTIFY_EMAIL")
+	r.PublicURL = os.Getenv("BUILDS_PUBLIC_URL")
+	if v := os.Getenv("BUILDS_SMTP_ADDR"); v != "" {
+		r.SMTPAddr = v
+	}
 	r.Start()
 	log.Printf("Runner started (build timeout: %s)", r.Timeout)
+	if r.NotifyEmail != "" {
+		log.Printf("Build notifications enabled: %s via %s", r.NotifyEmail, r.SMTPAddr)
+	} else {
+		log.Println("Build notifications disabled (BUILDS_NOTIFY_EMAIL is not set)")
+	}
 
 	// Git polling: the pull-based alternative to webhooks, opted into per
 	// project in its settings. Idle unless at least one project enables it.
