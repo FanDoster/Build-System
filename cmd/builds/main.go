@@ -103,18 +103,34 @@ func main() {
 		log.Fatalf("Server failed: %v", err)
 	}
 
+	// ListenAndServe returns as soon as Shutdown closes the listener, so this
+	// runs promptly on SIGTERM — well inside docker's stop grace period.
 	// Stop the poller before the runner so no build is queued into a worker
 	// that is already shutting down.
 	pl.Stop()
-	// Cancel any in-flight build (it is marked failed with a shutdown note)
-	// and wait for the worker to exit.
+	// Cancel any in-flight build. It is handed back to the queue (not failed)
+	// and resumes after the restart; see Runner.runBuild's shutdown branch.
 	r.Stop()
 	log.Println("Shutdown complete")
 }
 
-// recoverOrphanedBuilds marks builds that were mid-flight during a previous
-// crash/restart as failed, and re-queues builds that never started.
+// recoverOrphanedBuilds puts the queue back together after a restart:
+// interrupted builds go back to pending (bounded by MaxBuildRequeues), the
+// ones out of retries are failed, and everything pending is re-queued.
 func recoverOrphanedBuilds(database *db.DB, buildCh chan *models.Build) {
+	// Builds still marked running were killed mid-flight — SIGKILL after the
+	// stop grace period, or a crash. Hand them back to the queue rather than
+	// losing the work; this is the hard-kill counterpart to the graceful
+	// requeue the runner does on SIGTERM. Rows over the requeue cap fall
+	// through to FailStaleRunning below.
+	if requeued, err := database.RequeueStaleRunning(models.MaxBuildRequeues); err != nil {
+		log.Printf("Recovery: failed to re-queue interrupted builds: %v", err)
+	} else {
+		for _, id := range requeued {
+			log.Printf("Recovery: re-queued build %d (interrupted by restart)", id)
+		}
+	}
+
 	// finished_at stays NULL for interrupted builds — the real end time is
 	// unknown, and stamping the restart time poisons history durations.
 	interrupted, err := database.FailStaleRunning(0)

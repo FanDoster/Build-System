@@ -424,3 +424,73 @@ func TestMigrationAddsNoCacheColumn(t *testing.T) {
 	}
 	d2.Close()
 }
+
+// A SIGKILL after the stop grace period leaves rows stranded as 'running' —
+// that path never gets to write anything, so recovery happens at startup.
+func TestRequeueStaleRunning(t *testing.T) {
+	d := openTestDB(t)
+	p := newProject(t, d)
+
+	newRunning := func() *models.Build {
+		b := &models.Build{ProjectID: p.ID, Status: models.StatusRunning}
+		if err := d.CreateBuild(b); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := d.conn.Exec(`UPDATE builds SET status=? WHERE id=?`, models.StatusRunning, b.ID); err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+
+	fresh := newRunning()
+	exhausted := newRunning()
+	if _, err := d.conn.Exec(`UPDATE builds SET requeues=? WHERE id=?`, models.MaxBuildRequeues, exhausted.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	requeued, err := d.RequeueStaleRunning(models.MaxBuildRequeues)
+	if err != nil {
+		t.Fatalf("requeue sweep: %v", err)
+	}
+	if len(requeued) != 1 || requeued[0] != fresh.ID {
+		t.Fatalf("requeued = %v, want just build %d", requeued, fresh.ID)
+	}
+
+	got, _ := d.GetBuild(fresh.ID)
+	if got.Status != models.StatusPending || got.Requeues != 1 {
+		t.Errorf("fresh build: status=%s requeues=%d, want pending/1", got.Status, got.Requeues)
+	}
+	if !strings.Contains(got.Log, "re-queued") {
+		t.Errorf("no restart seam in log: %q", got.Log)
+	}
+
+	// The exhausted one is left running, for FailStaleRunning to mark failed.
+	stuck, _ := d.GetBuild(exhausted.ID)
+	if stuck.Status != models.StatusRunning {
+		t.Errorf("exhausted build: status=%s, want it left for FailStaleRunning", stuck.Status)
+	}
+	if failed, err := d.FailStaleRunning(0); err != nil || len(failed) != 1 || failed[0] != exhausted.ID {
+		t.Errorf("FailStaleRunning = %v (err=%v), want just build %d", failed, err, exhausted.ID)
+	}
+}
+
+// RequeueBuild only acts on running rows: a finished build must never be
+// resurrected by a late restart.
+func TestRequeueBuildIgnoresTerminalBuilds(t *testing.T) {
+	d := openTestDB(t)
+	p := newProject(t, d)
+	b := &models.Build{ProjectID: p.ID, Status: models.StatusSuccess}
+	if err := d.CreateBuild(b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.conn.Exec(`UPDATE builds SET status=? WHERE id=?`, models.StatusSuccess, b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := d.RequeueBuild(b.ID, models.MaxBuildRequeues); err != nil || ok {
+		t.Errorf("RequeueBuild on a success = %v (err=%v), want false", ok, err)
+	}
+	got, _ := d.GetBuild(b.ID)
+	if got.Status != models.StatusSuccess {
+		t.Errorf("status = %s, want success untouched", got.Status)
+	}
+}

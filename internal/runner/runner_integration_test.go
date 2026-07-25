@@ -333,3 +333,92 @@ func firstLineContaining(log, sub string) string {
 	}
 	return "(no matching line)"
 }
+
+// A server restart must not destroy work in progress: the in-flight build
+// goes back on the queue instead of being marked failed. This is what stops a
+// Watchtower redeploy (triggered by the build server pushing its own image)
+// from killing whatever it happened to be building.
+func TestShutdownRequeuesInFlightBuild(t *testing.T) {
+	env, build := newTestEnv(t)
+	t.Setenv("DOCKER_STUB_SLEEP", "10")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		env.r.process(build)
+	}()
+	waitForStatus(t, env, build.ID, models.StatusRunning)
+
+	env.r.Stop() // SIGTERM equivalent
+	<-done
+
+	got, err := env.db.GetBuild(build.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != models.StatusPending {
+		t.Fatalf("status = %s, want pending (re-queued); log:\n%s", got.Status, got.Log)
+	}
+	if got.Requeues != 1 {
+		t.Errorf("requeues = %d, want 1", got.Requeues)
+	}
+	if got.StartedAt != nil || got.FinishedAt != nil {
+		t.Errorf("timestamps not reset for the next attempt: started=%v finished=%v", got.StartedAt, got.FinishedAt)
+	}
+	if !strings.Contains(got.Log, "re-queued") {
+		t.Errorf("log missing the restart seam; log:\n%s", got.Log)
+	}
+	if strings.Contains(got.Log, "[ERROR]") {
+		t.Errorf("re-queued build recorded an error; log:\n%s", got.Log)
+	}
+	// The seam must go through the sink, not straight to the row, or the
+	// live-log buffer and the stored log drift apart.
+	tail, _, ok := env.bus.LogTail(build.ID, 0)
+	if !ok || string(tail) != got.Log {
+		t.Errorf("bus buffer and DB log diverged (ok=%v, bus=%d bytes, db=%d bytes)", ok, len(tail), len(got.Log))
+	}
+}
+
+// The re-queue is bounded: a build that takes the server down with it every
+// time must eventually be failed rather than retried on every boot forever.
+func TestShutdownRequeueIsBounded(t *testing.T) {
+	env, build := newTestEnv(t)
+	t.Setenv("DOCKER_STUB_SLEEP", "10")
+
+	// Each iteration is a fresh process restarting and picking the build up.
+	for i := 0; i <= models.MaxBuildRequeues; i++ {
+		r := New(env.db, make(chan *models.Build), env.bus)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			r.process(build)
+		}()
+		waitForStatus(t, env, build.ID, models.StatusRunning)
+		r.Stop()
+		<-done
+	}
+
+	got, _ := env.db.GetBuild(build.ID)
+	if got.Status != models.StatusFailed {
+		t.Fatalf("status = %s after %d restarts, want failed once re-queues run out",
+			got.Status, models.MaxBuildRequeues+1)
+	}
+	if got.Requeues != models.MaxBuildRequeues {
+		t.Errorf("requeues = %d, want the cap of %d", got.Requeues, models.MaxBuildRequeues)
+	}
+	if !strings.Contains(got.Log, "no re-queues left") {
+		t.Errorf("log doesn't explain why it stopped retrying; log:\n%s", got.Log)
+	}
+}
+
+func waitForStatus(t *testing.T, env *testEnv, id int64, want models.BuildStatus) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := env.db.GetBuild(id); err == nil && b.Status == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("build %d never reached status %s", id, want)
+}

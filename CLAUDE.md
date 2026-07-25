@@ -87,6 +87,22 @@ races; read the comments before editing it.
 **Interrupted builds keep `finished_at` NULL.** Stamping the restart time fabricates
 durations and poisons the ETA estimates. Never "fix" this by filling it in.
 
+**A restart re-queues the in-flight build rather than failing it.** The build server
+pushes its own image, which makes Watchtower recreate the container, which SIGTERMs a
+server that may be mid-build — so losing work on restart is a routine event here, not an
+edge case. Two paths cover it: the runner requeues on a `context.Canceled` cause
+(graceful SIGTERM), and `recoverOrphanedBuilds` requeues rows left `running` by a hard
+kill. Both are bounded by `models.MaxBuildRequeues`, without which a build that crashes
+the server would be retried on every boot forever. The runner writes the `[restart]`
+seam **through the log sink**, never straight to the row — see the byte-mirror note
+below.
+
+**The DB log and the logbus buffer must stay byte-identical** for a live build. Anything
+appending to `builds.log` via SQL while subscribers exist has to mirror the same bytes
+onto the bus (`handleCancelBuild` does this for the cancel tombstone). This is why
+`db.RequeueBuild` does *not* write the log seam itself and `db.RequeueNote` is exported
+for callers to write at the right layer.
+
 **State-changing API endpoints require `X-Builds-Csrf: 1`.** Any curl script must send it.
 
 ### Schema migrations
@@ -194,6 +210,13 @@ docker exec builds sh -c 'curl -s -H "Authorization: Bearer $BUILDS_PASSWORD" -H
 ```
 
 ## Known gaps
+
+The build server is Watchtower-managed (`com.centurylinklabs.watchtower.enable=true` in
+`/opt/docker/builds/docker-compose.yml`), so a Build-System build that pushes `:latest`
+causes a restart that interrupts whatever runs next. Requeueing makes that survivable
+rather than lossy; it does not stop the interruption. Removing the label and having the
+server deploy itself deliberately would, at the cost of a self-restart mechanism.
+
 
 Not bugs, just unbuilt: the registry host is hardcoded in `runner.go` (should be
 `BUILDS_REGISTRY`); images are tagged `:latest` only, so there is no rollback target;

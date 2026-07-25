@@ -24,6 +24,12 @@
   <span class="commit-msg" title="{{.Build.CommitMessage}}">{{.Build.CommitMessage}}</span>
 </div>
 
+{{if .Build.Requeues}}
+<div class="meta" style="margin-bottom:12px">
+  Interrupted by a server restart and re-queued {{.Build.Requeues}}× — the log below holds every attempt, separated by <span class="mono">[restart]</span> markers.
+</div>
+{{end}}
+
 <div class="meta-grid">
   <div class="meta-cell">
     <div class="meta-label">Trigger</div>

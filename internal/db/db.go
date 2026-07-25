@@ -77,6 +77,7 @@ func (d *DB) migrate() error {
 			commit_sha TEXT NOT NULL DEFAULT '',
 			commit_message TEXT NOT NULL DEFAULT '',
 			log TEXT NOT NULL DEFAULT '',
+			requeues INTEGER NOT NULL DEFAULT 0,
 			started_at DATETIME,
 			finished_at DATETIME,
 			created_at DATETIME NOT NULL DEFAULT (datetime('now'))
@@ -102,6 +103,7 @@ func (d *DB) migrate() error {
 		{"projects", "last_polled_sha", "TEXT NOT NULL DEFAULT ''"},
 		{"projects", "last_polled_at", "DATETIME"},
 		{"projects", "last_poll_error", "TEXT NOT NULL DEFAULT ''"},
+		{"builds", "requeues", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := d.addColumnIfMissing(c.table, c.column, c.decl); err != nil {
 			return err
@@ -324,18 +326,25 @@ func (d *DB) CreateBuild(b *models.Build) error {
 	return nil
 }
 
-func (d *DB) GetBuild(id int64) (*models.Build, error) {
+// buildCols is the full read column list; scanBuild consumes it in order.
+const buildCols = `b.id, b.project_id, p.name, b.status, b.commit_sha, b.commit_message,
+	b.log, b.requeues, b.started_at, b.finished_at, b.created_at`
+
+func scanBuild(s scanner) (*models.Build, error) {
 	b := &models.Build{}
-	err := d.conn.QueryRow(
-		`SELECT b.id, b.project_id, p.name, b.status, b.commit_sha, b.commit_message, b.log, b.started_at, b.finished_at, b.created_at
-		 FROM builds b JOIN projects p ON p.id = b.project_id
-		 WHERE b.id = ?`, id,
-	).Scan(&b.ID, &b.ProjectID, &b.ProjectName, &b.Status, &b.CommitSHA, &b.CommitMessage,
-		&b.Log, &b.StartedAt, &b.FinishedAt, &b.CreatedAt)
+	err := s.Scan(&b.ID, &b.ProjectID, &b.ProjectName, &b.Status, &b.CommitSHA, &b.CommitMessage,
+		&b.Log, &b.Requeues, &b.StartedAt, &b.FinishedAt, &b.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return b, nil
+}
+
+func (d *DB) GetBuild(id int64) (*models.Build, error) {
+	return scanBuild(d.conn.QueryRow(
+		`SELECT `+buildCols+`
+		 FROM builds b JOIN projects p ON p.id = b.project_id
+		 WHERE b.id = ?`, id))
 }
 
 func (d *DB) ListBuildsByProject(projectID int64, limit int) ([]models.Build, error) {
@@ -343,7 +352,7 @@ func (d *DB) ListBuildsByProject(projectID int64, limit int) ([]models.Build, er
 		limit = 20
 	}
 	rows, err := d.conn.Query(
-		`SELECT b.id, b.project_id, p.name, b.status, b.commit_sha, b.commit_message, b.log, b.started_at, b.finished_at, b.created_at
+		`SELECT `+buildCols+`
 		 FROM builds b JOIN projects p ON p.id = b.project_id
 		 WHERE b.project_id = ?
 		 ORDER BY b.created_at DESC, b.id DESC LIMIT ?`, projectID, limit,
@@ -355,12 +364,11 @@ func (d *DB) ListBuildsByProject(projectID int64, limit int) ([]models.Build, er
 
 	var builds []models.Build
 	for rows.Next() {
-		var b models.Build
-		if err := rows.Scan(&b.ID, &b.ProjectID, &b.ProjectName, &b.Status, &b.CommitSHA, &b.CommitMessage,
-			&b.Log, &b.StartedAt, &b.FinishedAt, &b.CreatedAt); err != nil {
+		b, err := scanBuild(rows)
+		if err != nil {
 			return nil, err
 		}
-		builds = append(builds, b)
+		builds = append(builds, *b)
 	}
 	return builds, rows.Err()
 }
@@ -370,7 +378,7 @@ func (d *DB) ListRecentBuilds(limit int) ([]models.Build, error) {
 		limit = 20
 	}
 	rows, err := d.conn.Query(
-		`SELECT b.id, b.project_id, p.name, b.status, b.commit_sha, b.commit_message, b.log, b.started_at, b.finished_at, b.created_at
+		`SELECT `+buildCols+`
 		 FROM builds b JOIN projects p ON p.id = b.project_id
 		 ORDER BY b.created_at DESC, b.id DESC LIMIT ?`, limit,
 	)
@@ -381,19 +389,18 @@ func (d *DB) ListRecentBuilds(limit int) ([]models.Build, error) {
 
 	var builds []models.Build
 	for rows.Next() {
-		var b models.Build
-		if err := rows.Scan(&b.ID, &b.ProjectID, &b.ProjectName, &b.Status, &b.CommitSHA, &b.CommitMessage,
-			&b.Log, &b.StartedAt, &b.FinishedAt, &b.CreatedAt); err != nil {
+		b, err := scanBuild(rows)
+		if err != nil {
 			return nil, err
 		}
-		builds = append(builds, b)
+		builds = append(builds, *b)
 	}
 	return builds, rows.Err()
 }
 
 func (d *DB) ListBuildsByStatus(status models.BuildStatus) ([]models.Build, error) {
 	rows, err := d.conn.Query(
-		`SELECT b.id, b.project_id, p.name, b.status, b.commit_sha, b.commit_message, b.log, b.started_at, b.finished_at, b.created_at
+		`SELECT `+buildCols+`
 		 FROM builds b JOIN projects p ON p.id = b.project_id
 		 WHERE b.status = ?
 		 ORDER BY b.created_at ASC`, status,
@@ -405,12 +412,11 @@ func (d *DB) ListBuildsByStatus(status models.BuildStatus) ([]models.Build, erro
 
 	var builds []models.Build
 	for rows.Next() {
-		var b models.Build
-		if err := rows.Scan(&b.ID, &b.ProjectID, &b.ProjectName, &b.Status, &b.CommitSHA, &b.CommitMessage,
-			&b.Log, &b.StartedAt, &b.FinishedAt, &b.CreatedAt); err != nil {
+		b, err := scanBuild(rows)
+		if err != nil {
 			return nil, err
 		}
-		builds = append(builds, b)
+		builds = append(builds, *b)
 	}
 	return builds, rows.Err()
 }
@@ -496,6 +502,71 @@ func (d *DB) FailStaleRunning(exceptID int64) ([]int64, error) {
 		}
 	}
 	return failed, nil
+}
+
+// RequeueNote marks the seam in a build's log where a restart interrupted it
+// and the next attempt begins. Callers append it themselves rather than having
+// this package do it in SQL: a live build's log must stay byte-identical
+// between the DB row and the logbus buffer, so the bytes have to go through
+// the runner's sink, not around it.
+const RequeueNote = "\n[restart] Build interrupted by a server restart — re-queued\n"
+
+// RequeueBuild hands a running build back to the queue as pending, so a
+// server restart (a redeploy, typically) doesn't destroy work in progress.
+// started_at/finished_at are reset because the next attempt is the one whose
+// timings mean anything. Returns false when the build is no longer running or
+// has already used up maxRequeues, in which case the caller should fail it.
+func (d *DB) RequeueBuild(id int64, maxRequeues int) (bool, error) {
+	res, err := d.conn.Exec(
+		`UPDATE builds
+		 SET status=?, requeues=requeues+1, started_at=NULL, finished_at=NULL
+		 WHERE id=? AND status=? AND requeues < ?`,
+		models.StatusPending, id, models.StatusRunning, maxRequeues,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// RequeueStaleRunning is the startup counterpart to RequeueBuild: it recovers
+// builds a hard kill (SIGKILL after the stop grace period) left stranded as
+// running, since that path never got to write anything. Rows over the requeue
+// cap are left alone for FailStaleRunning to mark failed.
+func (d *DB) RequeueStaleRunning(maxRequeues int) ([]int64, error) {
+	rows, err := d.conn.Query(
+		`SELECT id FROM builds WHERE status=? AND requeues < ?`,
+		models.StatusRunning, maxRequeues,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	var requeued []int64
+	for _, id := range ids {
+		if ok, err := d.RequeueBuild(id, maxRequeues); err == nil && ok {
+			// Safe to write the seam straight to the row here: this runs at
+			// startup, before the runner or any subscriber exists, so there
+			// is no logbus buffer to keep in step with.
+			d.AppendBuildLog(id, RequeueNote)
+			requeued = append(requeued, id)
+		}
+	}
+	return requeued, nil
 }
 
 // RepairInterruptedDurations fixes rows swept by older code, which stamped

@@ -24,7 +24,7 @@ const maxWebhookBody = 1 << 20
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-07-25-poll-dedup"
+const Version = "2026-07-25-requeue-on-restart"
 
 // RunnerControl is the runner surface the API needs (implemented by
 // runner.Runner): canceling the in-flight build and reading its progress.

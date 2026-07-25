@@ -71,6 +71,13 @@ func (p *Project) Sanitize() {
 	p.CloneToken = ""
 }
 
+// MaxBuildRequeues bounds how many times one build may be handed back to the
+// queue after a server restart interrupted it. Without a bound, a build that
+// takes the server down with it (an OOM, say) would be retried on every boot
+// forever. Two is enough for the case this exists for — a redeploy killing an
+// in-flight build — while still converging on a real failure.
+const MaxBuildRequeues = 2
+
 type Build struct {
 	ID            int64       `json:"id"`
 	ProjectID     int64       `json:"project_id"`
@@ -79,9 +86,12 @@ type Build struct {
 	CommitSHA     string      `json:"commit_sha"`
 	CommitMessage string      `json:"commit_message"`
 	Log           string      `json:"log"`
-	StartedAt     *time.Time  `json:"started_at"`
-	FinishedAt    *time.Time  `json:"finished_at"`
-	CreatedAt     time.Time   `json:"created_at"`
+	// Requeues counts restarts this build survived. Non-zero means an earlier
+	// attempt's output is in the log above the restart marker.
+	Requeues   int        `json:"requeues,omitempty"`
+	StartedAt  *time.Time `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at"`
+	CreatedAt  time.Time  `json:"created_at"`
 
 	// Computed, never stored. Populated only for ?meta=1 and /builds/active
 	// API responses.

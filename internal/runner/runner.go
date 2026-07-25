@@ -215,14 +215,35 @@ func (r *Runner) runBuild(ctx context.Context, build *models.Build, startedAt ti
 		r.setStep(id)
 		logStep("##[step:" + id + "] " + detail)
 	}
-	// fail terminates the build; a user cancel takes precedence over the
-	// error that the killed command surfaced.
+	// fail terminates the build. The cancellation cause outranks whatever
+	// error the killed command surfaced: a user cancel is not a failure, and
+	// a server shutdown is not the build's fault at all — that one goes back
+	// on the queue so a redeploy doesn't destroy work in progress.
 	fail := func(msg string) {
-		if context.Cause(ctx) == ErrCanceledByUser {
+		switch context.Cause(ctx) {
+		case ErrCanceledByUser:
 			logStep("Build canceled by user (partial artifacts may remain)")
 			sink.Close()
 			r.finish(build.ID, models.StatusCanceled, startedAt)
 			return
+		case context.Canceled:
+			// Claim the requeue before writing anything: the sink drops
+			// writes once closed, so the give-up path below needs the sink
+			// still open.
+			if ok, err := r.DB.RequeueBuild(build.ID, models.MaxBuildRequeues); err == nil && ok {
+				// Through the sink, not straight to the row — the DB log and
+				// the logbus buffer have to stay byte-identical.
+				fmt.Fprint(sink, db.RequeueNote)
+				sink.Close()
+				// Not terminal: startup recovery re-queues pending rows, and
+				// clients see it go back to pending rather than failed.
+				r.Bus.PublishStatus(build.ID, models.StatusPending, nil, nil)
+				return
+			}
+			// Out of retries (or no longer running) — fall through and record
+			// a failure, so a build that takes the server down with it can't
+			// be retried forever.
+			msg += " (no re-queues left)"
 		}
 		fmt.Fprintf(sink, "\n[ERROR] %s\n", msg)
 		sink.Close()
