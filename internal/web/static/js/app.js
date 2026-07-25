@@ -89,7 +89,13 @@
         deploy_compose_path: f.deploy_compose_path.value.trim(),
         deploy_service_name: f.deploy_service_name.value.trim(),
         no_cache: f.no_cache.checked,
+        poll_enabled: f.poll_enabled.checked,
+        poll_interval_secs: parseInt(f.poll_interval_secs.value, 10),
       };
+      if (!isFinite(payload.poll_interval_secs)) {
+        showBanner('err', 'Poll interval must be a number.');
+        return;
+      }
       // Secrets are write-only: blank means "keep", the explicit clear
       // checkbox sends an empty string, a typed value replaces.
       var clearWebhook = document.getElementById('clear-webhook');

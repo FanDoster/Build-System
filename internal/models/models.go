@@ -18,19 +18,51 @@ func (s BuildStatus) Terminal() bool {
 }
 
 type Project struct {
-	ID                int64     `json:"id"`
-	Name              string    `json:"name"`
-	RepoURL           string    `json:"repo_url"`
-	Branch            string    `json:"branch"`
-	DockerfilePath    string    `json:"dockerfile_path"`
-	ImageName         string    `json:"image_name"`
-	DeployComposePath string    `json:"deploy_compose_path,omitempty"`
-	DeployServiceName string    `json:"deploy_service_name,omitempty"`
-	WebhookSecret     string    `json:"webhook_secret,omitempty"`
-	CloneToken        string    `json:"clone_token,omitempty"`
-	NoCache           bool      `json:"no_cache"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	ID                int64  `json:"id"`
+	Name              string `json:"name"`
+	RepoURL           string `json:"repo_url"`
+	Branch            string `json:"branch"`
+	DockerfilePath    string `json:"dockerfile_path"`
+	ImageName         string `json:"image_name"`
+	DeployComposePath string `json:"deploy_compose_path,omitempty"`
+	DeployServiceName string `json:"deploy_service_name,omitempty"`
+	WebhookSecret     string `json:"webhook_secret,omitempty"`
+	CloneToken        string `json:"clone_token,omitempty"`
+	NoCache           bool   `json:"no_cache"`
+
+	// Polling: an alternative to GitHub Actions / webhooks. When enabled the
+	// server asks the remote for the branch tip every PollIntervalSecs and
+	// queues a build when the SHA moves. LastPolledSHA is the tip the poller
+	// last observed — it is seeded (without building) on the first successful
+	// poll so enabling polling never fires a build for history that already
+	// existed.
+	PollEnabled      bool       `json:"poll_enabled"`
+	PollIntervalSecs int        `json:"poll_interval_secs"`
+	LastPolledSHA    string     `json:"last_polled_sha,omitempty"`
+	LastPolledAt     *time.Time `json:"last_polled_at,omitempty"`
+	LastPollError    string     `json:"last_poll_error,omitempty"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// MinPollIntervalSecs floors the poll interval. Every poll is a network round
+// trip to the forge; anything tighter is rate-limit bait for no real gain.
+const MinPollIntervalSecs = 30
+
+// DefaultPollIntervalSecs is used when polling is enabled without an interval.
+const DefaultPollIntervalSecs = 60
+
+// PollInterval returns the effective, floored poll interval.
+func (p *Project) PollInterval() time.Duration {
+	secs := p.PollIntervalSecs
+	if secs <= 0 {
+		secs = DefaultPollIntervalSecs
+	}
+	if secs < MinPollIntervalSecs {
+		secs = MinPollIntervalSecs
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // Sanitize clears sensitive fields for API responses.

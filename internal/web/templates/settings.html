@@ -58,6 +58,32 @@
   </section>
 
   <section class="settings-card">
+    <h2 class="settings-heading">Triggers</h2>
+    <p class="form-hint" style="margin-bottom:12px">How builds start. Push webhooks (GitHub Actions or a repository webhook posting to <span class="mono">{{$.BasePath}}/api/webhook/github</span>) always work. Polling is the pull-based alternative: the server asks the remote for the branch tip on a timer and builds when it moves — no webhook, no inbound access required.</p>
+    <label class="form-check">
+      <input type="checkbox" name="poll_enabled" id="f-poll" {{if .Project.PollEnabled}}checked{{end}}>
+      <span>
+        <span class="form-check-title">Poll this repository for new commits</span>
+        <span class="form-hint">Runs <span class="mono">git ls-remote</span> against the repository URL and branch above. Enabling it records the current tip without building; the next new commit triggers a build.</span>
+      </span>
+    </label>
+    <div class="form-group" style="margin-top:12px">
+      <label for="f-poll-interval">Poll interval (seconds)</label>
+      <input id="f-poll-interval" name="poll_interval_secs" type="number" min="{{.MinPollIntervalSecs}}" step="10"
+        value="{{.Project.PollIntervalSecs}}" spellcheck="false" style="max-width:160px">
+      <p class="form-hint">Minimum {{.MinPollIntervalSecs}}s. Polling and webhooks can both be on — a commit already being built is not built twice.</p>
+    </div>
+    <p class="form-hint" style="margin-top:12px">
+      {{if .Project.LastPolledAt}}
+        Last polled <time data-abs datetime="{{.Project.LastPolledAt.Format "2006-01-02T15:04:05Z07:00"}}">{{.Project.LastPolledAt.Format "Jan 02 15:04"}}</time>{{if .Project.LastPolledSHA}} · watching <span class="mono">{{.Project.LastPolledSHA}}</span>{{end}}.
+        {{if .Project.LastPollError}}<span class="secret-state">Last poll failed: {{.Project.LastPollError}}</span>{{end}}
+      {{else}}
+        Not polled yet.
+      {{end}}
+    </p>
+  </section>
+
+  <section class="settings-card">
     <h2 class="settings-heading">Deploy</h2>
     <p class="form-hint" style="margin-bottom:12px">Optional. After a successful push, run <span class="mono">docker compose -f &lt;file&gt; up -d &lt;service&gt;</span>. Leave both blank to let Watchtower (or nothing) handle deployment.</p>
     <div class="form-row">

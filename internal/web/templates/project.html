@@ -12,6 +12,11 @@
     {{if .Project.DeployComposePath}}
     <div class="meta" style="margin-top:4px">Deploy: docker compose -f {{.Project.DeployComposePath}} up -d {{.Project.DeployServiceName}}</div>
     {{end}}
+    {{if .Project.PollEnabled}}
+    <div class="meta" style="margin-top:4px">
+      Polling every {{.Project.PollIntervalSecs}}s{{if .Project.LastPolledSHA}} · at {{.Project.LastPolledSHA}}{{end}}{{if .Project.LastPollError}} · <span class="badge badge-failed">poll failing</span> {{.Project.LastPollError}}{{end}}
+    </div>
+    {{end}}
   </div>
   <div class="btn-group">
     <a class="btn" href="{{$.BasePath}}/projects/{{.Project.ID}}/settings">Settings</a>

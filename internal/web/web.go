@@ -134,11 +134,15 @@ func (h *Handler) handleProjectSettings(w http.ResponseWriter, r *http.Request) 
 	hasWebhookSecret := project.WebhookSecret != ""
 	hasCloneToken := project.CloneToken != ""
 	project.Sanitize()
+	if project.PollIntervalSecs == 0 {
+		project.PollIntervalSecs = models.DefaultPollIntervalSecs
+	}
 	h.render(w, r, "settings", map[string]interface{}{
-		"Title":            project.Name + " · Settings",
-		"Project":          project,
-		"HasWebhookSecret": hasWebhookSecret,
-		"HasCloneToken":    hasCloneToken,
+		"Title":               project.Name + " · Settings",
+		"Project":             project,
+		"HasWebhookSecret":    hasWebhookSecret,
+		"HasCloneToken":       hasCloneToken,
+		"MinPollIntervalSecs": models.MinPollIntervalSecs,
 	})
 }
 

@@ -389,6 +389,14 @@ func resolveComposePath(workDir, path string) (string, error) {
 	return compose, nil
 }
 
+// InjectToken exposes injectToken to other packages: the poller builds the
+// same authenticated URL for its `git ls-remote` probe.
+func InjectToken(rawURL, token string) string { return injectToken(rawURL, token) }
+
+// ScrubSecret exposes scrubSecret so poller errors persisted to the DB and
+// shown in the UI can never carry a clone token.
+func ScrubSecret(s, secret string) string { return scrubSecret(s, secret) }
+
 // injectToken adds a credential to an HTTP(S) clone URL, percent-encoding it
 // so tokens containing special characters survive.
 func injectToken(rawURL, token string) string {

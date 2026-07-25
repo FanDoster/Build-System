@@ -24,7 +24,7 @@ const maxWebhookBody = 1 << 20
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-07-23-repo-compose"
+const Version = "2026-07-25-git-polling"
 
 // RunnerControl is the runner surface the API needs (implemented by
 // runner.Runner): canceling the in-flight build and reading its progress.
@@ -128,6 +128,13 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	if p.DockerfilePath == "" {
 		p.DockerfilePath = "Dockerfile"
 	}
+	if p.PollIntervalSecs == 0 {
+		p.PollIntervalSecs = models.DefaultPollIntervalSecs
+	}
+	if p.PollIntervalSecs < models.MinPollIntervalSecs {
+		writeError(w, 400, fmt.Sprintf("poll_interval_secs must be at least %d", models.MinPollIntervalSecs))
+		return
+	}
 
 	if err := s.DB.CreateProject(&p); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -186,6 +193,8 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 		WebhookSecret     *string `json:"webhook_secret"`
 		CloneToken        *string `json:"clone_token"`
 		NoCache           *bool   `json:"no_cache"`
+		PollEnabled       *bool   `json:"poll_enabled"`
+		PollIntervalSecs  *int    `json:"poll_interval_secs"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
 		writeError(w, 400, "invalid JSON: "+err.Error())
@@ -202,6 +211,18 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	if updates.PollIntervalSecs != nil && *updates.PollIntervalSecs < models.MinPollIntervalSecs {
+		writeError(w, 400, fmt.Sprintf("poll_interval_secs must be at least %d", models.MinPollIntervalSecs))
+		return
+	}
+
+	// The recorded poll baseline belongs to a specific ref; if either half of
+	// that ref changes, the stored SHA is meaningless and must not be compared
+	// against the new ref's tip (which would queue a build for a commit that
+	// is simply "not the old one").
+	refChanged := (updates.RepoURL != nil && *updates.RepoURL != existing.RepoURL) ||
+		(updates.Branch != nil && *updates.Branch != existing.Branch)
 
 	setIf := func(dst *string, src *string) {
 		if src != nil {
@@ -220,10 +241,22 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 	if updates.NoCache != nil {
 		existing.NoCache = *updates.NoCache
 	}
+	if updates.PollEnabled != nil {
+		existing.PollEnabled = *updates.PollEnabled
+	}
+	if updates.PollIntervalSecs != nil {
+		existing.PollIntervalSecs = *updates.PollIntervalSecs
+	}
 
 	if err := s.DB.UpdateProject(existing); err != nil {
 		writeError(w, 500, err.Error())
 		return
+	}
+	if refChanged {
+		if err := s.DB.ResetPollState(id); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
 	}
 	// Re-fetch without secrets
 	updated, _ := s.DB.GetProject(id)

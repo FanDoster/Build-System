@@ -61,6 +61,11 @@ func (d *DB) migrate() error {
 			webhook_secret TEXT NOT NULL DEFAULT '',
 			clone_token TEXT NOT NULL DEFAULT '',
 			no_cache INTEGER NOT NULL DEFAULT 0,
+			poll_enabled INTEGER NOT NULL DEFAULT 0,
+			poll_interval_secs INTEGER NOT NULL DEFAULT 60,
+			last_polled_sha TEXT NOT NULL DEFAULT '',
+			last_polled_at DATETIME,
+			last_poll_error TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
 			updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
 		);
@@ -90,7 +95,19 @@ func (d *DB) migrate() error {
 	// Additive column migrations for DBs created before the column existed.
 	// CREATE TABLE IF NOT EXISTS never alters an existing table, so new
 	// columns must be added explicitly and idempotently.
-	return d.addColumnIfMissing("projects", "no_cache", "INTEGER NOT NULL DEFAULT 0")
+	for _, c := range []struct{ table, column, decl string }{
+		{"projects", "no_cache", "INTEGER NOT NULL DEFAULT 0"},
+		{"projects", "poll_enabled", "INTEGER NOT NULL DEFAULT 0"},
+		{"projects", "poll_interval_secs", "INTEGER NOT NULL DEFAULT 60"},
+		{"projects", "last_polled_sha", "TEXT NOT NULL DEFAULT ''"},
+		{"projects", "last_polled_at", "DATETIME"},
+		{"projects", "last_poll_error", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := d.addColumnIfMissing(c.table, c.column, c.decl); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // addColumnIfMissing runs ALTER TABLE ADD COLUMN only when the column is
@@ -139,14 +156,40 @@ func (d *DB) SetSetting(key, value string) error {
 
 // --- Projects ---
 
+// projectCols is the full read column list, kept in one place so the several
+// project SELECTs and scanProject can never drift apart.
+const projectCols = `id, name, repo_url, branch, dockerfile_path, image_name,
+	deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache,
+	poll_enabled, poll_interval_secs, last_polled_sha, last_polled_at, last_poll_error,
+	created_at, updated_at`
+
+// scanner is satisfied by both *sql.Row and *sql.Rows.
+type scanner interface{ Scan(dest ...any) error }
+
+func scanProject(s scanner) (*models.Project, error) {
+	p := &models.Project{}
+	err := s.Scan(&p.ID, &p.Name, &p.RepoURL, &p.Branch, &p.DockerfilePath, &p.ImageName,
+		&p.DeployComposePath, &p.DeployServiceName, &p.WebhookSecret, &p.CloneToken, &p.NoCache,
+		&p.PollEnabled, &p.PollIntervalSecs, &p.LastPolledSHA, &p.LastPolledAt, &p.LastPollError,
+		&p.CreatedAt, &p.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
 func (d *DB) CreateProject(p *models.Project) error {
 	p.CreatedAt = time.Now().UTC()
 	p.UpdatedAt = p.CreatedAt
+	if p.PollIntervalSecs == 0 {
+		p.PollIntervalSecs = models.DefaultPollIntervalSecs
+	}
 	res, err := d.conn.Exec(
-		`INSERT INTO projects (name, repo_url, branch, dockerfile_path, image_name, deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO projects (name, repo_url, branch, dockerfile_path, image_name, deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache, poll_enabled, poll_interval_secs, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.Name, p.RepoURL, p.Branch, p.DockerfilePath, p.ImageName,
 		p.DeployComposePath, p.DeployServiceName, p.WebhookSecret, p.CloneToken, p.NoCache,
+		p.PollEnabled, p.PollIntervalSecs,
 		p.CreatedAt, p.UpdatedAt,
 	)
 	if err != nil {
@@ -157,38 +200,19 @@ func (d *DB) CreateProject(p *models.Project) error {
 }
 
 func (d *DB) GetProject(id int64) (*models.Project, error) {
-	p := &models.Project{}
-	err := d.conn.QueryRow(
-		`SELECT id, name, repo_url, branch, dockerfile_path, image_name, deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache, created_at, updated_at
-		 FROM projects WHERE id = ?`, id,
-	).Scan(&p.ID, &p.Name, &p.RepoURL, &p.Branch, &p.DockerfilePath, &p.ImageName,
-		&p.DeployComposePath, &p.DeployServiceName, &p.WebhookSecret, &p.CloneToken, &p.NoCache,
-		&p.CreatedAt, &p.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return p, nil
+	return scanProject(d.conn.QueryRow(
+		`SELECT `+projectCols+` FROM projects WHERE id = ?`, id))
 }
 
 func (d *DB) GetProjectByName(name string) (*models.Project, error) {
-	p := &models.Project{}
-	err := d.conn.QueryRow(
-		`SELECT id, name, repo_url, branch, dockerfile_path, image_name, deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache, created_at, updated_at
-		 FROM projects WHERE name = ?`, name,
-	).Scan(&p.ID, &p.Name, &p.RepoURL, &p.Branch, &p.DockerfilePath, &p.ImageName,
-		&p.DeployComposePath, &p.DeployServiceName, &p.WebhookSecret, &p.CloneToken, &p.NoCache,
-		&p.CreatedAt, &p.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return p, nil
+	return scanProject(d.conn.QueryRow(
+		`SELECT `+projectCols+` FROM projects WHERE name = ?`, name))
 }
 
+// ListProjects returns every project with secrets cleared — callers that need
+// the webhook secret or clone token must re-fetch the row with GetProject.
 func (d *DB) ListProjects() ([]models.Project, error) {
-	rows, err := d.conn.Query(
-		`SELECT id, name, repo_url, branch, dockerfile_path, image_name, deploy_compose_path, deploy_service_name, no_cache, created_at, updated_at
-		 FROM projects ORDER BY name`,
-	)
+	rows, err := d.conn.Query(`SELECT ` + projectCols + ` FROM projects ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -196,27 +220,70 @@ func (d *DB) ListProjects() ([]models.Project, error) {
 
 	var projects []models.Project
 	for rows.Next() {
-		var p models.Project
-		if err := rows.Scan(&p.ID, &p.Name, &p.RepoURL, &p.Branch, &p.DockerfilePath, &p.ImageName,
-			&p.DeployComposePath, &p.DeployServiceName, &p.NoCache, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		p, err := scanProject(rows)
+		if err != nil {
 			return nil, err
 		}
-		projects = append(projects, p)
+		p.Sanitize()
+		projects = append(projects, *p)
 	}
 	return projects, rows.Err()
 }
 
+// UpdateProject writes the user-editable columns. Poller bookkeeping
+// (last_polled_*) is deliberately NOT written here: a settings save must not
+// clobber state the poller owns, and the poller uses UpdatePollState.
 func (d *DB) UpdateProject(p *models.Project) error {
 	p.UpdatedAt = time.Now().UTC()
 	_, err := d.conn.Exec(
 		`UPDATE projects SET name=?, repo_url=?, branch=?, dockerfile_path=?, image_name=?,
-		 deploy_compose_path=?, deploy_service_name=?, webhook_secret=?, clone_token=?, no_cache=?, updated_at=?
+		 deploy_compose_path=?, deploy_service_name=?, webhook_secret=?, clone_token=?, no_cache=?,
+		 poll_enabled=?, poll_interval_secs=?, updated_at=?
 		 WHERE id=?`,
 		p.Name, p.RepoURL, p.Branch, p.DockerfilePath, p.ImageName,
 		p.DeployComposePath, p.DeployServiceName, p.WebhookSecret, p.CloneToken, p.NoCache,
+		p.PollEnabled, p.PollIntervalSecs,
 		p.UpdatedAt, p.ID,
 	)
 	return err
+}
+
+// UpdatePollState records the result of one poll. A successful poll stores the
+// observed tip and clears the error; a failed poll keeps the last known tip
+// (so recovery doesn't fire a spurious build) and surfaces the message.
+func (d *DB) UpdatePollState(id int64, sha string, pollErr string) error {
+	now := time.Now().UTC()
+	if pollErr != "" {
+		_, err := d.conn.Exec(
+			`UPDATE projects SET last_polled_at=?, last_poll_error=? WHERE id=?`,
+			now, pollErr, id)
+		return err
+	}
+	_, err := d.conn.Exec(
+		`UPDATE projects SET last_polled_at=?, last_polled_sha=?, last_poll_error='' WHERE id=?`,
+		now, sha, id)
+	return err
+}
+
+// ResetPollState forgets the observed tip so the next poll re-seeds instead of
+// building. Used when the repo URL or branch changes — the stored SHA belongs
+// to a ref that is no longer being watched.
+func (d *DB) ResetPollState(id int64) error {
+	_, err := d.conn.Exec(
+		`UPDATE projects SET last_polled_sha='', last_polled_at=NULL, last_poll_error='' WHERE id=?`, id)
+	return err
+}
+
+// HasActiveBuild reports whether the project has a build queued or running.
+// The poller uses it to avoid stacking builds when one commit's build outlasts
+// the poll interval.
+func (d *DB) HasActiveBuild(projectID int64) (bool, error) {
+	var exists int
+	err := d.conn.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM builds WHERE project_id=? AND status IN (?, ?))`,
+		projectID, models.StatusPending, models.StatusRunning,
+	).Scan(&exists)
+	return exists == 1, err
 }
 
 func (d *DB) DeleteProject(id int64) error {

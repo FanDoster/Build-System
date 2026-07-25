@@ -15,6 +15,7 @@ import (
 	"github.com/FanDoster/Build-System/internal/db"
 	"github.com/FanDoster/Build-System/internal/logbus"
 	"github.com/FanDoster/Build-System/internal/models"
+	"github.com/FanDoster/Build-System/internal/poller"
 	"github.com/FanDoster/Build-System/internal/runner"
 	"github.com/FanDoster/Build-System/internal/web"
 )
@@ -52,6 +53,12 @@ func main() {
 	}
 	r.Start()
 	log.Printf("Runner started (build timeout: %s)", r.Timeout)
+
+	// Git polling: the pull-based alternative to webhooks, opted into per
+	// project in its settings. Idle unless at least one project enables it.
+	pl := poller.New(database, buildCh)
+	pl.Start()
+	log.Printf("Git poller started (sweep every %s)", pl.Tick)
 
 	// Wire up HTTP
 	mux := http.NewServeMux()
@@ -96,6 +103,9 @@ func main() {
 		log.Fatalf("Server failed: %v", err)
 	}
 
+	// Stop the poller before the runner so no build is queued into a worker
+	// that is already shutting down.
+	pl.Stop()
 	// Cancel any in-flight build (it is marked failed with a shutdown note)
 	// and wait for the worker to exit.
 	r.Stop()

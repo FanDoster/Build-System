@@ -850,3 +850,57 @@ func TestProjectCRUDRequiresCsrf(t *testing.T) {
 		t.Error("project deleted despite missing csrf header")
 	}
 }
+
+func TestUpdateProjectPollSettings(t *testing.T) {
+	s, mux := newTestServer(t)
+	p := createProject(t, s, models.Project{
+		Name: "app", RepoURL: "https://github.com/u/app", Branch: "main",
+		DockerfilePath: "Dockerfile", ImageName: "app",
+	})
+	path := fmt.Sprintf("/api/projects/%d", p.ID)
+
+	w := doJSON(t, mux, "PUT", path, map[string]interface{}{
+		"poll_enabled": true, "poll_interval_secs": 120,
+	})
+	if w.Code != 200 {
+		t.Fatalf("enable polling: got %d: %s", w.Code, w.Body)
+	}
+	got, _ := s.DB.GetProject(p.ID)
+	if !got.PollEnabled || got.PollIntervalSecs != 120 {
+		t.Errorf("poll settings not persisted: %+v", got)
+	}
+
+	// Below the floor is rejected rather than silently clamped, so the UI can
+	// say why.
+	w = doJSON(t, mux, "PUT", path, map[string]interface{}{"poll_interval_secs": 1})
+	if w.Code != 400 {
+		t.Errorf("sub-minimum interval: got %d, want 400", w.Code)
+	}
+	got, _ = s.DB.GetProject(p.ID)
+	if got.PollIntervalSecs != 120 {
+		t.Errorf("rejected update still applied: %d", got.PollIntervalSecs)
+	}
+
+	// An unrelated edit must not disturb the poller's own bookkeeping.
+	if err := s.DB.UpdatePollState(p.ID, "abc123abc123", ""); err != nil {
+		t.Fatal(err)
+	}
+	if w := doJSON(t, mux, "PUT", path, map[string]string{"image_name": "app2"}); w.Code != 200 {
+		t.Fatalf("rename image: got %d: %s", w.Code, w.Body)
+	}
+	got, _ = s.DB.GetProject(p.ID)
+	if got.LastPolledSHA != "abc123abc123" {
+		t.Errorf("settings save clobbered the poll baseline: %q", got.LastPolledSHA)
+	}
+
+	// Changing the watched ref must reset the baseline: the stored SHA belongs
+	// to the old branch and comparing it against the new tip would build a
+	// commit that isn't new.
+	if w := doJSON(t, mux, "PUT", path, map[string]string{"branch": "develop"}); w.Code != 200 {
+		t.Fatalf("change branch: got %d: %s", w.Code, w.Body)
+	}
+	got, _ = s.DB.GetProject(p.ID)
+	if got.LastPolledSHA != "" || got.LastPolledAt != nil {
+		t.Errorf("poll baseline survived a branch change: %+v", got)
+	}
+}
