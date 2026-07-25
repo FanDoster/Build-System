@@ -21,22 +21,27 @@
   </div>
 
   <div>
-    <h2>Recent Builds</h2>
-    {{range .Builds}}
-    <div class="card" data-live-build="{{.ID}}" data-status="{{.Status}}">
-      <div class="card-header">
-        <div>
-          <a href="{{$.BasePath}}/builds/{{.ID}}" class="card-title">{{.ProjectName}} #{{.ID}}</a>
-          <div class="meta">{{.CommitMessage}}</div>
+    <h2>Recent Builds <span class="log-conn" id="live-conn" hidden style="font-weight:400"></span></h2>
+    <!-- Live-updated by app.js from the /api/live feed: rows are added and
+         restyled in place, so the card markup below is mirrored in JS
+         (buildCard). Keep the two in step. -->
+    <div data-live-list data-live-kind="card" data-live-limit="10">
+      {{range .Builds}}
+      <div class="card" data-live-build="{{.ID}}" data-status="{{.Status}}">
+        <div class="card-header">
+          <div>
+            <a href="{{$.BasePath}}/builds/{{.ID}}" class="card-title">{{.ProjectName}} #{{.ID}}</a>
+            <div class="meta">{{.CommitMessage}}</div>
+          </div>
+          <span class="badge badge-{{.Status}}">{{.Status}}</span>
         </div>
-        <span class="badge badge-{{.Status}}">{{.Status}}</span>
+        <div class="meta"><time data-abs datetime="{{if .StartedAt}}{{.StartedAt.Format "2006-01-02T15:04:05Z07:00"}}{{else}}{{.CreatedAt.Format "2006-01-02T15:04:05Z07:00"}}{{end}}">{{if .StartedAt}}{{.StartedAt.Format "Jan 02 15:04"}}{{else}}{{.CreatedAt.Format "Jan 02 15:04"}}{{end}}</time></div>
+        <div class="meta build-dur"></div>
       </div>
-      <div class="meta"><time data-abs datetime="{{if .StartedAt}}{{.StartedAt.Format "2006-01-02T15:04:05Z07:00"}}{{else}}{{.CreatedAt.Format "2006-01-02T15:04:05Z07:00"}}{{end}}">{{if .StartedAt}}{{.StartedAt.Format "Jan 02 15:04"}}{{else}}{{.CreatedAt.Format "Jan 02 15:04"}}{{end}}</time></div>
-      <div class="meta build-dur"></div>
+      {{else}}
+      <div class="card" data-live-empty><p class="meta">No builds yet.</p></div>
+      {{end}}
     </div>
-    {{else}}
-    <div class="card"><p class="meta">No builds yet.</p></div>
-    {{end}}
   </div>
 </div>
 {{end}}

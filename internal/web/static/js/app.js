@@ -2,6 +2,8 @@
 // Build page: live SSE log streaming (offset-polling fallback), terminal-style
 // renderer (CR collapse, ANSI SGR, line numbers/anchors, follow mode, search),
 // step rail, in-place status updates, cancel/re-run actions.
+// List pages: live build list over a WebSocket to /api/live (GET-polling
+// fallback) — see initListLive.
 // All URLs come from data-* attributes so BUILDS_BASE_PATH always works;
 // offsets are server-computed bytes and are only ever echoed back.
 (function () {
@@ -149,21 +151,24 @@
 
   // Render [data-abs] <time> elements (server emits UTC) in the viewer's
   // local timezone. Same-year dates drop the year; the full timestamp goes
-  // in the title. Called once on load — history timestamps are immutable.
+  // in the title.
   function renderAbsTimes() {
-    var now = new Date();
     var els = document.querySelectorAll('time[data-abs]');
-    for (var i = 0; i < els.length; i++) {
-      var dt = els[i].getAttribute('datetime');
-      if (!dt) continue;
-      var d = new Date(dt);
-      if (isNaN(d.getTime())) continue;
-      var label = MONTHS[d.getMonth()] + ' ' + pad2(d.getDate()) + ' ' +
-        pad2(d.getHours()) + ':' + pad2(d.getMinutes());
-      if (d.getFullYear() !== now.getFullYear()) label = d.getFullYear() + ' ' + label;
-      els[i].textContent = label;
-      els[i].title = d.toLocaleString();
-    }
+    for (var i = 0; i < els.length; i++) setAbsLabel(els[i]);
+  }
+
+  // setAbsLabel formats one [data-abs] <time> from its datetime attribute.
+  // Also used for rows the live feed adds after load.
+  function setAbsLabel(el) {
+    var dt = el.getAttribute('datetime');
+    if (!dt) return;
+    var d = new Date(dt);
+    if (isNaN(d.getTime())) return;
+    var label = MONTHS[d.getMonth()] + ' ' + pad2(d.getDate()) + ' ' +
+      pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    if (d.getFullYear() !== new Date().getFullYear()) label = d.getFullYear() + ' ' + label;
+    el.textContent = label;
+    el.title = d.toLocaleString();
   }
 
   // Shared: compact duration like "40s" / "1m40s" / "1h05m".
@@ -179,41 +184,101 @@
 
   var STEP_NAMES = { clone: 'Clone', checkout: 'Checkout', build: 'Build', push: 'Push', deploy: 'Deploy' };
 
-  // --- Dashboard / project pages: live badges, current step, ETA ---
+  // --- Dashboard / project pages: live build list ---
+  //
+  // Transport: a WebSocket to /api/live, which pushes a whole snapshot of the
+  // recent builds whenever anything changes (see internal/live). Snapshots are
+  // idempotent, so applying the newest one is always correct — nothing to
+  // resume, nothing to replay, and a reconnect needs no state. That is why a
+  // build STARTED AFTER PAGE LOAD shows up: the list is reconciled against the
+  // feed, not just refreshed in place.
+  //
+  // The same URL answers a plain GET with the same payload, which is the
+  // fallback when the socket cannot be established (a reverse proxy that does
+  // not forward Upgrade must degrade, not go dark).
+  //
+  // Elapsed times and progress bars animate locally from the absolute
+  // timestamps in the snapshot, so the server only speaks when state changes.
   function initListLive() {
-    var els = document.querySelectorAll('[data-live-build]');
-    if (!els.length) return;
-
-    var map = {}, tracked = {};
-    var anyActive = false;
-    Array.prototype.forEach.call(els, function (el) {
-      map[el.dataset.liveBuild] = el;
-      var st = el.dataset.status;
-      if (st === 'running' || st === 'pending') {
-        anyActive = true;
-        tracked[el.dataset.liveBuild] = true;
-      }
-    });
-    if (!anyActive) return;
+    var lists = Array.prototype.slice.call(document.querySelectorAll('[data-live-list]'));
+    if (!lists.length) return;
 
     var base = document.body.dataset.basePath || '';
+    var connEl = document.getElementById('live-conn');
+    var feed = {};   // build id -> newest record from the feed
+    var sock = null, everOpen = false, tries = 0, retryTimer = null, pollTimer = null;
 
-    function setBadge(el, status) {
-      var b = el.querySelector('.badge');
+    // ---- row markup (mirrors index.html / project.html; keep in step) ----
+    function el(tag, cls, text) {
+      var e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text !== undefined) e.textContent = text;
+      return e;
+    }
+    function buildLink(b, cls, text) {
+      var a = el('a', cls, text);
+      a.href = base + '/builds/' + b.id;
+      return a;
+    }
+    function timeCell(b) {
+      var t = el('time');
+      t.setAttribute('data-abs', '');
+      t.setAttribute('datetime', b.started_at || b.created_at || '');
+      setAbsLabel(t);
+      return t;
+    }
+
+    function buildCard(b) {
+      var card = el('div', 'card');
+      var header = el('div', 'card-header');
+      var left = el('div');
+      left.appendChild(buildLink(b, 'card-title', (b.project_name || 'build') + ' #' + b.id));
+      left.appendChild(el('div', 'meta', b.commit_message || ''));
+      header.appendChild(left);
+      header.appendChild(el('span', 'badge badge-' + b.status, b.status));
+      var when = el('div', 'meta');
+      when.appendChild(timeCell(b));
+      card.appendChild(header);
+      card.appendChild(when);
+      card.appendChild(el('div', 'meta build-dur'));
+      return card;
+    }
+
+    function buildRow(b) {
+      var tr = el('tr');
+      var idCell = el('td');
+      idCell.appendChild(buildLink(b, null, String(b.id)));
+      tr.appendChild(idCell);
+      tr.appendChild(el('td', 'meta', b.commit_sha || ''));
+      tr.appendChild(el('td', null, b.commit_message || ''));
+      var statusCell = el('td');
+      statusCell.appendChild(el('span', 'badge badge-' + b.status, b.status));
+      tr.appendChild(statusCell);
+      var whenCell = el('td', 'meta');
+      whenCell.appendChild(timeCell(b));
+      tr.appendChild(whenCell);
+      tr.appendChild(el('td', 'meta build-dur'));
+      var logCell = el('td');
+      logCell.appendChild(buildLink(b, 'btn', 'Logs'));
+      tr.appendChild(logCell);
+      return tr;
+    }
+
+    // ---- rendering ----
+    function setBadge(row, status) {
+      var b = row.querySelector('.badge');
       if (b) {
         b.className = 'badge badge-' + status;
         b.textContent = status;
       }
-      el.dataset.status = status;
+      row.dataset.status = status;
     }
 
     // Tiny inline progress bar for a running row; indeterminate without an
     // estimate or on a real overrun (same rules as the build page).
     function miniProgress(elapsedSec, expectedSec) {
-      var wrap = document.createElement('span');
-      wrap.className = 'mini-progress';
-      var fill = document.createElement('span');
-      fill.className = 'mini-progress-fill';
+      var wrap = el('span', 'mini-progress');
+      var fill = el('span', 'mini-progress-fill');
       var pct = expectedSec > 0 ? (elapsedSec / expectedSec) * 100 : -1;
       if (pct >= 0 && pct <= 100) {
         fill.style.width = pct.toFixed(1) + '%';
@@ -226,59 +291,176 @@
       return wrap;
     }
 
-    function finalize(id, el) {
-      fetch(base + '/api/builds/' + id + '?meta=1')
-        .then(function (r) { return r.json(); })
-        .then(function (meta) {
-          setBadge(el, meta.status);
-          var d = el.querySelector('.build-dur');
-          if (d) {
-            d.textContent = (meta.started_at && meta.finished_at)
-              ? fmtShort((new Date(meta.finished_at) - new Date(meta.started_at)) / 1000)
-              : '';
-          }
-        })
-        .catch(function () {});
+    function renderDuration(row, b) {
+      var d = row.querySelector('.build-dur');
+      if (!d) return;
+      if (b.status === 'running') {
+        var elapsed = b.started_at ? (Date.now() - new Date(b.started_at).getTime()) / 1000 : 0;
+        var txt = (b.current_step ? (STEP_NAMES[b.current_step] || b.current_step) + ' · ' : '') + fmtShort(elapsed);
+        if (b.expected_secs) txt += ' / ~' + fmtShort(b.expected_secs);
+        d.textContent = '';
+        d.appendChild(miniProgress(elapsed, b.expected_secs));
+        d.appendChild(document.createTextNode(txt));
+      } else if (b.status === 'pending') {
+        d.textContent = b.queue_position >= 2 ? 'queued · #' + b.queue_position : 'queued';
+      } else {
+        d.textContent = (b.started_at && b.finished_at)
+          ? fmtShort((new Date(b.finished_at) - new Date(b.started_at)) / 1000)
+          : '';
+      }
     }
 
-    function tick() {
-      fetch(base + '/api/builds/active')
-        .then(function (r) { return r.json(); })
-        .then(function (list) {
-          var present = {};
-          var now = Date.now();
-          (list || []).forEach(function (a) {
-            present[a.id] = true;
-            var el = map[a.id];
-            if (!el) return;
-            tracked[a.id] = true;
-            setBadge(el, a.status);
-            var d = el.querySelector('.build-dur');
-            if (!d) return;
-            if (a.status === 'running') {
-              var elapsed = a.started_at ? (now - new Date(a.started_at).getTime()) / 1000 : 0;
-              var txt = (a.current_step ? (STEP_NAMES[a.current_step] || a.current_step) + ' · ' : '') + fmtShort(elapsed);
-              if (a.expected_secs) txt += ' / ~' + fmtShort(a.expected_secs);
-              d.textContent = '';
-              d.appendChild(miniProgress(elapsed, a.expected_secs));
-              d.appendChild(document.createTextNode(txt));
-            } else {
-              d.textContent = a.queue_position >= 2 ? 'queued · #' + a.queue_position : 'queued';
-            }
-          });
-          // Builds we were tracking that left the active set → final state.
-          Object.keys(tracked).forEach(function (id) {
-            if (present[id]) return;
-            delete tracked[id];
-            if (map[id]) finalize(id, map[id]);
-          });
-          if (Object.keys(tracked).length) setTimeout(tick, 4000);
-        })
-        .catch(function () {
-          if (Object.keys(tracked).length) setTimeout(tick, 8000);
-        });
+    // A queued build has no start time until it is claimed; swap the column
+    // over to the real one when it arrives.
+    function renderWhen(row, b) {
+      var t = row.querySelector('time[data-abs]');
+      if (!t || !b.started_at) return;
+      if (t.getAttribute('datetime') === b.started_at) return;
+      t.setAttribute('datetime', b.started_at);
+      setAbsLabel(t);
     }
-    tick();
+
+    // ---- list reconciliation ----
+    function rowFor(list, id) {
+      return list.querySelector('[data-live-build="' + id + '"]');
+    }
+    function limitOf(list) {
+      return parseInt(list.dataset.liveLimit, 10) || 0;
+    }
+    function rowsOf(list) {
+      return list.querySelectorAll('[data-live-build]');
+    }
+    // A list only accepts builds it would have rendered itself: its project
+    // (when scoped) and inside its own window of newest rows.
+    function accepts(list, b) {
+      var only = list.dataset.liveProject;
+      if (only && String(b.project_id) !== only) return false;
+      var rows = rowsOf(list), limit = limitOf(list);
+      if (!limit || rows.length < limit) return true;
+      return b.id > parseInt(rows[rows.length - 1].dataset.liveBuild, 10);
+    }
+    function insertOrdered(list, node, id) {
+      var rows = rowsOf(list);
+      for (var i = 0; i < rows.length; i++) {
+        if (parseInt(rows[i].dataset.liveBuild, 10) < id) {
+          list.insertBefore(node, rows[i]);
+          return;
+        }
+      }
+      list.appendChild(node);
+    }
+    function trim(list) {
+      var limit = limitOf(list);
+      if (!limit) return;
+      var rows = rowsOf(list);
+      for (var i = limit; i < rows.length; i++) rows[i].parentNode.removeChild(rows[i]);
+    }
+
+    function upsert(list, b) {
+      var row = rowFor(list, b.id);
+      if (!row) {
+        if (!accepts(list, b)) return;
+        row = list.dataset.liveKind === 'row' ? buildRow(b) : buildCard(b);
+        row.dataset.liveBuild = b.id;
+        insertOrdered(list, row, b.id);
+        var empty = list.querySelector('[data-live-empty]');
+        if (empty) empty.parentNode.removeChild(empty);
+        trim(list);
+      }
+      if (row.dataset.status !== b.status) setBadge(row, b.status);
+      renderWhen(row, b);
+      renderDuration(row, b);
+    }
+
+    function apply(msg) {
+      if (!msg || msg.type !== 'builds' || !msg.builds) return;
+      // Replace rather than merge: a snapshot is the whole truth, and this
+      // keeps the local clock's work bounded on a page left open for days.
+      feed = {};
+      msg.builds.forEach(function (b) {
+        feed[b.id] = b;
+        lists.forEach(function (list) { upsert(list, b); });
+      });
+    }
+
+    // Local clock: keeps elapsed time and the progress bar moving between
+    // pushes, so an idle-but-running dashboard costs nothing on the wire.
+    setInterval(function () {
+      Object.keys(feed).forEach(function (id) {
+        var b = feed[id];
+        if (b.status !== 'running') return;
+        lists.forEach(function (list) {
+          var row = rowFor(list, id);
+          if (row) renderDuration(row, b);
+        });
+      });
+    }, 1000);
+
+    // ---- transport ----
+    function setConn(kind) {
+      if (!connEl) return;
+      if (!kind) { connEl.hidden = true; return; }
+      connEl.hidden = false;
+      connEl.className = 'log-conn' + (kind === 'live' ? ' log-conn--live' : kind === 'polling' ? ' log-conn--polling' : '');
+      connEl.textContent = kind === 'live' ? '● live' : kind === 'polling' ? '◌ polling' : '↻ reconnecting';
+    }
+
+    function connect() {
+      if (!window.WebSocket) { startPolling(); return; }
+      var url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + base + '/api/live';
+      var s;
+      try { s = new WebSocket(url); } catch (e) { startPolling(); return; }
+      sock = s;
+      s.onopen = function () {
+        everOpen = true;
+        tries = 0;
+        setConn('live');
+        stopPolling();
+      };
+      s.onmessage = function (e) {
+        try { apply(JSON.parse(e.data)); } catch (err) { /* ignore a bad frame */ }
+      };
+      s.onclose = function () {
+        if (sock !== s) return; // superseded by a newer socket
+        sock = null;
+        setConn(pollTimer ? 'polling' : 'reconnecting');
+        scheduleReconnect();
+      };
+    }
+
+    function scheduleReconnect() {
+      tries++;
+      // Two failures without ever connecting means the socket is not getting
+      // through — an old proxy that won't forward Upgrade, most likely. Start
+      // polling, but keep retrying in the background so the page heals itself
+      // once that is fixed.
+      if (!everOpen && tries >= 2) startPolling();
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(connect, Math.min(30000, 1000 * Math.pow(2, Math.min(tries, 5))));
+    }
+
+    function startPolling() {
+      if (pollTimer) return;
+      setConn('polling');
+      var tick = function () {
+        fetch(base + '/api/live')
+          .then(function (r) { return r.json(); })
+          .then(apply)
+          .catch(function () {})
+          .then(function () {
+            if (pollTimer) pollTimer = setTimeout(tick, 4000);
+          });
+      };
+      pollTimer = setTimeout(tick, 0);
+    }
+
+    function stopPolling() {
+      if (!pollTimer) return;
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+
+    connect();
   }
 
   // --- Project page: trigger button ---

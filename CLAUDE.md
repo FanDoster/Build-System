@@ -58,6 +58,55 @@ One process, three long-lived goroutine groups sharing a `chan *models.Build`:
 `internal/logbus` is the in-memory pub/sub hub connecting the runner's output to SSE
 clients. The DB row is the durable copy; the topic buffer mirrors it byte-for-byte.
 
+### Two live transports, on purpose
+
+| | build page | list pages (dashboard, project) |
+| --- | --- | --- |
+| transport | SSE, `GET /api/builds/{id}/events` | WebSocket, `GET /api/live` |
+| payload | one build's log bytes + status | whole snapshot of the recent builds |
+| source | `internal/logbus` (per-build topics) | `internal/live` (one sampler) |
+| fallback | `GET .../log?offset=N` polling | `GET /api/live` polling (same payload) |
+
+They are not interchangeable. A log is an append-only byte stream where every byte
+matters and a reconnect must resume at an offset — SSE's `Last-Event-ID` does that for
+free. The dashboard needs the opposite: idempotent whole-state snapshots that a late or
+reconnecting client can apply blind, broadcast to every open page at once.
+
+`internal/live` **samples** rather than being notified: a single goroutine re-reads the
+recent builds every second while at least one client is subscribed, and fans out only
+when the serialized snapshot actually changed. Builds are created in four places (API,
+webhook, poller, startup recovery) and their statuses move in three more (runner,
+janitor, DB layer); a sampler observes all of them without a hook in each, and a missed
+hook would be silent. N idle dashboards therefore cost one query per second and zero
+bytes on the wire; zero dashboards cost nothing at all.
+
+`internal/ws` is a hand-rolled RFC 6455 server — ~200 lines covering exactly the
+one-way text-frame case, keeping `go.mod` at one direct dependency. It masks nothing
+(server frames must not be masked), rejects unmasked client frames, answers pings, and
+caps inbound payloads at 4 KiB. Do not grow it into a general WebSocket library; reach
+for a real one instead.
+
+**The WebSocket needs proxy cooperation.** nginx must forward the upgrade for
+`/api/live`, which is *not* the default:
+
+```nginx
+proxy_http_version 1.1;
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection $connection_upgrade;
+proxy_set_header Host $host;          # or the Origin check rejects every browser
+proxy_read_timeout 300s;              # idle sockets are pinged every 25s
+```
+
+Without it the handshake fails and the UI falls back to polling `/api/live` every 4s —
+degraded, not broken. The connection indicator next to "Recent Builds" says which mode
+is live (`● live` / `◌ polling` / `↻ reconnecting`), and `curl /api/live` returns the
+exact JSON the socket pushes.
+
+**`Host` matters.** `SameOrigin` (in `internal/ws`) compares the browser's `Origin`
+against `Host`/`X-Forwarded-Host`, because WebSocket has no CORS: without it any page
+on the internet could open a socket carrying the operator's cookie. A `proxy_pass` that
+leaves `Host` as the upstream address makes every browser fail that check.
+
 ### Things that will bite you
 
 **SQLite pragmas are driver-specific.** The driver is `modernc.org/sqlite`, which reads
@@ -78,6 +127,11 @@ added, or was removed without updating the comment.)
 
 **Templates and static assets are `go:embed`ed.** Editing HTML/CSS/JS requires a server
 restart, not just a refresh.
+
+**List row markup exists twice.** The dashboard cards (`index.html`) and project rows
+(`project.html`) are also built in JS (`buildCard`/`buildRow` in `app.js`) for rows the
+live feed adds after page load. Change one, change the other — the templates carry a
+comment saying so.
 
 **Ordering contract in SSE:** log bytes are always written *before* a terminal status
 event — the client closes its `EventSource` on a terminal status and would drop anything
@@ -220,5 +274,7 @@ server deploy itself deliberately would, at the cost of a self-restart mechanism
 
 Not bugs, just unbuilt: the registry host is hardcoded in `runner.go` (should be
 `BUILDS_REGISTRY`); images are tagged `:latest` only, so there is no rollback target;
-list endpoints serialize full logs per row; and `AppendBuildLog`'s string concat in
+`/api/builds` and `/api/projects/{id}/builds` still serialize full logs per row
+(`ListRecentBuildSummaries` is the log-free query the live feed uses — the list
+endpoints could take the same treatment); and `AppendBuildLog`'s string concat in
 SQLite is O(n²) for very large logs.

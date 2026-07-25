@@ -398,6 +398,49 @@ func (d *DB) ListRecentBuilds(limit int) ([]models.Build, error) {
 	return builds, rows.Err()
 }
 
+// buildSummaryCols is buildCols without the log blob, and scanBuildSummary
+// consumes it in order. The live dashboard feed re-reads the recent builds
+// every second; pulling every row's full log along with them would make that
+// cost proportional to log size for data no list view ever renders.
+const buildSummaryCols = `b.id, b.project_id, p.name, b.status, b.commit_sha, b.commit_message,
+	b.requeues, b.started_at, b.finished_at, b.created_at`
+
+func scanBuildSummary(s scanner) (*models.Build, error) {
+	b := &models.Build{}
+	err := s.Scan(&b.ID, &b.ProjectID, &b.ProjectName, &b.Status, &b.CommitSHA, &b.CommitMessage,
+		&b.Requeues, &b.StartedAt, &b.FinishedAt, &b.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// ListRecentBuildSummaries is ListRecentBuilds with Log left empty.
+func (d *DB) ListRecentBuildSummaries(limit int) ([]models.Build, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := d.conn.Query(
+		`SELECT `+buildSummaryCols+`
+		 FROM builds b JOIN projects p ON p.id = b.project_id
+		 ORDER BY b.created_at DESC, b.id DESC LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var builds []models.Build
+	for rows.Next() {
+		b, err := scanBuildSummary(rows)
+		if err != nil {
+			return nil, err
+		}
+		builds = append(builds, *b)
+	}
+	return builds, rows.Err()
+}
+
 func (d *DB) ListBuildsByStatus(status models.BuildStatus) ([]models.Build, error) {
 	rows, err := d.conn.Query(
 		`SELECT `+buildCols+`

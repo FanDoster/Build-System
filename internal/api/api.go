@@ -14,17 +14,24 @@ import (
 	"time"
 
 	"github.com/FanDoster/Build-System/internal/db"
+	"github.com/FanDoster/Build-System/internal/live"
 	"github.com/FanDoster/Build-System/internal/logbus"
 	"github.com/FanDoster/Build-System/internal/models"
+	"github.com/FanDoster/Build-System/internal/ws"
 )
 
 // maxWebhookBody caps webhook payload reads (GitHub push payloads are far smaller).
 const maxWebhookBody = 1 << 20
 
+// livePingInterval is how often an idle dashboard socket is pinged. It has to
+// stay comfortably under the idle timeouts of intermediaries (nginx defaults
+// to 60s of silence) or a quiet dashboard would be cut off every minute.
+const livePingInterval = 25 * time.Second
+
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-07-25-requeue-on-restart"
+const Version = "2026-07-25-live-dashboard"
 
 // RunnerControl is the runner surface the API needs (implemented by
 // runner.Runner): canceling the in-flight build and reading its progress.
@@ -34,10 +41,13 @@ type RunnerControl interface {
 }
 
 type Server struct {
-	DB       *db.DB
-	BuildCh  chan *models.Build
-	Bus      *logbus.Bus
-	Runner   RunnerControl
+	DB      *db.DB
+	BuildCh chan *models.Build
+	Bus     *logbus.Bus
+	Runner  RunnerControl
+	// Live feeds the dashboard/project list pages. Optional: with a nil hub
+	// /api/live 503s and the UI falls back to polling.
+	Live     *live.Hub
 	BasePath string // e.g. "/builds"
 }
 
@@ -68,6 +78,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/projects/{id}/builds", s.handleListProjectBuilds)
 	mux.HandleFunc("GET /api/builds", s.handleListRecentBuilds)
 	mux.HandleFunc("GET /api/builds/active", s.handleActiveBuilds)
+	mux.HandleFunc("GET /api/live", s.handleLive)
 	mux.HandleFunc("GET /api/builds/{id}", s.handleGetBuild)
 	mux.HandleFunc("GET /api/builds/{id}/events", s.handleBuildEvents)
 	mux.HandleFunc("GET /api/builds/{id}/log", s.handleBuildLog)
@@ -375,30 +386,16 @@ func (s *Server) handleGetBuild(w http.ResponseWriter, r *http.Request) {
 			build.LogLen = int64(cur)
 		}
 		build.Log = ""
-		if build.Status == models.StatusPending {
-			if pos, err := s.DB.QueuePosition(id); err == nil {
-				build.QueuePosition = pos
-			}
-		}
 		s.decorateProgress(build)
 	}
 	writeJSON(w, 200, build)
 }
 
-// decorateProgress fills the live-progress fields for an active build: the
-// step the runner is on and the expected duration from recent history.
+// decorateProgress fills the computed live-progress fields of an active build
+// — queue position, current step, expected duration. The WebSocket feed pushes
+// the same fields, so the logic lives in internal/live and both use it.
 func (s *Server) decorateProgress(b *models.Build) {
-	if b.Status != models.StatusRunning && b.Status != models.StatusPending {
-		return
-	}
-	if b.Status == models.StatusRunning && s.Runner != nil {
-		if step, ok := s.Runner.Progress(b.ID); ok {
-			b.CurrentStep = step
-		}
-	}
-	if d, ok := s.DB.ExpectedDuration(b.ProjectID); ok {
-		b.ExpectedSecs = int64(d.Seconds() + 0.5)
-	}
+	live.Decorate(s.DB, s.Runner, b)
 }
 
 // handleActiveBuilds returns all pending and running builds, log-free, with
@@ -418,15 +415,81 @@ func (s *Server) handleActiveBuilds(w http.ResponseWriter, r *http.Request) {
 	active := make([]models.Build, 0, len(running)+len(pending))
 	for _, b := range append(running, pending...) {
 		b.Log = ""
-		if b.Status == models.StatusPending {
-			if pos, err := s.DB.QueuePosition(b.ID); err == nil {
-				b.QueuePosition = pos
-			}
-		}
 		s.decorateProgress(&b)
 		active = append(active, b)
 	}
 	writeJSON(w, 200, active)
+}
+
+// handleLive serves the dashboard feed: the recent builds with live progress,
+// pushed on change. A WebSocket upgrade gets a stream; a plain GET gets one
+// snapshot of the identical payload, which is both the fallback for a proxy
+// that will not forward Upgrade and the easiest way to inspect the feed by
+// hand (curl /api/live).
+//
+// Reads only. Nothing the client sends is interpreted, which is why the
+// endpoint needs no CSRF header — but it does need the origin check, since
+// WebSocket has no same-origin policy of its own.
+func (s *Server) handleLive(w http.ResponseWriter, r *http.Request) {
+	if s.Live == nil {
+		writeError(w, 503, "live feed not configured")
+		return
+	}
+	if !ws.IsUpgrade(r) {
+		snapshot, err := s.Live.Snapshot()
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(snapshot)
+		return
+	}
+	if !ws.SameOrigin(r) {
+		writeError(w, 403, "cross-origin websocket rejected")
+		return
+	}
+	conn, err := ws.Upgrade(w, r)
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	defer conn.Close()
+
+	updates, unsub := s.Live.Subscribe()
+	defer unsub()
+
+	// The read loop enforces the idle timeout and answers pings. It also gives
+	// this handler its disconnect signal: a client that closes or dies ends the
+	// loop, which closes done, which returns from here.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn.ReadLoop()
+	}()
+
+	ping := time.NewTicker(livePingInterval)
+	defer ping.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ping.C:
+			// Also the liveness probe for the write path: a peer that vanished
+			// without a FIN (a dropped NAT mapping) surfaces here as an error.
+			if err := conn.Ping(); err != nil {
+				return
+			}
+		case snapshot, open := <-updates:
+			if !open {
+				return // dropped as a slow subscriber; the client reconnects
+			}
+			if err := conn.WriteText(snapshot); err != nil {
+				return
+			}
+		}
+	}
 }
 
 // handleBuildLog serves the raw scrubbed log: full text, ?download=1

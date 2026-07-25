@@ -13,6 +13,7 @@ import (
 	"github.com/FanDoster/Build-System/internal/api"
 	"github.com/FanDoster/Build-System/internal/auth"
 	"github.com/FanDoster/Build-System/internal/db"
+	"github.com/FanDoster/Build-System/internal/live"
 	"github.com/FanDoster/Build-System/internal/logbus"
 	"github.com/FanDoster/Build-System/internal/models"
 	"github.com/FanDoster/Build-System/internal/poller"
@@ -63,8 +64,12 @@ func main() {
 	// Wire up HTTP
 	mux := http.NewServeMux()
 
+	// Live dashboard feed. Demand-driven: it samples the DB only while a list
+	// page is connected.
+	liveHub := live.New(database, r)
+
 	// API
-	apiServer := &api.Server{DB: database, BuildCh: buildCh, Bus: bus, Runner: r, BasePath: basePath}
+	apiServer := &api.Server{DB: database, BuildCh: buildCh, Bus: bus, Runner: r, Live: liveHub, BasePath: basePath}
 	apiServer.RegisterRoutes(mux)
 
 	// Web UI

@@ -24,12 +24,14 @@
   </div>
 </div>
 
-<h2>Build History</h2>
+<h2>Build History <span class="log-conn" id="live-conn" hidden style="font-weight:400"></span></h2>
 <table class="build-table">
   <thead>
     <tr><th>#</th><th>Commit</th><th>Message</th><th>Status</th><th>Started</th><th>Duration</th><th></th></tr>
   </thead>
-  <tbody>
+  <!-- Live-updated by app.js from the /api/live feed, filtered to this
+       project; the row markup below is mirrored in JS (buildRow). -->
+  <tbody data-live-list data-live-kind="row" data-live-project="{{.Project.ID}}" data-live-limit="20">
     {{range .Builds}}
     <tr data-live-build="{{.ID}}" data-status="{{.Status}}">
       <td><a href="{{$.BasePath}}/builds/{{.ID}}">{{.ID}}</a></td>
@@ -41,7 +43,7 @@
       <td><a href="{{$.BasePath}}/builds/{{.ID}}" class="btn">Logs</a></td>
     </tr>
     {{else}}
-    <tr><td colspan="7" class="meta">No builds yet.</td></tr>
+    <tr data-live-empty><td colspan="7" class="meta">No builds yet.</td></tr>
     {{end}}
   </tbody>
 </table>
