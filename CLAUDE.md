@@ -232,9 +232,12 @@ Polling invariants, each of which has a test in `internal/poller/poller_test.go`
 ### Secret scrubbing
 
 `injectToken` puts the token in **both** halves of the userinfo
-(`https://<token>:<token>@host/...`). Git ≥2.45 rejects username-only Basic auth and
-prompts for a password, which `GIT_TERMINAL_PROMPT=0` turns into `could not read
-Password`. `TestInjectToken` pins the format.
+(`https://<token>:<token>@host/...`) because that is the only form valid for every
+token type: GitHub accepts a *classic* PAT as the username, but a *fine-grained* one
+must arrive as the password, and a username-only URL leaves git nothing to send —
+which `GIT_TERMINAL_PROMPT=0` turns into `could not read Password`. The classic tokens
+in use today also work username-only, so this is robustness, not a live fix.
+`TestInjectToken` pins the format.
 
 Clone tokens are injected into the clone URL and must never reach a stored log. The
 scrubbing lives in `internal/runner/sink.go`, which scans complete `\n`/`\r`-terminated

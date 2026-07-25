@@ -326,13 +326,20 @@ Put a personal access token in `clone_token`. It is injected as the userinfo com
 of the clone URL for both the clone and the poller's `git ls-remote` probe.
 
 The injected URL is `https://<token>:<token>@github.com/...` — the token in **both**
-positions. That is not redundancy: git 2.45 and later require a username *and* a
-password for HTTP Basic auth, and a username-only URL makes git prompt, which with
-`GIT_TERMINAL_PROMPT=0` fails as `could not read Password for 'https://***@github.com'`.
-GitHub accepts a PAT in either position, so this needs no per-forge username. Don't
-"simplify" it back.
+positions, which is the form that works for every token type:
 
-Use a fine-grained PAT with read access to the specific repo; `gh auth token` prints one.
+- a **classic** PAT (`ghp_…`, 40 chars) is accepted by GitHub as the *username*, so a
+  username-only URL happens to work too;
+- a **fine-grained** PAT (`github_pat_…`) must be sent as the *password*, and a
+  username-only URL gives git nothing to send — with `GIT_TERMINAL_PROMPT=0` on every
+  command the runner spawns, that surfaces as
+  `could not read Password for 'https://***@github.com'`.
+
+Putting the token in both halves satisfies both without needing a per-forge username,
+so don't "simplify" it back. `TestInjectToken` pins the format.
+
+`gh auth token` prints a usable token; a fine-grained one needs read access to the
+specific repo.
 
 Tokens are **scrubbed from stored logs** — both the raw and percent-encoded forms are
 masked, in complete lines, so a token cannot be split across a flush and survive. This
