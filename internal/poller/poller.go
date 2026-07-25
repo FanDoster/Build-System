@@ -4,8 +4,9 @@
 // It is pull-based on purpose: nothing has to reach the build server, so it
 // works for repos on hosts that can't send webhooks, for a server behind NAT,
 // and for forges where configuring a webhook isn't an option. Webhooks stay
-// available and the two can be enabled together — a build queued by one is
-// visible to the other through HasActiveBuild, so a push won't be built twice.
+// available and the two can be enabled together — the poller checks whether a
+// commit already has a build before queueing one, so the two triggers racing
+// on the same push produce a single build.
 package poller
 
 import (
@@ -182,6 +183,18 @@ func (p *Poller) pollProject(id int64) {
 	}
 	if prev == sha {
 		touch(sha)
+		return
+	}
+
+	// Something else already built this exact commit — almost always the
+	// webhook, which the poller races on every push when both are enabled.
+	// Adopt the baseline: the commit is covered, and queueing here would
+	// duplicate a build that is already done or in flight. This check must
+	// come BEFORE the in-flight one below, which cannot tell whether the
+	// running build is for this commit or an older one.
+	if built, err := p.DB.HasBuildForCommit(project.ID, sha); err == nil && built {
+		touch(sha)
+		log.Printf("Poller: %s: %s already built by another trigger", project.Name, sha)
 		return
 	}
 

@@ -154,6 +154,73 @@ func TestUnchangedTipDoesNotBuild(t *testing.T) {
 	}
 }
 
+// Regression: build 61 in production. The webhook and the poller race on
+// every push when both are enabled. The poller deferred one sweep while the
+// webhook's build ran, then — seeing its baseline still behind — queued a
+// second build of a commit that had just been built successfully.
+func TestCommitAlreadyBuiltByWebhookIsNotRebuilt(t *testing.T) {
+	f := newFixture(t)
+	p := f.project(true, 30)
+	f.p.Sweep() // seed at aaaa…
+
+	// The webhook gets there first with the new commit.
+	webhook := &models.Build{ProjectID: p.ID, Status: models.StatusRunning, CommitSHA: "dddddddddddd"}
+	if err := f.db.CreateBuild(webhook); err != nil {
+		t.Fatal(err)
+	}
+	f.setRemote("dddddddddddd4444", nil)
+
+	// Sweep while it runs: covered, so the baseline is adopted outright — not
+	// merely deferred, which is what produced the duplicate.
+	f.forceDue(p.ID)
+	f.p.Sweep()
+	if got := f.queued(); len(got) != 0 {
+		t.Fatalf("queued %d builds for a commit the webhook was building, want 0", len(got))
+	}
+	after, _ := f.db.GetProject(p.ID)
+	if after.LastPolledSHA != "dddddddddddd" {
+		t.Errorf("LastPolledSHA = %q, want the baseline adopted", after.LastPolledSHA)
+	}
+
+	// And still nothing once that build finishes — this is the sweep that
+	// used to queue the duplicate.
+	if err := f.db.FinishBuild(webhook.ID, models.StatusSuccess); err != nil {
+		t.Fatal(err)
+	}
+	f.forceDue(p.ID)
+	f.p.Sweep()
+	if got := f.queued(); len(got) != 0 {
+		t.Errorf("queued %d duplicate builds after the webhook's build finished, want 0", len(got))
+	}
+}
+
+// A commit whose build failed must not be retried on every sweep — the
+// baseline advance plus the already-built check both have to hold for that.
+func TestFailedCommitIsNotRetried(t *testing.T) {
+	f := newFixture(t)
+	p := f.project(true, 30)
+	f.p.Sweep() // seed
+
+	f.setRemote("eeeeeeeeeeee5555", nil)
+	f.forceDue(p.ID)
+	f.p.Sweep()
+	got := f.queued()
+	if len(got) != 1 {
+		t.Fatalf("queued %d builds, want 1", len(got))
+	}
+	if err := f.db.FinishBuild(got[0].ID, models.StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 3; i++ {
+		f.forceDue(p.ID)
+		f.p.Sweep()
+	}
+	if n := len(f.queued()); n != 0 {
+		t.Errorf("queued %d retries of a failed commit, want 0", n)
+	}
+}
+
 // A commit that lands mid-build must not stack a second build behind the
 // running one — but it must not be forgotten either: the in-flight build has
 // its own commit pinned and will never produce an image for this one.

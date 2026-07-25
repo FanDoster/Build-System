@@ -274,6 +274,24 @@ func (d *DB) ResetPollState(id int64) error {
 	return err
 }
 
+// HasBuildForCommit reports whether the project already has a build — of any
+// status — for this commit. The poller uses it to stay out of the way of the
+// webhook: when both triggers are enabled they race on every push, and
+// without this the loser queues a second build of a commit that is already
+// covered. Any status counts, so a commit whose build failed is not retried
+// on a timer.
+func (d *DB) HasBuildForCommit(projectID int64, sha string) (bool, error) {
+	if sha == "" {
+		return false, nil
+	}
+	var exists int
+	err := d.conn.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM builds WHERE project_id=? AND commit_sha=?)`,
+		projectID, sha,
+	).Scan(&exists)
+	return exists == 1, err
+}
+
 // HasActiveBuild reports whether the project has a build queued or running.
 // The poller uses it to avoid stacking builds when one commit's build outlasts
 // the poll interval.

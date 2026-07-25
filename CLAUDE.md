@@ -114,6 +114,11 @@ Polling invariants, each of which has a test in `internal/poller/poller_test.go`
 
 - Enabling only **seeds** the baseline; it never builds. Otherwise turning it on would
   rebuild whatever the branch already pointed at.
+- A commit that **already has a build** (any status, any trigger) is never queued again.
+  This is what keeps webhook + polling from double-building every push — they race, and
+  the loser must adopt the baseline rather than build. It also stops a failed commit
+  being retried every sweep. This check must stay *before* the in-flight check, which
+  cannot tell whether the running build is for this commit or an older one.
 - A failed probe **keeps** the last known tip, so a remote coming back up doesn't build
   an old commit.
 - A commit landing mid-build is **deferred, not dropped** — the in-flight build has its
