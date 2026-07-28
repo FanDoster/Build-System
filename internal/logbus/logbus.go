@@ -152,6 +152,31 @@ func (b *Bus) PublishStatus(id int64, status models.BuildStatus, startedAt, fini
 	}
 }
 
+// Seed installs already-durable log bytes into a topic's buffer WITHOUT
+// publishing them, and only when the buffer is shorter than what it is given.
+//
+// It exists for one situation: a build that outlived the process streaming it.
+// A remote agent keeps building across a server restart, so the new process
+// meets a build whose stored log is long and whose topic is brand new and
+// empty — and appending to that gap would hand subscribers offsets that mean
+// nothing. Seeding restores the invariant that the buffer mirrors the DB.
+//
+// The silence is the point. Anyone who subscribed to the empty topic replayed
+// those same bytes from the stored log (Subscribe returning cur == 0 is
+// exactly the signal handleBuildEvents uses to fall back to it), so
+// publishing them would paint the log twice.
+func (b *Bus) Seed(id int64, data []byte) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	t := b.topicLocked(id)
+	if t.closed || len(t.buf) >= len(data) {
+		return len(t.buf)
+	}
+	t.buf = append(t.buf[:0], data...)
+	return len(t.buf)
+}
+
 // LogTail returns buffered bytes from `from` without subscribing, plus the
 // current total offset. ok is false when the build has no live topic (serve
 // from the DB instead).

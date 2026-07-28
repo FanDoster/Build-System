@@ -221,3 +221,58 @@ func TestRateLimitLockout(t *testing.T) {
 		t.Errorf("after lockout: got %d, want 429 even with correct password", w.Code)
 	}
 }
+
+// A build agent authenticates with its own credential, so the machines running
+// builds never hold the password that signs into the UI.
+func TestAgentTokenAuthenticatesButIsMarkedAsAgent(t *testing.T) {
+	d := testDB(t)
+	a, err := New(d, "operator-pw", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.SetAgentToken("agent-tok")
+
+	var sawAuthed, sawAgent bool
+	h := a.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAuthed, sawAgent = IsAuthed(r.Context()), IsAgent(r.Context())
+		w.WriteHeader(200)
+	}))
+
+	call := func(bearer string) int {
+		sawAuthed, sawAgent = false, false
+		req := httptest.NewRequest("GET", "/api/projects", nil)
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	if code := call("agent-tok"); code != 200 {
+		t.Fatalf("agent token: status %d, want 200", code)
+	}
+	if !sawAuthed || !sawAgent {
+		t.Errorf("agent request: authed=%v agent=%v, want both true", sawAuthed, sawAgent)
+	}
+
+	if code := call("operator-pw"); code != 200 {
+		t.Fatalf("operator password: status %d, want 200", code)
+	}
+	if !sawAuthed || sawAgent {
+		t.Errorf("operator request: authed=%v agent=%v, want authed only", sawAuthed, sawAgent)
+	}
+
+	if code := call("wrong"); code != 401 {
+		t.Errorf("bad token: status %d, want 401", code)
+	}
+	// With no agent token configured, only the password works.
+	b, _ := New(d, "operator-pw", "", "")
+	req := httptest.NewRequest("GET", "/api/projects", nil)
+	req.Header.Set("Authorization", "Bearer agent-tok")
+	w := httptest.NewRecorder()
+	b.Middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(w, req)
+	if w.Code != 401 {
+		t.Errorf("agent token with none configured: status %d, want 401", w.Code)
+	}
+}

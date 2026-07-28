@@ -81,7 +81,10 @@ func main() {
 	liveHub := live.New(database, r)
 
 	// API
-	apiServer := &api.Server{DB: database, BuildCh: buildCh, Bus: bus, Runner: r, Live: liveHub, BasePath: basePath}
+	// Notifier: agent builds reach their terminal state through the API rather
+	// than the worker's finish(), so the mail hook has to be reachable from
+	// there too.
+	apiServer := &api.Server{DB: database, BuildCh: buildCh, Bus: bus, Runner: r, Live: liveHub, BasePath: basePath, Notifier: r}
 	apiServer.RegisterRoutes(mux)
 
 	// Web UI
@@ -93,11 +96,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialise auth: %v", err)
 	}
+	// Build agents authenticate with a credential of their own, so a build
+	// machine never holds the password that signs into the UI.
+	agentToken := os.Getenv("BUILDS_AGENT_TOKEN")
+	authz.SetAgentToken(agentToken)
 	if authz.Disabled() {
 		log.Println("WARNING: BUILDS_PASSWORD is not set — the UI and API are UNPROTECTED")
 	} else {
 		authz.RegisterRoutes(mux)
 		log.Println("Authentication enabled")
+		if agentToken != "" {
+			log.Println("Build-agent token accepted (BUILDS_AGENT_TOKEN)")
+		}
 	}
 
 	server := &http.Server{Addr: addr, Handler: authz.Middleware(mux)}
@@ -150,12 +160,19 @@ func recoverOrphanedBuilds(database *db.DB, buildCh chan *models.Build) {
 
 	// finished_at stays NULL for interrupted builds — the real end time is
 	// unknown, and stamping the restart time poisons history durations.
-	interrupted, err := database.FailStaleRunning(0)
+	//
+	// The floor is now: an agent's build is only failed here if it has been
+	// quiet for a full TTL measured from this moment, which in practice means
+	// never (this runs at startup). That is the point — an agent that kept
+	// building through the redeploy could not possibly have heartbeated while
+	// the server was down, and must not be punished for it. The janitor picks
+	// up the ones that really are dead a tick later.
+	interrupted, err := database.FailStaleRunning(0, time.Now())
 	if err != nil {
 		log.Printf("Recovery: failed to sweep running builds: %v", err)
 	}
-	for _, id := range interrupted {
-		log.Printf("Recovery: marked build %d failed (interrupted by restart)", id)
+	for _, sb := range interrupted {
+		log.Printf("Recovery: marked build %d failed (interrupted by restart)", sb.ID)
 	}
 	// One-time repair of rows swept by older code, which stamped finished_at
 	// with the restart time.
@@ -176,6 +193,13 @@ func recoverOrphanedBuilds(database *db.DB, buildCh chan *models.Build) {
 	}
 	for i := range pending {
 		b := &pending[i]
+		// A remote executor's pending row is not queue work for this process:
+		// the row itself is the queue, and its agent claims it over HTTP.
+		// Pushing it onto the local channel would hand a Unity build to the
+		// Docker runner.
+		if models.Remote(b.Executor) {
+			continue
+		}
 		select {
 		case buildCh <- b:
 			log.Printf("Recovery: re-queued pending build %d", b.ID)

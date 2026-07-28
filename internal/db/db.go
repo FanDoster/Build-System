@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -66,6 +67,7 @@ func (d *DB) migrate() error {
 			last_polled_sha TEXT NOT NULL DEFAULT '',
 			last_polled_at DATETIME,
 			last_poll_error TEXT NOT NULL DEFAULT '',
+			executor TEXT NOT NULL DEFAULT 'local',
 			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
 			updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
 		);
@@ -78,6 +80,9 @@ func (d *DB) migrate() error {
 			commit_message TEXT NOT NULL DEFAULT '',
 			log TEXT NOT NULL DEFAULT '',
 			requeues INTEGER NOT NULL DEFAULT 0,
+			agent TEXT NOT NULL DEFAULT '',
+			last_heartbeat_at DATETIME,
+			cancel_requested INTEGER NOT NULL DEFAULT 0,
 			started_at DATETIME,
 			finished_at DATETIME,
 			created_at DATETIME NOT NULL DEFAULT (datetime('now'))
@@ -103,7 +108,11 @@ func (d *DB) migrate() error {
 		{"projects", "last_polled_sha", "TEXT NOT NULL DEFAULT ''"},
 		{"projects", "last_polled_at", "DATETIME"},
 		{"projects", "last_poll_error", "TEXT NOT NULL DEFAULT ''"},
+		{"projects", "executor", "TEXT NOT NULL DEFAULT 'local'"},
 		{"builds", "requeues", "INTEGER NOT NULL DEFAULT 0"},
+		{"builds", "agent", "TEXT NOT NULL DEFAULT ''"},
+		{"builds", "last_heartbeat_at", "DATETIME"},
+		{"builds", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := d.addColumnIfMissing(c.table, c.column, c.decl); err != nil {
 			return err
@@ -163,7 +172,7 @@ func (d *DB) SetSetting(key, value string) error {
 const projectCols = `id, name, repo_url, branch, dockerfile_path, image_name,
 	deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache,
 	poll_enabled, poll_interval_secs, last_polled_sha, last_polled_at, last_poll_error,
-	created_at, updated_at`
+	executor, created_at, updated_at`
 
 // scanner is satisfied by both *sql.Row and *sql.Rows.
 type scanner interface{ Scan(dest ...any) error }
@@ -173,7 +182,7 @@ func scanProject(s scanner) (*models.Project, error) {
 	err := s.Scan(&p.ID, &p.Name, &p.RepoURL, &p.Branch, &p.DockerfilePath, &p.ImageName,
 		&p.DeployComposePath, &p.DeployServiceName, &p.WebhookSecret, &p.CloneToken, &p.NoCache,
 		&p.PollEnabled, &p.PollIntervalSecs, &p.LastPolledSHA, &p.LastPolledAt, &p.LastPollError,
-		&p.CreatedAt, &p.UpdatedAt)
+		&p.Executor, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -186,12 +195,15 @@ func (d *DB) CreateProject(p *models.Project) error {
 	if p.PollIntervalSecs == 0 {
 		p.PollIntervalSecs = models.DefaultPollIntervalSecs
 	}
+	if p.Executor == "" {
+		p.Executor = models.ExecutorLocal
+	}
 	res, err := d.conn.Exec(
-		`INSERT INTO projects (name, repo_url, branch, dockerfile_path, image_name, deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache, poll_enabled, poll_interval_secs, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO projects (name, repo_url, branch, dockerfile_path, image_name, deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache, poll_enabled, poll_interval_secs, executor, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.Name, p.RepoURL, p.Branch, p.DockerfilePath, p.ImageName,
 		p.DeployComposePath, p.DeployServiceName, p.WebhookSecret, p.CloneToken, p.NoCache,
-		p.PollEnabled, p.PollIntervalSecs,
+		p.PollEnabled, p.PollIntervalSecs, p.Executor,
 		p.CreatedAt, p.UpdatedAt,
 	)
 	if err != nil {
@@ -237,14 +249,17 @@ func (d *DB) ListProjects() ([]models.Project, error) {
 // clobber state the poller owns, and the poller uses UpdatePollState.
 func (d *DB) UpdateProject(p *models.Project) error {
 	p.UpdatedAt = time.Now().UTC()
+	if p.Executor == "" {
+		p.Executor = models.ExecutorLocal
+	}
 	_, err := d.conn.Exec(
 		`UPDATE projects SET name=?, repo_url=?, branch=?, dockerfile_path=?, image_name=?,
 		 deploy_compose_path=?, deploy_service_name=?, webhook_secret=?, clone_token=?, no_cache=?,
-		 poll_enabled=?, poll_interval_secs=?, updated_at=?
+		 poll_enabled=?, poll_interval_secs=?, executor=?, updated_at=?
 		 WHERE id=?`,
 		p.Name, p.RepoURL, p.Branch, p.DockerfilePath, p.ImageName,
 		p.DeployComposePath, p.DeployServiceName, p.WebhookSecret, p.CloneToken, p.NoCache,
-		p.PollEnabled, p.PollIntervalSecs,
+		p.PollEnabled, p.PollIntervalSecs, p.Executor,
 		p.UpdatedAt, p.ID,
 	)
 	return err
@@ -328,12 +343,14 @@ func (d *DB) CreateBuild(b *models.Build) error {
 
 // buildCols is the full read column list; scanBuild consumes it in order.
 const buildCols = `b.id, b.project_id, p.name, b.status, b.commit_sha, b.commit_message,
-	b.log, b.requeues, b.started_at, b.finished_at, b.created_at`
+	b.log, b.requeues, b.started_at, b.finished_at, b.created_at,
+	p.executor, b.agent, b.last_heartbeat_at, b.cancel_requested`
 
 func scanBuild(s scanner) (*models.Build, error) {
 	b := &models.Build{}
 	err := s.Scan(&b.ID, &b.ProjectID, &b.ProjectName, &b.Status, &b.CommitSHA, &b.CommitMessage,
-		&b.Log, &b.Requeues, &b.StartedAt, &b.FinishedAt, &b.CreatedAt)
+		&b.Log, &b.Requeues, &b.StartedAt, &b.FinishedAt, &b.CreatedAt,
+		&b.Executor, &b.Agent, &b.LastHeartbeatAt, &b.CancelRequested)
 	if err != nil {
 		return nil, err
 	}
@@ -403,12 +420,14 @@ func (d *DB) ListRecentBuilds(limit int) ([]models.Build, error) {
 // every second; pulling every row's full log along with them would make that
 // cost proportional to log size for data no list view ever renders.
 const buildSummaryCols = `b.id, b.project_id, p.name, b.status, b.commit_sha, b.commit_message,
-	b.requeues, b.started_at, b.finished_at, b.created_at`
+	b.requeues, b.started_at, b.finished_at, b.created_at,
+	p.executor, b.agent, b.last_heartbeat_at, b.cancel_requested`
 
 func scanBuildSummary(s scanner) (*models.Build, error) {
 	b := &models.Build{}
 	err := s.Scan(&b.ID, &b.ProjectID, &b.ProjectName, &b.Status, &b.CommitSHA, &b.CommitMessage,
-		&b.Requeues, &b.StartedAt, &b.FinishedAt, &b.CreatedAt)
+		&b.Requeues, &b.StartedAt, &b.FinishedAt, &b.CreatedAt,
+		&b.Executor, &b.Agent, &b.LastHeartbeatAt, &b.CancelRequested)
 	if err != nil {
 		return nil, err
 	}
@@ -488,6 +507,109 @@ func (d *DB) ClaimBuild(id int64) (bool, error) {
 	return n == 1, err
 }
 
+// ClaimBuildForAgent atomically claims the oldest pending build belonging to a
+// project whose executor is one of executors, marking it running and owned by
+// agent. Returns (nil, nil) when there is nothing to claim.
+//
+// One statement, so two agents polling at once cannot claim the same build:
+// the sub-select picks a candidate and the outer WHERE re-checks that it is
+// still pending inside the same write, which is ClaimBuild's compare-and-swap
+// generalised to a queue with more than one waiting worker.
+func (d *DB) ClaimBuildForAgent(agent string, executors []string) (*models.Build, error) {
+	if agent == "" || len(executors) == 0 {
+		return nil, nil
+	}
+	args := []any{time.Now().UTC(), agent, time.Now().UTC()}
+	placeholders := make([]string, len(executors))
+	for i, e := range executors {
+		placeholders[i] = "?"
+		args = append(args, e)
+	}
+
+	var id int64
+	err := d.conn.QueryRow(
+		`UPDATE builds
+		 SET status='running', started_at=?, agent=?, last_heartbeat_at=?, cancel_requested=0
+		 WHERE id = (
+		     SELECT b.id FROM builds b JOIN projects p ON p.id = b.project_id
+		     WHERE b.status='pending' AND p.executor IN (`+strings.Join(placeholders, ",")+`)
+		     ORDER BY b.id LIMIT 1
+		 ) AND status='pending'
+		 RETURNING id`, args...).Scan(&id)
+	if err == sql.ErrNoRows {
+		return nil, nil // nothing waiting for this agent
+	}
+	if err != nil {
+		return nil, err
+	}
+	return d.GetBuild(id)
+}
+
+// HeartbeatBuild renews an agent's lease on a running build it owns. ok is
+// false when the build is not running or belongs to a different agent — the
+// agent should stop working on it. cancel reports whether someone has asked
+// for the build to be canceled; piggybacking it on the response the agent
+// already makes is the only way a cancel reaches an out-of-process executor.
+func (d *DB) HeartbeatBuild(id int64, agent string) (ok bool, cancel bool, err error) {
+	if agent == "" {
+		return false, false, nil
+	}
+	err = d.conn.QueryRow(
+		`UPDATE builds SET last_heartbeat_at=?
+		 WHERE id=? AND status=? AND agent=?
+		 RETURNING cancel_requested`,
+		time.Now().UTC(), id, models.StatusRunning, agent,
+	).Scan(&cancel)
+	if err == sql.ErrNoRows {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	return true, cancel, nil
+}
+
+// RequestAgentCancel flags a running agent-owned build for cancellation.
+// Returns false when the build is not in a state an agent could cancel.
+func (d *DB) RequestAgentCancel(id int64) (bool, error) {
+	res, err := d.conn.Exec(
+		`UPDATE builds SET cancel_requested=1 WHERE id=? AND status=? AND agent != ''`,
+		id, models.StatusRunning,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// BuildLogLen returns the stored log's length in BYTES.
+//
+// The CAST is load-bearing: SQLite's length() counts CHARACTERS on a TEXT
+// value, so it drifts from the byte offsets the log protocol is written in the
+// moment a build prints a non-ASCII character — and Unity build logs are full
+// of them. length(CAST(log AS BLOB)) counts bytes, matching Go's len().
+func (d *DB) BuildLogLen(id int64) (int, error) {
+	var n int
+	err := d.conn.QueryRow(`SELECT length(CAST(log AS BLOB)) FROM builds WHERE id = ?`, id).Scan(&n)
+	return n, err
+}
+
+// BuildLogSlice returns n bytes of a build's log starting at byte offset.
+// Same CAST as BuildLogLen and for the same reason: substr() indexes
+// characters on a TEXT value, bytes on a BLOB.
+func (d *DB) BuildLogSlice(id int64, offset, n int) ([]byte, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	var out []byte
+	err := d.conn.QueryRow(
+		`SELECT substr(CAST(log AS BLOB), ?, ?) FROM builds WHERE id = ?`,
+		offset+1, n, id, // substr is 1-indexed
+	).Scan(&out)
+	return out, err
+}
+
 // CancelPendingBuild atomically cancels a build that has not started yet.
 // Returns false if the build was not pending.
 func (d *DB) CancelPendingBuild(id int64) (bool, error) {
@@ -513,45 +635,86 @@ func (d *DB) FinishBuild(id int64, status models.BuildStatus) error {
 	return err
 }
 
-// FailStaleRunning marks every running build except exceptID as failed.
+// RestartNote and AgentLostNote are the two ways a running build dies without
+// anyone reporting its outcome. They are distinct because the remedies are:
+// the first means this server went down under a build it was running, the
+// second means a remote machine stopped answering and may have left a
+// half-finished upload behind it.
+const (
+	RestartNote   = "\n[ERROR] Build interrupted by server restart\n"
+	AgentLostNote = "\n[ERROR] Build agent stopped responding — no heartbeat received\n"
+)
+
+// FailStaleRunning marks stale running builds failed and returns their ids.
 // finished_at is deliberately left untouched (NULL): the build's real end
-// time is unknowable, and stamping "now" poisons history durations. With a
-// single worker, any running row that isn't the current build is stale by
-// definition (crash, SIGKILL, or an abandoned process).
-func (d *DB) FailStaleRunning(exceptID int64) ([]int64, error) {
+// time is unknowable, and stamping "now" poisons history durations.
+//
+// Two kinds of row are running at any moment, and only one of them is the
+// local worker's. For local builds the single-worker invariant still holds —
+// any running row that isn't exceptID is stale by definition (crash, SIGKILL,
+// or an abandoned process). Agent-owned rows carry no such guarantee: a build
+// running on another machine is perfectly healthy as long as its agent keeps
+// checking in, so it is stale only once its heartbeat goes quiet for
+// AgentHeartbeatTTL measured from agentFloor (see models.AgentStale — the
+// floor is what lets an agent build survive a redeploy of this server).
+//
+// Staleness is decided in Go rather than SQL on purpose: the driver stores
+// time.Time in Go's own format while SQLite's datetime() defaults write
+// another, so comparing the two in a WHERE clause is a trap.
+// StaleBuild is one build a sweep gave up on, and the bytes it appended to
+// that build's log saying so. Callers need the note, not just the id: a live
+// build's stored log and its logbus buffer have to stay byte-identical, so
+// whoever holds the bus must publish the same bytes this wrote in SQL.
+type StaleBuild struct {
+	ID   int64
+	Note string
+}
+
+func (d *DB) FailStaleRunning(exceptID int64, agentFloor time.Time) ([]StaleBuild, error) {
 	rows, err := d.conn.Query(
-		`SELECT id FROM builds WHERE status=? AND id != ?`, models.StatusRunning, exceptID,
+		`SELECT id, agent, last_heartbeat_at FROM builds WHERE status=? AND id != ?`,
+		models.StatusRunning, exceptID,
 	)
 	if err != nil {
 		return nil, err
 	}
-	var ids []int64
+	var stale []StaleBuild
+	now := time.Now()
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+		var (
+			id    int64
+			agent string
+			beat  *time.Time
+		)
+		if err := rows.Scan(&id, &agent, &beat); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		ids = append(ids, id)
+		note := RestartNote
+		if agent != "" {
+			if !models.AgentStale(beat, agentFloor, now) {
+				continue // still checking in — someone else's live build
+			}
+			note = AgentLostNote
+		}
+		stale = append(stale, StaleBuild{ID: id, Note: note})
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	var failed []int64
-	for _, id := range ids {
+	var failed []StaleBuild
+	for _, sb := range stale {
 		res, err := d.conn.Exec(
 			`UPDATE builds SET status=?, log = log || ? WHERE id=? AND status=?`,
-			models.StatusFailed,
-			"\n[ERROR] Build interrupted by server restart\n",
-			id, models.StatusRunning,
+			models.StatusFailed, sb.Note, sb.ID, models.StatusRunning,
 		)
 		if err != nil {
 			continue
 		}
 		if n, _ := res.RowsAffected(); n == 1 {
-			failed = append(failed, id)
+			failed = append(failed, sb)
 		}
 	}
 	return failed, nil
@@ -587,9 +750,15 @@ func (d *DB) RequeueBuild(id int64, maxRequeues int) (bool, error) {
 // builds a hard kill (SIGKILL after the stop grace period) left stranded as
 // running, since that path never got to write anything. Rows over the requeue
 // cap are left alone for FailStaleRunning to mark failed.
+//
+// Agent-owned builds are excluded (agent = ”). Re-running one is not free the
+// way re-running a Docker build is: an agent build may already have pushed a
+// player to Steam, and this server has no way to know how far it got. A live
+// agent's build also has to be left alone entirely — it is still running on
+// the other machine and will report its own outcome.
 func (d *DB) RequeueStaleRunning(maxRequeues int) ([]int64, error) {
 	rows, err := d.conn.Query(
-		`SELECT id FROM builds WHERE status=? AND requeues < ?`,
+		`SELECT id FROM builds WHERE status=? AND requeues < ? AND agent = ''`,
 		models.StatusRunning, maxRequeues,
 	)
 	if err != nil {
@@ -685,18 +854,42 @@ func (d *DB) ExpectedDuration(projectID int64) (time.Duration, bool) {
 }
 
 // QueuePosition returns a pending build's 1-based position in the run order:
-// pending builds ahead of it (lower id) plus one slot for any running build.
+// builds ahead of it (lower id) plus one slot per build already running.
+//
+// Counted within the build's own executor, because there is one queue per
+// executor and they do not wait on each other. A Docker build is not behind
+// five Unity builds stacked up for an offline Mac, and saying so would be
+// worse than saying nothing — the number is read as "how long until mine
+// starts". Empty and "local" are the same queue; every project predating the
+// column has no executor set.
 func (d *DB) QueuePosition(id int64) (int, error) {
-	var ahead int
+	var executor string
 	err := d.conn.QueryRow(
-		`SELECT COUNT(*) FROM builds WHERE status=? AND id < ?`, models.StatusPending, id,
+		`SELECT p.executor FROM builds b JOIN projects p ON p.id = b.project_id WHERE b.id = ?`, id,
+	).Scan(&executor)
+	if err != nil {
+		return 0, err
+	}
+	if !models.Remote(executor) {
+		executor = models.ExecutorLocal
+	}
+	// Normalize '' to 'local' on the SQL side so both spellings match.
+	const sameQueue = `(CASE WHEN p.executor = '' THEN 'local' ELSE p.executor END) = ?`
+
+	var ahead int
+	err = d.conn.QueryRow(
+		`SELECT COUNT(*) FROM builds b JOIN projects p ON p.id = b.project_id
+		 WHERE b.status = ? AND b.id < ? AND `+sameQueue,
+		models.StatusPending, id, executor,
 	).Scan(&ahead)
 	if err != nil {
 		return 0, err
 	}
 	var running int
 	err = d.conn.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM builds WHERE status=?)`, models.StatusRunning,
+		`SELECT COUNT(*) FROM builds b JOIN projects p ON p.id = b.project_id
+		 WHERE b.status = ? AND `+sameQueue,
+		models.StatusRunning, executor,
 	).Scan(&running)
 	if err != nil {
 		return 0, err

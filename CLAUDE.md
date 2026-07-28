@@ -4,6 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This file is for working **on** the build server. For putting a *new project* onto it
 (create → trigger → deploy → expose), see [docs/adding-a-project.md](docs/adding-a-project.md).
+For builds that run on another machine (Unity on a Mac, say), see
+[docs/build-agents.md](docs/build-agents.md).
 
 ## What this is
 
@@ -44,6 +46,7 @@ BUILDS_DB=/tmp/builds.db BUILDS_ADDR=:8899 go run ./cmd/builds
 | `BUILDS_BASE_PATH` | `""` | e.g. `/builds` when behind a path-stripping proxy |
 | `BUILDS_BUILD_TIMEOUT` | `30m` | Go duration |
 | `BUILDS_PASSWORD` / `BUILDS_PASSWORD_HASH` | unset | Unset **disables auth entirely** (the server logs a loud warning). Hash (bcrypt) wins when both are set. |
+| `BUILDS_AGENT_TOKEN` | unset | Credential for build agents, separate from the operator password so a build machine never holds it. Requests bearing it are refused by the project-management endpoints. |
 | `BUILDS_NOTIFY_EMAIL` | unset | Recipient of build-completion mail. Unset disables it. |
 | `BUILDS_PUBLIC_URL` | `""` | e.g. `https://fandoster.com/builds`. Only used for the link in that mail — the server never sees its own external URL. |
 | `BUILDS_SMTP_ADDR` | `172.17.0.1:25` | The host's Postfix over the Docker bridge. Override is for tests. |
@@ -56,10 +59,31 @@ One process, three long-lived goroutine groups sharing a `chan *models.Build`:
   it on the channel.
 - **Runner** (`internal/runner`) — a **single** worker draining that channel, plus a
   janitor. Single-worker is an invariant, not a coincidence: the janitor assumes any
-  `running` row that isn't the current build is stale, so **two server processes against
-  one DB will fail each other's builds**.
+  *local* `running` row that isn't the current build is stale, so **two server processes
+  against one DB will fail each other's builds**.
 - **Poller** (`internal/poller`) — sweeps every 10s, `git ls-remote`s each enabled
   project, and pushes builds onto the same channel.
+
+### Two executors
+
+`projects.executor` decides who runs a build: `local` (the Docker runner above) or the
+name of a queue a **remote build agent** claims from over HTTP. A remote build is never
+put on the channel — its `pending` row *is* the queue. Everything that creates a build
+goes through `api.Server.dispatch`, `poller.pollProject` or `recoverOrphanedBuilds`, and
+all three gate on `models.Remote(executor)`; miss one and a Unity build gets handed to
+the Docker runner. The protocol, timings and the janitor rules that follow from it are
+in [docs/build-agents.md](docs/build-agents.md).
+
+Two consequences worth holding on to here:
+
+- **The janitor cannot use "not mine" to mean "dead" for agent rows.** They are stale
+  only once their heartbeat is quiet for `models.AgentHeartbeatTTL`, measured from
+  `max(last_heartbeat_at, process start)`. That floor is what lets an agent's build
+  survive a redeploy — while the server is down no agent can heartbeat, so on restart
+  every one of them looks dead.
+- **Agent builds are failed, never requeued.** `RequeueStaleRunning` filters on
+  `agent = ''`. A Docker build is free to re-run; a build that may already have uploaded
+  to Steam is not, and the server cannot know how far it got.
 
 `internal/logbus` is the in-memory pub/sub hub connecting the runner's output to SSE
 clients. The DB row is the durable copy; the topic buffer mirrors it byte-for-byte.
@@ -187,7 +211,17 @@ below.
 appending to `builds.log` via SQL while subscribers exist has to mirror the same bytes
 onto the bus (`handleCancelBuild` does this for the cancel tombstone). This is why
 `db.RequeueBuild` does *not* write the log seam itself and `db.RequeueNote` is exported
-for callers to write at the right layer.
+for callers to write at the right layer. The agent log endpoint holds
+`Server.agentLogMu` across read-length → publish → append for the same reason, and calls
+`logbus.Seed` first when the buffer is behind the row — which happens whenever a build
+outlives the process that was streaming it.
+
+**`length()` in SQLite counts characters, not bytes.** Log offsets are byte offsets, so
+`db.BuildLogLen` uses `length(CAST(log AS BLOB))`. The plain spelling agrees with Go's
+`len` right up until a build prints a non-ASCII character, and Unity logs are full of
+them. The driver also stores `time.Time` in Go's own format while SQLite's `datetime()`
+defaults write another, so **never compare timestamps in a WHERE clause** — that is why
+`FailStaleRunning` decides staleness in Go.
 
 **State-changing API endpoints require `X-Builds-Csrf: 1`.** Any curl script must send it.
 
@@ -311,6 +345,14 @@ causes a restart that interrupts whatever runs next. Requeueing makes that survi
 rather than lossy; it does not stop the interruption. Removing the label and having the
 server deploy itself deliberately would, at the cost of a self-restart mechanism.
 
+
+An agent log append publishes to the bus before writing the row (the house ordering, so
+a subscriber's DB-fallback replay can never double up with a queued publish). If that DB
+write then fails — `SQLITE_BUSY` past the timeout, or a full disk — the agent retries
+from its old offset and the chunk lands in the buffer twice. The stored log stays
+correct and a reload after the topic expires shows the truth; only the live view of a
+build on an ailing server is affected. Fixing it properly needs a way to truncate a
+topic, which nothing else wants.
 
 Not bugs, just unbuilt: the registry host is hardcoded in `runner.go` (should be
 `BUILDS_REGISTRY`); images are tagged `:latest` only, so there is no rollback target;

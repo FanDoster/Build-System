@@ -2,12 +2,15 @@ package runner
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/FanDoster/Build-System/internal/db"
 	"github.com/FanDoster/Build-System/internal/logbus"
@@ -17,9 +20,27 @@ import (
 // testEnv wires a Runner against a real temp DB, a real local git repo, and
 // a stub `docker` binary on PATH that respects DOCKER_STUB_SLEEP/EXIT.
 type testEnv struct {
-	db  *db.DB
-	bus *logbus.Bus
-	r   *Runner
+	db     *db.DB
+	bus    *logbus.Bus
+	r      *Runner
+	dbPath string
+}
+
+// backdateHeartbeat ages a build's agent heartbeat, so the sweep sees what it
+// would see after that agent stopped answering. Done over a second connection
+// rather than through db's API: nothing in production ever writes a heartbeat
+// into the past, and that is not an ability to hand it.
+func (e *testEnv) backdateHeartbeat(t *testing.T, id int64, ago time.Duration) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", e.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`UPDATE builds SET last_heartbeat_at=? WHERE id=?`,
+		time.Now().UTC().Add(-ago), id); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func newTestEnv(t *testing.T) (*testEnv, *models.Build) {
@@ -54,7 +75,8 @@ func newTestEnv(t *testing.T) (*testEnv, *models.Build) {
 	git("add", "-A")
 	git("commit", "-qm", "init")
 
-	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	database, err := db.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +96,7 @@ func newTestEnv(t *testing.T) (*testEnv, *models.Build) {
 
 	bus := logbus.New()
 	r := New(database, make(chan *models.Build), bus)
-	return &testEnv{db: database, bus: bus, r: r}, b
+	return &testEnv{db: database, bus: bus, r: r, dbPath: dbPath}, b
 }
 
 func TestRunBuildSuccessEmitsGrammar(t *testing.T) {
@@ -421,4 +443,134 @@ func waitForStatus(t *testing.T, env *testEnv, id int64, want models.BuildStatus
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("build %d never reached status %s", id, want)
+}
+
+// The janitor must leave a remote agent's build alone. Without this the whole
+// build-agent design collapses: a Unity build takes tens of minutes, and every
+// sweep in that window would see a running row the local worker does not own.
+func TestSweepStaleSparesLiveAgentBuild(t *testing.T) {
+	env, _ := newTestEnv(t)
+
+	// A project whose builds run on an agent, with a build that agent claimed.
+	macProject := &models.Project{
+		Name: "game", RepoURL: "https://github.com/nmr/ship", Branch: "main",
+		DockerfilePath: "Dockerfile", ImageName: "game", Executor: "mac",
+	}
+	if err := env.db.CreateProject(macProject); err != nil {
+		t.Fatal(err)
+	}
+	b := &models.Build{ProjectID: macProject.ID, Status: models.StatusPending}
+	if err := env.db.CreateBuild(b); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := env.db.ClaimBuildForAgent("mac-1", []string{"mac"})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: %v %v", claimed, err)
+	}
+
+	// Pretend the process has been up a while, so the grace floor is not what
+	// is keeping the build alive — the heartbeat is.
+	env.r.SetStartedAt(time.Now().Add(-time.Hour))
+
+	// Several sweeps, as would happen across a long build.
+	for i := 0; i < 3; i++ {
+		if swept := env.r.SweepStale(); len(swept) != 0 {
+			t.Fatalf("sweep %d failed agent build(s) %v while the agent was heartbeating", i, swept)
+		}
+		if _, _, err := env.db.HeartbeatBuild(claimed.ID, "mac-1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ := env.db.GetBuild(claimed.ID)
+	if got.Status != models.StatusRunning {
+		t.Fatalf("agent build status = %s after sweeps, want running", got.Status)
+	}
+
+	// The dead-agent half of this rule (silence past the TTL fails the build,
+	// with its own log note) is covered at the DB layer, where a heartbeat can
+	// be backdated: see TestFailStaleRunningSparesLiveAgentBuilds.
+}
+
+// When the sweep gives up on an agent, the reason it writes to the row has to
+// reach the live stream too. The agent's build ran elsewhere but its logbus
+// topic lives in THIS process, so a note written only in SQL leaves the buffer
+// and the row disagreeing — and every reader prefers the buffer, so the
+// operator would see a build go red with no explanation.
+func TestSweepStaleMirrorsAgentLostNoteOntoBus(t *testing.T) {
+	env, _ := newTestEnv(t)
+	env.r.SetStartedAt(time.Now().Add(-time.Hour))
+
+	p := &models.Project{
+		Name: "game", RepoURL: "https://github.com/nmr/ship", Branch: "main",
+		DockerfilePath: "Dockerfile", ImageName: "game", Executor: "mac",
+	}
+	if err := env.db.CreateProject(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.db.CreateBuild(&models.Build{ProjectID: p.ID, Status: models.StatusPending}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := env.db.ClaimBuildForAgent("mac-1", []string{"mac"})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: %v %v", claimed, err)
+	}
+
+	// The agent streamed some output, the way the log endpoint would: bus and
+	// row together.
+	const line = "[12:00:00] ##[step:unity] compiling\n"
+	env.bus.Publish(claimed.ID, []byte(line))
+	if err := env.db.AppendBuildLog(claimed.ID, line); err != nil {
+		t.Fatal(err)
+	}
+
+	// Then its machine drops off the network.
+	env.backdateHeartbeat(t, claimed.ID, 10*models.AgentHeartbeatTTL)
+
+	if swept := env.r.SweepStale(); len(swept) != 1 || swept[0] != claimed.ID {
+		t.Fatalf("swept = %v, want the abandoned build %d", swept, claimed.ID)
+	}
+
+	stored, _ := env.db.GetBuild(claimed.ID)
+	if stored.Status != models.StatusFailed {
+		t.Errorf("status = %s, want failed", stored.Status)
+	}
+	if !strings.Contains(stored.Log, "agent stopped responding") {
+		t.Fatalf("stored log = %q, want the agent-lost note", stored.Log)
+	}
+	tail, cur, ok := env.bus.LogTail(claimed.ID, 0)
+	if !ok {
+		t.Fatal("topic gone; the buffer is retained after close for late readers")
+	}
+	if string(tail) != stored.Log || cur != len(stored.Log) {
+		t.Errorf("bus buffer %q (%d) != stored log %q (%d) — a reader would miss why the build failed",
+			tail, cur, stored.Log, len(stored.Log))
+	}
+}
+
+// The counterpart: a local build swept after a restart has no live topic, and
+// must not get one containing only the note — every reader prefers the buffer
+// while it exists, so that would hide the whole log behind one line.
+func TestSweepStaleLeavesEmptyTopicAloneForLocalBuilds(t *testing.T) {
+	env, build := newTestEnv(t)
+	env.r.SetStartedAt(time.Now().Add(-time.Hour))
+
+	if ok, err := env.db.ClaimBuild(build.ID); err != nil || !ok {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	const earlier = "[11:59:00] ##[step:build] from the process that died\n"
+	if err := env.db.AppendBuildLog(build.ID, earlier); err != nil {
+		t.Fatal(err)
+	}
+
+	if swept := env.r.SweepStale(); len(swept) != 1 {
+		t.Fatalf("swept = %v, want the orphaned local build", swept)
+	}
+	if _, cur, ok := env.bus.LogTail(build.ID, 0); ok && cur > 0 {
+		t.Errorf("sweep put %d bytes in a topic that had none; readers prefer the buffer "+
+			"and would see only that, not the stored log", cur)
+	}
+	stored, _ := env.db.GetBuild(build.ID)
+	if !strings.Contains(stored.Log, earlier) || !strings.Contains(stored.Log, "interrupted by server restart") {
+		t.Errorf("stored log = %q, want the earlier output plus the restart note", stored.Log)
+	}
 }

@@ -44,6 +44,11 @@
   <section class="settings-card">
     <h2 class="settings-heading">Build</h2>
     <div class="form-group">
+      <label for="f-executor">Executor</label>
+      <input id="f-executor" name="executor" value="{{.Project.Executor}}" spellcheck="false" style="max-width:220px">
+      <p class="form-hint"><span class="mono">local</span> builds a Docker image on this server. Any other name is a queue a build agent claims from — its builds wait here until an agent asking for that name picks one up, and the settings below do not apply to them.</p>
+    </div>
+    <div class="form-group">
       <label for="f-image">Image name</label>
       <input id="f-image" name="image_name" value="{{.Project.ImageName}}" required spellcheck="false">
       <p class="form-hint">Pushed as <span class="mono">registry.fandoster.com/&lt;image&gt;:latest</span>.</p>

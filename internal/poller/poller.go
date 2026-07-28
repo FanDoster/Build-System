@@ -223,6 +223,13 @@ func (p *Poller) pollProject(id int64) {
 		return // baseline stays put, so the next sweep retries this commit
 	}
 	touch(sha)
+	// A remote executor's build is not this process's work: the pending row is
+	// the queue an agent claims from over HTTP, and putting it on the local
+	// channel would run it here instead.
+	if models.Remote(project.Executor) {
+		log.Printf("Poller: %s: queued build %d for %s (executor %s)", project.Name, build.ID, sha, project.Executor)
+		return
+	}
 	select {
 	case p.BuildCh <- build:
 		log.Printf("Poller: %s: queued build %d for %s", project.Name, build.ID, sha)

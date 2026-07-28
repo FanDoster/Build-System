@@ -390,3 +390,39 @@ func TestGitLsRemote(t *testing.T) {
 		t.Error("expected an error for a missing branch")
 	}
 }
+
+// A polled project on a remote executor still gets a build row — that row IS
+// the agent's queue — but the row must not be pushed at the local worker.
+func TestPollCreatesBuildWithoutQueueingForRemoteExecutor(t *testing.T) {
+	f := newFixture(t)
+	p := f.project(true, 60)
+	p.Executor = "mac"
+	if err := f.db.UpdateProject(p); err != nil {
+		t.Fatal(err)
+	}
+
+	f.p.Sweep() // seeds the baseline
+	f.setRemote("bbbbbbbbbbbb2222", nil)
+	f.forceDue(p.ID)
+	f.p.Sweep()
+
+	if got := f.queued(); len(got) != 0 {
+		t.Fatalf("poller put %d remote-executor build(s) on the local channel; "+
+			"the Docker runner would have run them", len(got))
+	}
+	builds, err := f.db.ListBuildsByStatus(models.StatusPending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(builds) != 1 {
+		t.Fatalf("pending builds = %d, want 1 waiting for the agent to claim", len(builds))
+	}
+	if builds[0].Executor != "mac" {
+		t.Errorf("build executor = %q, want mac", builds[0].Executor)
+	}
+	// And an agent can pick it up.
+	claimed, err := f.db.ClaimBuildForAgent("mac-1", []string{"mac"})
+	if err != nil || claimed == nil {
+		t.Fatalf("agent could not claim the polled build: %v %v", claimed, err)
+	}
+}

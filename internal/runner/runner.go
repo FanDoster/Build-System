@@ -60,6 +60,13 @@ type Runner struct {
 	// killed processes) are swept to failed. Exposed for tests.
 	JanitorInterval time.Duration
 
+	// startedAt is when this process came up. It is the floor the sweep
+	// measures agent heartbeats from, so agents get a full grace period to
+	// check back in after a restart rather than all looking dead at once
+	// (they had nowhere to send heartbeats while the server was down).
+	// Exposed via SetStartedAt for tests.
+	startedAt time.Time
+
 	mu            sync.Mutex
 	currentID     int64
 	currentStep   string
@@ -75,10 +82,15 @@ func New(database *db.DB, jobs <-chan *models.Build, bus *logbus.Bus) *Runner {
 		Timeout:         DefaultBuildTimeout,
 		SMTPAddr:        defaultSMTPAddr,
 		JanitorInterval: 30 * time.Second,
+		startedAt:       time.Now(),
 		ctx:             ctx,
 		cancel:          func() { cancel(context.Canceled) },
 	}
 }
+
+// SetStartedAt overrides the agent-heartbeat grace floor. Tests use it to make
+// the sweep behave as though the process has been up for a while.
+func (r *Runner) SetStartedAt(t time.Time) { r.startedAt = t }
 
 func (r *Runner) Start() {
 	r.wg.Add(2)
@@ -123,9 +135,14 @@ func (r *Runner) setStep(step string) {
 
 // janitor periodically sweeps stale 'running' rows — builds a crashed or
 // killed process left behind — so history never shows phantom running
-// builds until the next restart. Single-worker invariant: any running row
-// that isn't the current build is stale. (Do not run two server processes
+// builds until the next restart. Single-worker invariant: any LOCAL running
+// row that isn't the current build is stale. (Do not run two server processes
 // against one DB; their janitors would fail each other's builds.)
+//
+// Builds claimed by a remote agent are the deliberate exception: they are
+// running on another machine, so "not mine" says nothing about their health.
+// Their liveness evidence is the heartbeat, and the sweep leaves them alone
+// until it goes quiet — see db.FailStaleRunning.
 func (r *Runner) janitor() {
 	defer r.wg.Done()
 	ticker := time.NewTicker(r.JanitorInterval)
@@ -150,13 +167,30 @@ func (r *Runner) janitor() {
 func (r *Runner) SweepStale() []int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	ids, err := r.DB.FailStaleRunning(r.currentID)
+	swept, err := r.DB.FailStaleRunning(r.currentID, r.startedAt)
 	if err != nil {
 		return nil
 	}
-	for _, id := range ids {
+	ids := make([]int64, 0, len(swept))
+	for _, sb := range swept {
+		// Mirror onto the bus the bytes the sweep just appended in SQL, so the
+		// buffer and the stored log stay identical for anyone watching. This
+		// matters for agent builds specifically: their topic lives in THIS
+		// process even though the build does not, so without the mirror the
+		// stream ends on a bare "failed" and the reader never learns why.
+		//
+		// Only when the topic already holds that build's log, though. Seeding
+		// an absent or empty topic with just this note would leave the buffer
+		// looking like a one-line log, and every reader prefers the buffer to
+		// the row while it exists — which would hide the whole build. An empty
+		// topic is the ordinary local-restart case, where the process that had
+		// the log is gone and the DB is rightly the only copy.
+		if _, cur, ok := r.Bus.LogTail(sb.ID, 0); ok && cur > 0 {
+			r.Bus.Publish(sb.ID, []byte(sb.Note))
+		}
 		// Close any open topic/subscribers; finished time is unknown.
-		r.Bus.PublishStatus(id, models.StatusFailed, nil, nil)
+		r.Bus.PublishStatus(sb.ID, models.StatusFailed, nil, nil)
+		ids = append(ids, sb.ID)
 	}
 	return ids
 }

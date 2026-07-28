@@ -36,6 +36,15 @@ const (
 	notifyTimeout = 10 * time.Second
 )
 
+// NotifyFinished sends the completion mail for a build this process did not
+// run itself — an agent's build, finished through the API. Same mail, same
+// fire-and-forget contract as the worker's own path; it exists because
+// finish() is unreachable for a build no worker ever touched, and a build
+// being remote is no reason to stop telling anyone it finished.
+func (r *Runner) NotifyFinished(buildID int64, status models.BuildStatus, startedAt, finishedAt time.Time) {
+	go r.notify(buildID, status, startedAt, finishedAt)
+}
+
 // notify emails the outcome of a finished build. Best effort by design: a mail
 // failure is logged and dropped, never surfaced into the build's own result —
 // the build already succeeded or failed on its own merits.

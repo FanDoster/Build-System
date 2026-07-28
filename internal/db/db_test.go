@@ -253,11 +253,11 @@ func TestFailStaleRunningPreservesUnknownFinishTime(t *testing.T) {
 	}
 	current, stale := mk(), mk()
 
-	failed, err := d.FailStaleRunning(current.ID)
+	failed, err := d.FailStaleRunning(current.ID, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(failed) != 1 || failed[0] != stale.ID {
+	if len(failed) != 1 || failed[0].ID != stale.ID {
 		t.Fatalf("failed ids = %v, want [%d]", failed, stale.ID)
 	}
 
@@ -469,7 +469,7 @@ func TestRequeueStaleRunning(t *testing.T) {
 	if stuck.Status != models.StatusRunning {
 		t.Errorf("exhausted build: status=%s, want it left for FailStaleRunning", stuck.Status)
 	}
-	if failed, err := d.FailStaleRunning(0); err != nil || len(failed) != 1 || failed[0] != exhausted.ID {
+	if failed, err := d.FailStaleRunning(0, time.Now()); err != nil || len(failed) != 1 || failed[0].ID != exhausted.ID {
 		t.Errorf("FailStaleRunning = %v (err=%v), want just build %d", failed, err, exhausted.ID)
 	}
 }

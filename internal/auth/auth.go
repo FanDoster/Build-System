@@ -42,6 +42,7 @@ const (
 )
 
 type ctxKey struct{}
+type agentKey struct{}
 
 // Auth is the middleware + login handlers. Zero-value is unusable; construct
 // with New.
@@ -50,6 +51,13 @@ type Auth struct {
 	hash     []byte // bcrypt mode (nil otherwise)
 	basePath string
 	secret   []byte
+
+	// agentToken is a second credential (BUILDS_AGENT_TOKEN) for build
+	// agents. It exists so the machines running builds never hold the
+	// operator's password: it can be rotated on its own, and requests bearing
+	// it are marked as agent requests so they can be kept away from the
+	// endpoints that reconfigure what gets built.
+	agentToken string
 
 	mu       sync.Mutex
 	attempts float64
@@ -104,6 +112,19 @@ func IsAuthed(ctx context.Context) bool {
 	return v
 }
 
+// IsAgent reports whether the request authenticated with the agent token
+// rather than the operator password. Handlers use it to refuse requests that
+// go beyond running builds — an agent's credential lives on a build machine,
+// and a build machine has no business creating or deleting projects.
+func IsAgent(ctx context.Context) bool {
+	v, _ := ctx.Value(agentKey{}).(bool)
+	return v
+}
+
+// SetAgentToken installs the agent credential. Empty (the default) means no
+// agent may authenticate and only the operator password works.
+func (a *Auth) SetAgentToken(tok string) { a.agentToken = tok }
+
 func (a *Auth) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/login", a.handleLogin)
 	mux.HandleFunc("POST /api/logout", a.handleLogout)
@@ -117,8 +138,10 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authed := a.requestAuthed(r)
-		r = r.WithContext(context.WithValue(r.Context(), ctxKey{}, authed))
+		authed, agent := a.requestAuthed(r)
+		ctx := context.WithValue(r.Context(), ctxKey{}, authed)
+		ctx = context.WithValue(ctx, agentKey{}, agent)
+		r = r.WithContext(ctx)
 
 		if openPath(r.URL.Path) || authed {
 			next.ServeHTTP(w, r)
@@ -145,15 +168,24 @@ func openPath(p string) bool {
 	return strings.HasPrefix(p, "/static/")
 }
 
-func (a *Auth) requestAuthed(r *http.Request) bool {
+// requestAuthed reports whether the request carries a valid credential, and
+// whether that credential was an agent's rather than the operator's.
+func (a *Auth) requestAuthed(r *http.Request) (authed, agent bool) {
 	if c, err := r.Cookie(cookieName); err == nil && a.validToken(c.Value) {
-		return true
+		return true, false
 	}
-	// Script convenience: the password itself as a bearer token.
+	// Script convenience: the password itself as a bearer token. A build
+	// agent presents its own token in the same header instead.
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-		return a.verifyPassword(strings.TrimPrefix(h, "Bearer "))
+		tok := strings.TrimPrefix(h, "Bearer ")
+		if a.verifyPassword(tok) {
+			return true, false
+		}
+		if a.agentToken != "" && subtle.ConstantTimeCompare([]byte(a.agentToken), []byte(tok)) == 1 {
+			return true, true
+		}
 	}
-	return false
+	return false, false
 }
 
 func (a *Auth) verifyPassword(candidate string) bool {

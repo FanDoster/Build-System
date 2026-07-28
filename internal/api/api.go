@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/FanDoster/Build-System/internal/auth"
 	"github.com/FanDoster/Build-System/internal/db"
 	"github.com/FanDoster/Build-System/internal/live"
 	"github.com/FanDoster/Build-System/internal/logbus"
@@ -31,13 +33,29 @@ const livePingInterval = 25 * time.Second
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-07-25-clone-token-auth"
+const Version = "2026-07-28-build-agents"
+
+// Agent long-poll defaults. The hold is deliberately under the 60s nginx
+// defaults with room to spare: a claim request that outlives proxy_read_timeout
+// comes back as a 504 and looks like a flapping agent. The interval is how
+// often an idle hold re-checks the queue — one cheap indexed read per second
+// per waiting agent.
+const (
+	DefaultAgentPollHold     = 30 * time.Second
+	DefaultAgentPollInterval = time.Second
+)
 
 // RunnerControl is the runner surface the API needs (implemented by
 // runner.Runner): canceling the in-flight build and reading its progress.
 type RunnerControl interface {
 	Cancel(buildID int64) bool
 	Progress(buildID int64) (step string, ok bool)
+}
+
+// Notifier sends the build-completion mail for builds this server finishes on
+// an agent's behalf. runner.Runner implements it; nil sends nothing.
+type Notifier interface {
+	NotifyFinished(buildID int64, status models.BuildStatus, startedAt, finishedAt time.Time)
 }
 
 type Server struct {
@@ -49,6 +67,19 @@ type Server struct {
 	// /api/live 503s and the UI falls back to polling.
 	Live     *live.Hub
 	BasePath string // e.g. "/builds"
+	// Notifier mails the outcome of agent-finished builds. Optional.
+	Notifier Notifier
+
+	// AgentPollHold/AgentPollInterval tune the claim long-poll; zero means the
+	// defaults above. Tests set them small.
+	AgentPollHold     time.Duration
+	AgentPollInterval time.Duration
+
+	// agentLogMu serialises the read-offset/publish/append sequence in
+	// handleAgentLog. The bus buffer and the stored log have to stay
+	// byte-identical, and that invariant spans three statements which two
+	// concurrent uploads would interleave.
+	agentLogMu sync.Mutex
 }
 
 type apiError struct {
@@ -85,6 +116,14 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/builds/{id}/cancel", s.handleCancelBuild)
 	mux.HandleFunc("POST /api/builds/{id}/rerun", s.handleRerunBuild)
 
+	// Build agents. Everything an agent does is a POST it initiates itself:
+	// the Mac running these builds sits behind NAT, so nothing here ever
+	// connects outwards to it.
+	mux.HandleFunc("POST /api/agents/claim", s.handleAgentClaim)
+	mux.HandleFunc("POST /api/builds/{id}/log", s.handleAgentLog)
+	mux.HandleFunc("POST /api/builds/{id}/heartbeat", s.handleAgentHeartbeat)
+	mux.HandleFunc("POST /api/builds/{id}/finish", s.handleAgentFinish)
+
 	mux.HandleFunc("POST /api/webhook/github", s.handleGitHubWebhook)
 }
 
@@ -99,8 +138,38 @@ func requireCsrf(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// requireOperator refuses agent credentials. An agent token lives in a file on
+// a build machine so that machine can run builds; it must not also be able to
+// change which repositories get built, or point a project at a different one.
+func requireOperator(w http.ResponseWriter, r *http.Request) bool {
+	if auth.IsAgent(r.Context()) {
+		writeError(w, 403, "agent credentials cannot manage projects")
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok", "version": Version})
+}
+
+// validExecutor accepts "" (meaning local), "local", or a queue name an agent
+// can match on. The character restriction keeps executor names to things that
+// read unambiguously in a config file and a URL — this is a routing key that
+// has to agree exactly with a string typed into an agent's config.
+func validExecutor(e string) error {
+	if e == "" || e == models.ExecutorLocal {
+		return nil
+	}
+	if len(e) > 32 {
+		return fmt.Errorf("executor must be 32 characters or fewer")
+	}
+	for _, r := range e {
+		if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '-' && r != '_' {
+			return fmt.Errorf("executor must be lowercase letters, digits, - or _ (got %q)", e)
+		}
+	}
+	return nil
 }
 
 // --- Projects ---
@@ -124,6 +193,9 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	if !requireCsrf(w, r) {
 		return
 	}
+	if !requireOperator(w, r) {
+		return
+	}
 	var p models.Project
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 		writeError(w, 400, "invalid JSON: "+err.Error())
@@ -144,6 +216,10 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.PollIntervalSecs < models.MinPollIntervalSecs {
 		writeError(w, 400, fmt.Sprintf("poll_interval_secs must be at least %d", models.MinPollIntervalSecs))
+		return
+	}
+	if err := validExecutor(p.Executor); err != nil {
+		writeError(w, 400, err.Error())
 		return
 	}
 
@@ -180,6 +256,9 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 	if !requireCsrf(w, r) {
 		return
 	}
+	if !requireOperator(w, r) {
+		return
+	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		writeError(w, 400, "invalid id")
@@ -206,6 +285,7 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 		NoCache           *bool   `json:"no_cache"`
 		PollEnabled       *bool   `json:"poll_enabled"`
 		PollIntervalSecs  *int    `json:"poll_interval_secs"`
+		Executor          *string `json:"executor"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
 		writeError(w, 400, "invalid JSON: "+err.Error())
@@ -227,6 +307,17 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, fmt.Sprintf("poll_interval_secs must be at least %d", models.MinPollIntervalSecs))
 		return
 	}
+	if updates.Executor != nil {
+		if err := validExecutor(*updates.Executor); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+	}
+
+	// Snapshot the executor before the updates are applied: moving a project
+	// off a remote executor has to adopt the builds that were waiting for its
+	// agent.
+	before := *existing
 
 	// The recorded poll baseline belongs to a specific ref; if either half of
 	// that ref changes, the stored SHA is meaningless and must not be compared
@@ -258,10 +349,33 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 	if updates.PollIntervalSecs != nil {
 		existing.PollIntervalSecs = *updates.PollIntervalSecs
 	}
+	if updates.Executor != nil {
+		existing.Executor = *updates.Executor
+		if existing.Executor == "" {
+			existing.Executor = models.ExecutorLocal
+		}
+	}
+
+	// Moving a project back to the local runner has to bring its waiting
+	// builds with it. A remote project's pending rows were deliberately never
+	// put on the channel — the agent was going to claim them — so after the
+	// switch nobody owns them, and they would sit pending until the next
+	// server restart happened to re-queue them.
+	adopt := models.Remote(existing.Executor) == false && models.Remote(before.Executor)
 
 	if err := s.DB.UpdateProject(existing); err != nil {
 		writeError(w, 500, err.Error())
 		return
+	}
+	if adopt {
+		pending, err := s.DB.ListBuildsByStatus(models.StatusPending)
+		if err == nil {
+			for i := range pending {
+				if pending[i].ProjectID == id {
+					s.enqueue(&pending[i])
+				}
+			}
+		}
 	}
 	if refChanged {
 		if err := s.DB.ResetPollState(id); err != nil {
@@ -277,6 +391,9 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 	if !requireCsrf(w, r) {
+		return
+	}
+	if !requireOperator(w, r) {
 		return
 	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
@@ -319,12 +436,26 @@ func (s *Server) handleTriggerBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.enqueue(build) {
+	if !s.dispatch(project, build) {
 		writeError(w, 503, "build queue is full, try again later")
 		return
 	}
 
 	writeJSON(w, 201, build)
+}
+
+// dispatch hands a newly created build to whoever will run it.
+//
+// A build for a remote executor is deliberately NOT put on the local channel:
+// its pending row IS the queue, and the agent serving that executor claims it
+// over HTTP whenever it next polls. This is the one gate that keeps a Unity
+// build from being handed to the Docker runner, so every path that creates a
+// build goes through here.
+func (s *Server) dispatch(project *models.Project, build *models.Build) bool {
+	if models.Remote(project.Executor) {
+		return true
+	}
+	return s.enqueue(build)
 }
 
 // enqueue attempts a non-blocking send to the build channel. On a full queue
@@ -702,8 +833,19 @@ func (s *Server) handleBuildEvents(w http.ResponseWriter, r *http.Request) {
 				writeLog(ev.Chunk, ev.Offset)
 				sent = ev.Offset
 			case "status":
-				// Per-subscriber FIFO: all log chunks published before a
-				// terminal status are already delivered above it.
+				// Per-subscriber FIFO: all log chunks published through the
+				// bus before a terminal status are already delivered above.
+				// Bytes appended straight to the row are not — a sweep writes
+				// its reason in SQL, and can only mirror it onto a buffer that
+				// still holds the build's log, which after a restart it does
+				// not. Backfill from the row so the stream never ends on a
+				// bare "failed" with the explanation sitting in the database.
+				if ev.Status.Terminal() {
+					if tail := s.storedTail(id, sent); tail != "" {
+						writeLog(tail, sent+len(tail))
+						sent += len(tail)
+					}
+				}
 				writeStatus(ev.Status, ev.StartedAt, ev.FinishedAt)
 			}
 			flusher.Flush()
@@ -712,6 +854,22 @@ func (s *Server) handleBuildEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// storedTail returns the stored log past the byte offset a subscriber has
+// already been sent, or "" when it is up to date. Reads the length and only
+// the tail rather than the whole row: on an ordinary build this runs once per
+// stream and finds nothing, and the row can be tens of megabytes.
+func (s *Server) storedTail(id int64, sent int) string {
+	n, err := s.DB.BuildLogLen(id)
+	if err != nil || n <= sent {
+		return ""
+	}
+	tail, err := s.DB.BuildLogSlice(id, sent, n-sent)
+	if err != nil {
+		return ""
+	}
+	return string(tail)
 }
 
 // handleCancelBuild cancels a queued or running build. Race-safe against the
@@ -752,7 +910,9 @@ func (s *Server) handleCancelBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	build, err := s.DB.GetBuild(id)
+	// Summary, not GetBuild: only the status and owner are read, and an agent
+	// build's log can be tens of megabytes.
+	build, err := s.DB.GetBuildSummary(id)
 	if err != nil {
 		writeError(w, 404, "build not found")
 		return
@@ -762,6 +922,21 @@ func (s *Server) handleCancelBuild(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]interface{}{"id": id, "status": models.StatusCanceled, "already": true})
 	case models.StatusSuccess, models.StatusFailed:
 		writeError(w, 409, "build already finished")
+	case models.StatusRunning:
+		// Running on an agent: nothing here can reach into that machine, so
+		// the cancel is left as a flag the agent reads off its next heartbeat
+		// or log-append response. The build stays running until the agent
+		// reports back — 202, not 200.
+		if build.Agent != "" {
+			if ok, err := s.DB.RequestAgentCancel(id); err != nil {
+				writeError(w, 500, err.Error())
+				return
+			} else if ok {
+				writeJSON(w, 202, map[string]interface{}{"id": id, "status": "canceling", "agent": build.Agent})
+				return
+			}
+		}
+		writeError(w, 409, "build could not be canceled, try again")
 	default:
 		writeError(w, 409, "build could not be canceled, try again")
 	}
@@ -777,12 +952,13 @@ func (s *Server) handleRerunBuild(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid id")
 		return
 	}
-	src, err := s.DB.GetBuild(id)
+	src, err := s.DB.GetBuildSummary(id)
 	if err != nil {
 		writeError(w, 404, "build not found")
 		return
 	}
-	if _, err := s.DB.GetProject(src.ProjectID); err != nil {
+	project, err := s.DB.GetProject(src.ProjectID)
+	if err != nil {
 		writeError(w, 404, "project no longer exists")
 		return
 	}
@@ -797,7 +973,7 @@ func (s *Server) handleRerunBuild(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
-	if !s.enqueue(build) {
+	if !s.dispatch(project, build) {
 		writeError(w, 503, "build queue is full, try again later")
 		return
 	}
@@ -896,7 +1072,7 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		if err := s.DB.CreateBuild(build); err != nil {
 			continue
 		}
-		if !s.enqueue(build) {
+		if !s.dispatch(&project, build) {
 			continue
 		}
 		created = append(created, build.ID)

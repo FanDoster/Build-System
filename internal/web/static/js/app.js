@@ -93,6 +93,7 @@
         no_cache: f.no_cache.checked,
         poll_enabled: f.poll_enabled.checked,
         poll_interval_secs: parseInt(f.poll_interval_secs.value, 10),
+        executor: f.executor.value.trim(),
       };
       if (!isFinite(payload.poll_interval_secs)) {
         showBanner('err', 'Poll interval must be a number.');

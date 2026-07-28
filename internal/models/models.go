@@ -17,6 +17,19 @@ func (s BuildStatus) Terminal() bool {
 	return s == StatusSuccess || s == StatusFailed || s == StatusCanceled
 }
 
+// ExecutorLocal names the built-in Docker runner — the single in-process
+// worker that has always run every build. Any other value is a queue name a
+// remote build agent serves: those builds are never put on the local channel,
+// their pending row IS the queue, and an agent claims it over HTTP.
+const ExecutorLocal = "local"
+
+// Remote reports whether an executor value routes builds to an agent rather
+// than the built-in runner. Empty counts as local — every project predating
+// the column has no executor set.
+func Remote(executor string) bool {
+	return executor != "" && executor != ExecutorLocal
+}
+
 type Project struct {
 	ID                int64  `json:"id"`
 	Name              string `json:"name"`
@@ -29,6 +42,10 @@ type Project struct {
 	WebhookSecret     string `json:"webhook_secret,omitempty"`
 	CloneToken        string `json:"clone_token,omitempty"`
 	NoCache           bool   `json:"no_cache"`
+	// Executor decides who runs this project's builds: ExecutorLocal (the
+	// Docker runner in this process) or the name of a queue an agent serves,
+	// e.g. "mac".
+	Executor string `json:"executor"`
 
 	// Polling: an alternative to GitHub Actions / webhooks. When enabled the
 	// server asks the remote for the branch tip every PollIntervalSecs and
@@ -93,12 +110,49 @@ type Build struct {
 	FinishedAt *time.Time `json:"finished_at"`
 	CreatedAt  time.Time  `json:"created_at"`
 
+	// Agent names the build agent that claimed this build; empty means the
+	// local Docker runner owns it. LastHeartbeatAt is when that agent last
+	// reported in — the janitor's only evidence it is still alive.
+	// CancelRequested is how a cancel reaches an out-of-process executor:
+	// nothing can call into an agent, so it reads the flag off its own next
+	// heartbeat or log-append response.
+	Agent           string     `json:"agent,omitempty"`
+	LastHeartbeatAt *time.Time `json:"last_heartbeat_at,omitempty"`
+	CancelRequested bool       `json:"cancel_requested,omitempty"`
+
+	// Executor is the owning project's executor, populated by the JOIN in the
+	// same way as ProjectName. Never stored on the build row.
+	Executor string `json:"executor,omitempty"`
+
 	// Computed, never stored. Populated only for ?meta=1 and /builds/active
 	// API responses.
 	LogLen        int64  `json:"log_len,omitempty"`
 	QueuePosition int    `json:"queue_position,omitempty"`
 	CurrentStep   string `json:"current_step,omitempty"`
 	ExpectedSecs  int64  `json:"expected_secs,omitempty"`
+}
+
+// AgentHeartbeatTTL is how long a build claimed by an agent may go without a
+// heartbeat before its agent is presumed dead and the build is failed. Three
+// missed beats at the agent's 20s interval, plus margin for a slow network.
+const AgentHeartbeatTTL = 90 * time.Second
+
+// AgentStale reports whether an agent-owned running build has gone quiet long
+// enough to presume its agent is gone.
+//
+// floor is the earliest instant an agent could have reported in to THIS server
+// process — its start time. It matters because after a restart every heartbeat
+// in the DB is old through no fault of the agent: it had nowhere to send them
+// while the server was down. Measuring from the floor gives every agent a full
+// TTL to check back in before its build is failed, which is what lets a live
+// agent build survive a redeploy. In steady state the stored heartbeat is
+// newer than the floor and dominates.
+func AgentStale(lastHeartbeat *time.Time, floor, now time.Time) bool {
+	last := floor
+	if lastHeartbeat != nil && lastHeartbeat.After(last) {
+		last = *lastHeartbeat
+	}
+	return now.Sub(last) >= AgentHeartbeatTTL
 }
 
 // Duration returns a human-readable build duration, or "" if the build
