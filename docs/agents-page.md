@@ -94,6 +94,69 @@ server change at all.
 
 ---
 
+## 4a. Transport security
+
+Everything an agent sends and receives is sensitive. Every request carries the
+agent token in an `Authorization` header, and **the claim response carries the
+project's GitHub clone token** — the one endpoint in the API that deliberately
+returns a secret unstripped. A page about agents has to account for how that
+traffic is protected, and be able to say when it is not.
+
+### Where it stands today (verified 2026-07-29)
+
+| | State |
+| --- | --- |
+| Production transport | TLS 1.3, `TLS_AES_256_GCM_SHA384`, certificate verifies (`Verify return code: 0`) |
+| Plain HTTP to the public host | `301` to `https://` |
+| Certificate checking in the agent | Go's default. No `InsecureSkipVerify` anywhere in either repository |
+| The server's own listener | `127.0.0.1:8082` — nginx terminates TLS, and the cleartext hop never leaves the machine |
+| Transport visible to the server | Yes. nginx sets `X-Forwarded-Proto $scheme` on `location ^~ /builds/` |
+| HSTS | Not set |
+
+So production is encrypted. The gap was that **nothing enforced it**: the
+agent's config accepted `http://` for any host, and a `POST` to a plaintext URL
+puts the token on the wire before the redirect ever comes back. The 301 does not
+protect the first request, and Go forwards the `Authorization` header across a
+same-host redirect.
+
+Closed in the agent (`internal/config`, `internal/client`): a non-loopback
+`server_url` must be `https`, and a redirect that downgrades to `http` is
+refused. Loopback stays exempt so a development server without a certificate
+still works.
+
+### What the page must do about it
+
+1. **Record and show the transport per agent.** The server reads
+   `X-Forwarded-Proto` (falling back to `r.TLS != nil` when nothing is in
+   front). Store it on the sighting and render it. An agent whose requests are
+   arriving in clear is a loud red warning, not a footnote — it means a token
+   has already been exposed and needs rotating.
+2. **Do not trust the header blindly.** `X-Forwarded-Proto` is client-supplied
+   unless a proxy overwrites it, and nginx here does overwrite it. Treat it as
+   evidence for a warning, never as an authorisation decision.
+3. **Never render a token.** The agents page is the first UI that would be
+   tempted to show "what the agent was given". It must not: the claim response
+   is the only place a clone token legitimately appears, and it belongs nowhere
+   near a web page. Build the page's data path on `ListProjects`, which
+   sanitizes, not `GetProject`, which does not.
+4. **Show the certificate expiry** for the public host, if it is cheap to get.
+   An expired certificate breaks every agent at once, and the failure — a TLS
+   error in a log on someone else's machine — is invisible from here.
+
+### Related, not in scope for this page
+
+- **HSTS is worth setting on the nginx site** so a browser that types `http://`
+  never sends a session cookie in clear. It does nothing for the agent: Go's
+  HTTP client does not implement HSTS, which is exactly why the agent enforces
+  its own rule instead.
+- **Mutual TLS or certificate pinning** would be the next step up and is not
+  proposed. With one agent and a bearer token over a verified TLS 1.3 channel,
+  the marginal gain is small and the operational cost — a private CA, renewals
+  on both ends, an agent that stops building when a certificate rotates — is
+  not.
+
+---
+
 ## 5. The page
 
 `GET /agents`, linked from the header beside Projects.
@@ -118,7 +181,8 @@ already exists server-side today.
 In priority order — everything below (5) goes behind a disclosure triangle:
 
 1. **State** — one badge (`online` / `busy` / `paused` / `offline`) plus the age
-   of the freshest signal. Always show the timestamp, relative *and* absolute
+   of the freshest signal, and the transport its last request arrived on. A
+   plaintext agent is flagged here, loudly. Always show the timestamp, relative *and* absolute
    ("34 seconds ago · 14:22:07 UTC"). A badge the operator cannot verify is a
    badge they will not trust during an incident.
 2. **Executors served**, and the projects routed to them.
@@ -198,6 +262,7 @@ CREATE TABLE IF NOT EXISTS agents (
     os_arch           TEXT NOT NULL DEFAULT '',
     disk_free_gb      INTEGER NOT NULL DEFAULT 0,
     disk_floor_gb     INTEGER NOT NULL DEFAULT 0,
+    last_scheme       TEXT NOT NULL DEFAULT '',   -- https or http, from X-Forwarded-Proto
     status_json       TEXT NOT NULL DEFAULT '',   -- last doctor result
     last_status_at    DATETIME,
     paused_until      DATETIME,
@@ -274,7 +339,7 @@ its pause expires on its own.
 floor, version, uptime and workspaces. *Accept:* pulling the Unity licence shows
 the needs-operator check on the page with the agent's own remedy text.
 
-**A4 — polish.** Clock-skew readout (the log grammar is agent-authored and UTC,
+**A4 — polish.** Transport warning and certificate expiry; clock-skew readout (the log grammar is agent-authored and UTC,
 so a skewed Mac clock makes every step duration silently wrong); duplicate-name
 and changed-hostname warnings; consecutive-failure highlighting.
 
@@ -320,6 +385,11 @@ existing templates carry a comment saying so; follow it.
 **Do not build the data path on `GetProject`.** It returns the clone token
 unstripped — that is deliberate, for the claim response. `ListProjects`
 sanitizes. A page that leaks tokens into HTML would be a bad way to find out.
+
+**`X-Forwarded-Proto` is only trustworthy because nginx overwrites it.** Behind
+a different proxy, or with the container reachable directly, it is whatever the
+client sent. Use it to raise a warning; never to decide whether a request is
+allowed.
 
 ---
 
