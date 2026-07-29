@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -975,5 +976,344 @@ func TestListAgentsNeverDisclosesACloneToken(t *testing.T) {
 	w := doJSON(t, mux, "GET", "/api/agents", nil)
 	if strings.Contains(w.Body.String(), "ghp_secret") {
 		t.Error("the agents payload carried a clone token")
+	}
+}
+
+// --- A2: persistence and pause ---
+
+func pauseAgent(t *testing.T, mux *http.ServeMux, name string, minutes int, note string) *httptest.ResponseRecorder {
+	t.Helper()
+	return doJSON(t, mux, "POST", "/api/agents/"+name+"/pause",
+		map[string]interface{}{"minutes": minutes, "note": note})
+}
+
+// The core of pause: no new work, but the agent is still there.
+func TestAPausedAgentGetsNothingAndStaysConnected(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	p := macProject(t, s)
+	b := pending(t, s, p.ID)
+
+	if w := pauseAgent(t, mux, "mac-1", 60, "updating Unity"); w.Code != 200 {
+		t.Fatalf("pause: %d %s", w.Code, w.Body.String())
+	}
+
+	pollEmpty(t, mux) // 204, exactly as when there is genuinely no work
+
+	got, err := s.DB.GetBuild(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != models.StatusPending {
+		t.Errorf("build status = %q, want it left pending for a paused agent", got.Status)
+	}
+	if got.Agent != "" {
+		t.Errorf("build was claimed by %q despite the pause", got.Agent)
+	}
+
+	// The sighting still happened — this is what keeps a paused agent visibly
+	// connected instead of decaying to offline and hiding the distinction.
+	w := doJSON(t, mux, "GET", "/api/agents", nil)
+	var fleet agents.Fleet
+	decodeJSON(t, w, &fleet)
+	if len(fleet.Agents) != 1 {
+		t.Fatalf("agents = %+v", fleet.Agents)
+	}
+	a := fleet.Agents[0]
+	if a.State != agents.StatePaused {
+		t.Errorf("state = %q, want paused", a.State)
+	}
+	if !a.Paused || a.PauseNote != "updating Unity" {
+		t.Errorf("pause not shown: %+v", a)
+	}
+}
+
+func TestResumeLetsTheAgentClaimAgain(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	p := macProject(t, s)
+	b := pending(t, s, p.ID)
+
+	pauseAgent(t, mux, "mac-1", 60, "")
+	pollEmpty(t, mux)
+
+	if w := doJSON(t, mux, "POST", "/api/agents/mac-1/resume", nil); w.Code != 200 {
+		t.Fatalf("resume: %d %s", w.Code, w.Body.String())
+	}
+	claimOne(t, mux)
+
+	got, _ := s.DB.GetBuild(b.ID)
+	if got.Status != models.StatusRunning || got.Agent != "mac-1" {
+		t.Errorf("after resume: status=%q agent=%q, want the build claimed", got.Status, got.Agent)
+	}
+}
+
+// Nobody investigates a pause they did not set, so it has to end by itself.
+func TestAnExpiredPauseStopsBlockingClaims(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	p := macProject(t, s)
+	b := pending(t, s, p.ID)
+
+	// Written directly with an expiry already in the past — the API refuses to
+	// create one, which is the point of the other test.
+	if err := s.DB.PauseAgent("mac-1", time.Now().Add(-time.Minute), "forgotten"); err != nil {
+		t.Fatal(err)
+	}
+	claimOne(t, mux)
+
+	got, _ := s.DB.GetBuild(b.ID)
+	if got.Agent != "mac-1" {
+		t.Errorf("an expired pause still blocked the claim (agent=%q)", got.Agent)
+	}
+}
+
+func TestPauseRequiresAnExpiryAndIsCapped(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+
+	if w := pauseAgent(t, mux, "mac-1", 0, ""); w.Code != 400 {
+		t.Errorf("zero minutes: %d, want 400 — an unexpiring pause is a dead CI that looks healthy", w.Code)
+	}
+	if w := pauseAgent(t, mux, "mac-1", -5, ""); w.Code != 400 {
+		t.Errorf("negative minutes: %d, want 400", w.Code)
+	}
+	tooLong := int(models.MaxPauseDuration.Minutes()) + 1
+	if w := pauseAgent(t, mux, "mac-1", tooLong, ""); w.Code != 400 {
+		t.Errorf("%d minutes: %d, want 400", tooLong, w.Code)
+	}
+	if w := pauseAgent(t, mux, "mac-1", 30, ""); w.Code != 200 {
+		t.Errorf("30 minutes: %d, want accepted", w.Code)
+	}
+}
+
+// Pause means "take no more work", not "abandon what you are doing". A Unity
+// build that may already be uploading to Steam must not be killed by it.
+func TestPauseLeavesAnInFlightBuildAlone(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	p := macProject(t, s)
+	b := pending(t, s, p.ID)
+
+	claimOne(t, mux)
+	pauseAgent(t, mux, "mac-1", 60, "")
+
+	// Every in-build call must keep working. A 403 here would be fatal to the
+	// agent's job loop and would abandon the build within one heartbeat.
+	if w := agentLog(t, mux, b.ID, "mac-1", 0, "still building\n"); w.Code != 200 {
+		t.Errorf("log while paused: %d %s", w.Code, w.Body.String())
+	}
+	hb := doJSON(t, mux, "POST", buildPath(b.ID, "heartbeat"), map[string]interface{}{"agent": "mac-1"})
+	if hb.Code != 200 {
+		t.Errorf("heartbeat while paused: %d %s", hb.Code, hb.Body.String())
+	}
+	fin := doJSON(t, mux, "POST", buildPath(b.ID, "finish"),
+		map[string]interface{}{"agent": "mac-1", "status": "success"})
+	if fin.Code != 200 {
+		t.Errorf("finish while paused: %d %s", fin.Code, fin.Body.String())
+	}
+	got, _ := s.DB.GetBuild(b.ID)
+	if got.Status != models.StatusSuccess {
+		t.Errorf("build status = %q, want the in-flight build to have completed normally", got.Status)
+	}
+}
+
+// Pause is the one call here that can stop CI. A build machine holds the agent
+// token, and a machine that could pause its neighbours is a far more useful
+// thing to compromise than one that can only build.
+func TestAgentControlsRefuseAnAgentToken(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+
+	a, err := auth.New(s.DB, "operator-pw", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.SetAgentToken("agent-tok")
+	h := a.Middleware(mux)
+
+	call := func(method, path, bearer, body string) int {
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req := httptest.NewRequest(method, path, rdr)
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Builds-Csrf", "1")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	for _, c := range []struct{ method, path, body string }{
+		{"POST", "/api/agents/mac-1/pause", `{"minutes":30}`},
+		{"POST", "/api/agents/mac-1/resume", ""},
+		{"DELETE", "/api/agents/mac-1", ""},
+	} {
+		if code := call(c.method, c.path, "agent-tok", c.body); code != 403 {
+			t.Errorf("%s %s with an agent token: %d, want 403", c.method, c.path, code)
+		}
+		if code := call(c.method, c.path, "operator-pw", c.body); code == 403 {
+			t.Errorf("%s %s with the operator password: 403, want it allowed", c.method, c.path)
+		}
+	}
+}
+
+// An agent named "claim" must not shadow POST /api/agents/claim.
+func TestAnAgentNamedClaimCannotShadowTheClaimEndpoint(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	macProject(t, s)
+
+	w := doJSON(t, mux, "POST", "/api/agents/claim",
+		map[string]interface{}{"agent": "claim", "executors": []string{"mac"}})
+	if w.Code != 204 {
+		t.Errorf("claim: %d %s, want the claim endpoint to answer", w.Code, w.Body.String())
+	}
+}
+
+func TestForgetRemovesTheAgentRecord(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	macProject(t, s)
+
+	pollEmpty(t, mux) // creates the row
+	if row, _ := s.DB.GetAgentRow("mac-1"); row == nil {
+		t.Fatal("no row was persisted for a polling agent")
+	}
+	w := doJSON(t, mux, "DELETE", "/api/agents/mac-1", nil)
+	if w.Code != 204 {
+		t.Fatalf("forget: %d %s", w.Code, w.Body.String())
+	}
+	row, err := s.DB.GetAgentRow("mac-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row != nil {
+		t.Errorf("row survived forget: %+v", row)
+	}
+}
+
+// The reason the table exists: an idle poll writes nothing else anywhere.
+func TestAnIdlePollIsPersisted(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	macProject(t, s)
+
+	pollEmpty(t, mux)
+
+	row, err := s.DB.GetAgentRow("mac-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row == nil {
+		t.Fatal("an idle claim poll left no trace; last-seen would not survive a restart")
+	}
+	if row.LastSeenAt == nil || row.FirstSeenAt == nil {
+		t.Errorf("row = %+v, want both timestamps", row)
+	}
+	if len(row.Executors) != 1 || row.Executors[0] != "mac" {
+		t.Errorf("executors = %v", row.Executors)
+	}
+}
+
+// Absurd names are rejected at the door, because the name becomes a primary key
+// and is retained in memory for the life of the process.
+func TestClaimRejectsAnAbsurdAgentName(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	macProject(t, s)
+
+	for _, name := range []string{
+		strings.Repeat("a", models.MaxAgentNameLen+1),
+		"trailing ",
+		"nul\x00byte",
+		// A path separator would survive Go's router intact, but nginx
+		// normalises %2F in front of it, so this name would address a
+		// different endpoint than the operator clicked.
+		"evil/../claim",
+		"back\\slash",
+	} {
+		w := doJSON(t, mux, "POST", "/api/agents/claim",
+			map[string]interface{}{"agent": name, "executors": []string{"mac"}})
+		if w.Code != 400 {
+			t.Errorf("name %q: %d, want 400", name, w.Code)
+		}
+	}
+	// And the name actually deployed today must still work.
+	w := doJSON(t, mux, "POST", "/api/agents/claim",
+		map[string]interface{}{"agent": "mac-m4max-dan", "executors": []string{"mac"}})
+	if w.Code != 204 {
+		t.Errorf("the deployed agent name was rejected: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// The cap is applied to the operator's input, not to the converted Duration.
+// Checking the product lets the multiply overflow int64 first: a wrapped
+// negative passes both a "greater than zero" test on the input and a "no more
+// than a week" test on the product, and the operator is told 200 for a pause
+// that expired in 1822.
+func TestAnAbsurdPauseDurationIsRejectedNotWrapped(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	p := macProject(t, s)
+	b := pending(t, s, p.ID)
+
+	for _, minutes := range []int{
+		200000000,          // wraps negative
+		307445735,          // wraps to a positive but tiny duration
+		1 << 62,            // far past the wrap point
+		int(^uint(0) >> 1), // max int
+	} {
+		w := pauseAgent(t, mux, "mac-1", minutes, "")
+		if w.Code != 400 {
+			t.Errorf("minutes=%d: %d, want 400 (body %s)", minutes, w.Code, w.Body.String())
+		}
+	}
+
+	// Nothing above may have left a pause behind, and the agent must be free.
+	until, err := s.DB.AgentPausedUntil("mac-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if until != nil {
+		t.Errorf("a rejected pause still wrote %v", until)
+	}
+	claimOne(t, mux)
+	got, _ := s.DB.GetBuild(b.ID)
+	if got.Agent != "mac-1" {
+		t.Errorf("agent could not claim after a rejected pause (agent=%q)", got.Agent)
+	}
+}
+
+// The largest accepted value must still be exactly the documented cap.
+func TestTheLargestAcceptedPauseIsTheCap(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+
+	maxMinutes := int(models.MaxPauseDuration / time.Minute)
+	if w := pauseAgent(t, mux, "mac-1", maxMinutes, ""); w.Code != 200 {
+		t.Errorf("minutes=%d (the cap): %d, want 200", maxMinutes, w.Code)
+	}
+	if w := pauseAgent(t, mux, "mac-1", maxMinutes+1, ""); w.Code != 400 {
+		t.Errorf("minutes=%d (one past the cap): %d, want 400", maxMinutes+1, w.Code)
+	}
+}
+
+// "." and ".." are path segments in their own right; a browser resolves them
+// out of the URL before the request is sent, so such an agent could never be
+// paused or forgotten from the page.
+func TestClaimRejectsPathSegmentNames(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	macProject(t, s)
+
+	for _, name := range []string{".", ".."} {
+		w := doJSON(t, mux, "POST", "/api/agents/claim",
+			map[string]interface{}{"agent": name, "executors": []string{"mac"}})
+		if w.Code != 400 {
+			t.Errorf("name %q: %d, want 400", name, w.Code)
+		}
 	}
 }

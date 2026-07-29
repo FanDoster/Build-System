@@ -89,6 +89,15 @@ func (h *Handler) render(w http.ResponseWriter, r *http.Request, name string, da
 // Server-rendered from the same view model the JSON endpoint returns, so the
 // page is right before any script runs — the script only keeps it current.
 func (h *Handler) handleAgents(w http.ResponseWriter, r *http.Request) {
+	// Operators only, matching the JSON endpoint this renders from. Without it
+	// the API is gated and the HTML view of the same data is not, so a build
+	// machine's own token could read the whole fleet — every machine, every
+	// queue, and the operator's pause notes — by asking for the page instead of
+	// the API.
+	if auth.IsAgent(r.Context()) {
+		http.Error(w, "agent credentials cannot view the fleet", 403)
+		return
+	}
 	if h.Agents == nil {
 		http.Error(w, "agent registry not configured", 503)
 		return

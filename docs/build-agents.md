@@ -62,6 +62,19 @@ Long-poll for work. Held open for up to **30s**, then `204`.
 {"agent": "mac-m4max-dan", "executors": ["mac"]}
 ```
 
+`204` has meant "nothing waiting" since the beginning, and since A2 it also means **"you
+are paused"** — an operator has stopped this agent taking new work from the `/agents`
+page. This is deliberately indistinguishable to the agent, and needs no agent change:
+a paused claim is still held for the full 30s, so a paused agent keeps its normal poll
+cadence and keeps proving it is alive. Answering anything else would be worse. A `403`
+is fatal to the agent's claim loop, which exits so a wrong token is visible rather than
+silent; and returning `204` immediately would drop the agent onto its one-second poll
+floor and turn a pause into a request flood.
+
+The agent name is limited to `models.MaxAgentNameLen` (64) characters, with no control
+characters, no surrounding whitespace, and no `/` or `\` — it is a database key and a URL
+path segment on the operator endpoints. `executors` is capped at 16 entries.
+
 `200` returns the claimed build and the **full project row, clone token included** — the
 agent has to authenticate the same private clone the local runner would. This is the one
 response in the API that does not strip secrets; treat it accordingly.

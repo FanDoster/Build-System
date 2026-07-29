@@ -17,6 +17,7 @@ type State string
 const (
 	StateBusy    State = "busy"    // running a build right now
 	StateOnline  State = "online"  // here, and free
+	StatePaused  State = "paused"  // here, but deliberately not taking work
 	StateOffline State = "offline" // not heard from within the tolerance
 	StateWaiting State = "waiting" // server restarted; nothing has checked in yet
 )
@@ -72,9 +73,33 @@ type Agent struct {
 	// in a row on one machine is the fastest signal available for "the box is
 	// broken" rather than "the code is broken".
 	ConsecutiveFailures int `json:"consecutive_failures,omitempty"`
-	// Known is false for an agent seen only in build history — it has run
-	// things here before but has not checked in since this server started.
+	// Known is false for an agent seen only in build history or in the agents
+	// table — it has been here before but has not checked in since THIS server
+	// process started.
+	//
+	// A persisted row must never set this. It is what gates the post-restart
+	// grace, and a redeploy takes longer than the staleness tolerance: mark a
+	// remembered agent as known and the first minutes after every deploy show
+	// it offline, which also drops it out of queue coverage and puts the
+	// panel's loudest warning on screen for no reason.
 	Known bool `json:"known"`
+
+	// Paused, and the rest of this block, are the admission dimension: whether
+	// the agent is ALLOWED to take work, which is independent of whether it is
+	// reachable and of whether it is busy. Kept as their own fields rather than
+	// folded into State — conflating the three is the mistake this design
+	// specifically set out not to repeat, and State is only the headline.
+	Paused      bool       `json:"paused,omitempty"`
+	PausedUntil *time.Time `json:"paused_until,omitempty"`
+	PauseNote   string     `json:"pause_note,omitempty"`
+
+	// FirstSeen is when this agent first ever contacted this server, from the
+	// persisted row. Nil for an agent known only from build history.
+	FirstSeen *time.Time `json:"first_seen,omitempty"`
+
+	// Remembered is true when the agent has a persisted row. It separates "we
+	// have never heard of this machine" from "we know it, it is just not here".
+	Remembered bool `json:"remembered,omitempty"`
 }
 
 // Executor is a queue, and whether anything is serving it.
@@ -89,6 +114,17 @@ type Executor struct {
 	// one-character typo in a project's executor looks like, and today it
 	// produces a green agent, a build stuck forever, and no error anywhere.
 	Served bool `json:"served"`
+
+	// AllPaused means the queue has agents but every one of them is paused, so
+	// nothing will be claimed from it.
+	//
+	// Deliberately a separate signal rather than clearing Served. "No agent
+	// serving this" means a name nothing answers to — a typo, needing a config
+	// change. "Served, but paused" means a decision somebody made and can undo.
+	// Collapsing them would send an operator hunting for a misspelling they
+	// never made, and would also un-cover a queue an agent is at that moment
+	// building from.
+	AllPaused bool `json:"all_paused,omitempty"`
 }
 
 // Fleet is the whole page.
@@ -97,6 +133,10 @@ type Fleet struct {
 	Executors     []Executor `json:"executors"`
 	ServerStarted time.Time  `json:"server_started"`
 	Now           time.Time  `json:"now"`
+	// Degraded is set when part of the page could not be assembled but the
+	// rest still can. Shown rather than swallowed: a page quietly missing its
+	// pause state would be read as "nothing is paused".
+	Degraded string `json:"degraded,omitempty"`
 }
 
 // Source is the database surface Build needs, so tests need no SQLite.
@@ -106,54 +146,81 @@ type Source interface {
 	RecentBuildsForAgent(agent string, limit int) ([]models.Build, error)
 	RemoteExecutors() ([]db.RemoteExecutor, error)
 	LogTailBytes(id int64, n int) ([]byte, error)
+	ListAgentRows() ([]db.AgentRow, error)
 }
 
 // Build assembles the page from the registry and the database.
+//
+// Three sources name agents and they overlap: the in-memory registry (here
+// now), the agents table (here before, and where pause lives), and the builds
+// table (has built here at some point). Each is merged into one record per
+// name — an agent that appears twice on this page reads as two machines, and
+// the whole point of the page is knowing how many there are.
 func Build(src Source, reg *Registry, now time.Time) (*Fleet, error) {
 	f := &Fleet{ServerStarted: reg.StartedAt(), Now: now}
 
-	sightings := reg.Snapshot()
-	byName := make(map[string]*Agent, len(sightings))
-	for _, s := range sightings {
-		a := &Agent{
-			Name:      s.Name,
-			Executors: s.Executors,
-			Scheme:    s.Scheme,
-			Polling:   s.Polling > 0,
-			Known:     true,
+	var order []*Agent
+	byName := map[string]*Agent{}
+	at := func(name string) *Agent {
+		if a, ok := byName[name]; ok {
+			return a
 		}
-		last := s.LastPoll
-		a.LastSeen, a.LastSeenFrom = &last, "claim poll"
-		byName[s.Name] = a
-		f.Agents = append(f.Agents, *a)
+		a := &Agent{Name: name}
+		byName[name] = a
+		order = append(order, a)
+		return a
 	}
 
-	// Agents in the history that have not checked in since this server
-	// started. Worth listing: after a restart that is every one of them, and a
-	// page that hid them would be empty exactly when someone is asking why
-	// nothing is building.
+	// 1. Live sightings. The only source that can say "polling right now".
+	for _, s := range reg.Snapshot() {
+		a := at(s.Name)
+		a.Executors = s.Executors
+		a.Scheme = s.Scheme
+		a.Polling = s.Polling > 0
+		a.Known = true
+		last := s.LastPoll
+		a.LastSeen, a.LastSeenFrom = &last, "claim poll"
+	}
+
+	// 2. Remembered agents. Where pause comes from, and where last-seen comes
+	// from for an agent that has not polled since this process started.
+	//
+	// Read failing open. A scan error here must not take down the page: the
+	// coverage panel is what an operator opens when nothing is building, and
+	// losing it because one row would not parse is the worst possible moment.
+	// Degrading to A1's behaviour beats a 500.
+	rows, rowsErr := src.ListAgentRows()
+	if rowsErr != nil {
+		f.Degraded = "agent records could not be read; showing live state only"
+		rows = nil
+	}
+	for i := range rows {
+		applyRow(at(rows[i].Name), &rows[i], now)
+	}
+
+	// 3. Agents in the build history. After a restart that may be all of them,
+	// and a page that hid them would be empty exactly when someone is asking
+	// why nothing is building.
 	names, err := src.AgentNames()
 	if err != nil {
 		return nil, err
 	}
 	for _, name := range names {
-		if _, ok := byName[name]; ok {
-			continue
-		}
-		a := &Agent{Name: name}
-		byName[name] = a
-		f.Agents = append(f.Agents, *a)
+		at(name)
 	}
 
 	// Fill each agent in, then decide its state.
-	for i := range f.Agents {
-		a := &f.Agents[i]
+	for _, a := range order {
 		if err := fill(src, a); err != nil {
 			return nil, err
 		}
 		a.State = stateOf(a, reg.StartedAt(), now)
 	}
-	sort.Slice(f.Agents, func(i, j int) bool { return f.Agents[i].Name < f.Agents[j].Name })
+	sort.Slice(order, func(i, j int) bool { return order[i].Name < order[j].Name })
+	f.Agents = make([]Agent, 0, len(order))
+	for _, a := range order {
+		f.Agents = append(f.Agents, *a)
+	}
 
 	execs, err := src.RemoteExecutors()
 	if err != nil {
@@ -165,20 +232,62 @@ func Build(src Source, reg *Registry, now time.Time) (*Fleet, error) {
 			t := e.OldestPending
 			out.OldestPending = &t
 		}
+		live := 0
 		for _, a := range f.Agents {
 			if a.State == StateOffline {
 				continue
 			}
-			for _, want := range a.Executors {
-				if want == e.Name {
-					out.Agents = append(out.Agents, a.Name)
-					out.Served = true
-				}
+			if !contains(a.Executors, e.Name) {
+				continue
+			}
+			out.Agents = append(out.Agents, a.Name)
+			out.Served = true
+			if !a.Paused {
+				live++
 			}
 		}
+		// Every agent on this queue is paused, so nothing will be claimed from
+		// it. Said separately from "no agent serving this", which means a name
+		// nothing answers to and needs a config change rather than a resume.
+		out.AllPaused = out.Served && live == 0
 		f.Executors = append(f.Executors, out)
 	}
 	return f, nil
+}
+
+// applyRow folds a persisted agent record into the view.
+//
+// Note what this does NOT set: Known. That flag means "has checked in since
+// this process started", and it gates the post-restart grace period. A redeploy
+// of this server takes about two minutes — longer than the staleness tolerance
+// — so if a remembered agent counted as known, every deploy would show the
+// fleet offline, drop those agents out of queue coverage, and put the panel's
+// loudest warning on screen for no reason at all.
+func applyRow(a *Agent, row *db.AgentRow, now time.Time) {
+	a.Remembered = true
+	a.FirstSeen = row.FirstSeenAt
+	a.Paused = row.Paused(now)
+	if a.Paused {
+		a.PausedUntil = row.PausedUntil
+		a.PauseNote = row.PauseNote
+	}
+	// The live sighting wins on both of these: it describes the connection that
+	// is open now, while the row describes whatever the last stored one was.
+	if len(a.Executors) == 0 {
+		a.Executors = row.Executors
+	}
+	if a.Scheme == "" {
+		a.Scheme = row.LastScheme
+	}
+	// Only when there is no live sighting at all. The stored timestamp is
+	// written on the very poll the registry also records, a few microseconds
+	// later, so comparing the two and taking the newer relabels every live
+	// agent as one last seen before a restart — which is what this did on its
+	// first run against a real server. The registry is never behind: it is
+	// updated on every poll, the row only once per throttle interval.
+	if a.LastSeen == nil && row.LastSeenAt != nil {
+		a.LastSeen, a.LastSeenFrom = row.LastSeenAt, "last poll before restart"
+	}
 }
 
 func fill(src Source, a *Agent) error {
@@ -284,17 +393,25 @@ func currentStep(src Source, buildID int64) (step, detail string) {
 // agent owns. Drop the third and every busy agent reads as offline, because an
 // agent does not poll while it builds.
 func stateOf(a *Agent, floor, now time.Time) State {
-	if a.Polling {
+	// The headline for a reachable agent, in the order an operator cares.
+	// Busy outranks paused: a paused agent that is mid-build really is
+	// building, and hiding that behind "paused" would make the running build
+	// invisible on the one page that lists what each machine is doing. The
+	// pause is still shown — it is its own field, and the row says both.
+	here := func() State {
 		if a.Current != nil {
 			return StateBusy
+		}
+		if a.Paused {
+			return StatePaused
 		}
 		return StateOnline
 	}
+	if a.Polling {
+		return here()
+	}
 	if a.LastSeen != nil && !models.AgentStale(a.LastSeen, time.Time{}, now) {
-		if a.Current != nil {
-			return StateBusy
-		}
-		return StateOnline
+		return here()
 	}
 	// Nothing recent. Immediately after a restart that says nothing about the
 	// agent — it simply has not had a chance to poll yet — so the page says so

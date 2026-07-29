@@ -103,3 +103,89 @@ func TestForgetRemovesAnAgent(t *testing.T) {
 		t.Errorf("agent survived Forget: %+v", s)
 	}
 }
+
+// The throttle is what makes a persisted sighting affordable. Without it this
+// is one row write per poll per agent forever — the cost the in-memory registry
+// was built to avoid.
+func TestShouldPersistThrottlesPerAgent(t *testing.T) {
+	r := NewRegistry()
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	r.SetClock(func() time.Time { return now })
+
+	r.PollStarted("mac", []string{"mac"}, "https")()
+	if !r.ShouldPersist("mac", 10*time.Second) {
+		t.Fatal("the first sighting was not persisted; last-seen would start out wrong")
+	}
+	if r.ShouldPersist("mac", 10*time.Second) {
+		t.Error("persisted twice in the same instant")
+	}
+
+	now = now.Add(9 * time.Second)
+	if r.ShouldPersist("mac", 10*time.Second) {
+		t.Error("persisted before the interval elapsed")
+	}
+	now = now.Add(2 * time.Second)
+	if !r.ShouldPersist("mac", 10*time.Second) {
+		t.Error("did not persist after the interval elapsed")
+	}
+
+	// Throttled per agent, not globally — one chatty agent must not stop
+	// another being recorded.
+	r.PollStarted("mac-2", []string{"mac"}, "https")()
+	if !r.ShouldPersist("mac-2", 10*time.Second) {
+		t.Error("a second agent was throttled by the first")
+	}
+}
+
+// An agent with no sighting has nothing to persist. Returning true would write
+// a row for a name that never reached PollStarted.
+func TestShouldPersistNeedsASighting(t *testing.T) {
+	r := NewRegistry()
+	if r.ShouldPersist("never-polled", time.Second) {
+		t.Error("offered to persist an agent that has never been seen")
+	}
+	if r.ShouldPersist("", time.Second) {
+		t.Error("offered to persist an empty name")
+	}
+}
+
+// The claim handler is concurrent: two polls arriving together must not both
+// decide they are due, or the throttle is not a throttle.
+func TestShouldPersistIsAtomicUnderConcurrency(t *testing.T) {
+	r := NewRegistry()
+	r.PollStarted("mac", []string{"mac"}, "https")()
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	yes := 0
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if r.ShouldPersist("mac", time.Hour) {
+				mu.Lock()
+				yes++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if yes != 1 {
+		t.Errorf("%d of 50 concurrent callers were told to persist, want exactly 1", yes)
+	}
+}
+
+// Forget must clear the throttle too, or a re-registered agent waits out the
+// old interval before its first row is written.
+func TestForgetClearsTheThrottle(t *testing.T) {
+	r := NewRegistry()
+	r.PollStarted("mac", []string{"mac"}, "https")()
+	if !r.ShouldPersist("mac", time.Hour) {
+		t.Fatal("first persist refused")
+	}
+	r.Forget("mac")
+	r.PollStarted("mac", []string{"mac"}, "https")()
+	if !r.ShouldPersist("mac", time.Hour) {
+		t.Error("after Forget, the agent had to wait out the old interval before being recorded again")
+	}
+}

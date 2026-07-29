@@ -610,3 +610,14 @@ h2 { font-size: 20px; margin-bottom: 16px; }
 .chip-failed   { background: rgba(248,81,73,0.15); color: var(--red); }
 .chip-running  { background: rgba(210,153,29,0.15); color: var(--orange); }
 .chip-pending, .chip-canceled { background: rgba(139,148,158,0.15); color: var(--text-muted); }
+
+/* Agents page — pause (A2) */
+.badge-paused   { background: rgba(139,148,158,0.18); color: var(--text-muted); }
+.agent-paused {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.agent-pause-note { color: var(--text); font-style: italic; }
+.agent-actions { margin-top: 10px; display: flex; gap: 8px; }
+.btn-sm { height: 26px; padding: 0 10px; font-size: 12px; }

@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -16,6 +17,8 @@ type fakeSource struct {
 	recent    map[string][]models.Build
 	executors []db.RemoteExecutor
 	logs      map[int64]string
+	rows      []db.AgentRow
+	rowsErr   error
 }
 
 func (f *fakeSource) AgentNames() ([]string, error) { return f.names, nil }
@@ -29,6 +32,7 @@ func (f *fakeSource) RemoteExecutors() ([]db.RemoteExecutor, error) { return f.e
 func (f *fakeSource) LogTailBytes(id int64, n int) ([]byte, error) {
 	return []byte(f.logs[id]), nil
 }
+func (f *fakeSource) ListAgentRows() ([]db.AgentRow, error) { return f.rows, f.rowsErr }
 
 func at(t time.Time) *time.Time { return &t }
 
@@ -343,5 +347,264 @@ func TestALocalBuildIsNotQueueCoverage(t *testing.T) {
 	f, _ := Build(src, reg, now)
 	if len(f.Agents[0].Executors) != 0 {
 		t.Errorf("executors = %v, want none — local is not a queue", f.Agents[0].Executors)
+	}
+}
+
+func pausedRow(name string, until time.Time, note string) db.AgentRow {
+	u := until
+	return db.AgentRow{Name: name, Executors: []string{"mac"}, PausedUntil: &u, PauseNote: note}
+}
+
+// A paused agent must read as connected-but-paused. If pause made it look
+// offline the distinction would be destroyed, and an operator could not tell
+// "I stopped this" from "this machine died".
+func TestAPausedAgentIsStillConnected(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac", []string{"mac"}, "https") // still polling, as it must
+
+	src := &fakeSource{rows: []db.AgentRow{pausedRow("mac", now.Add(time.Hour), "updating Unity")}}
+	f, err := Build(src, reg, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := f.Agents[0]
+	if a.State != StatePaused {
+		t.Errorf("state = %q, want paused", a.State)
+	}
+	if !a.Polling {
+		t.Error("a paused agent must keep polling — that is what keeps it visibly connected")
+	}
+	if !a.Paused || a.PausedUntil == nil {
+		t.Errorf("pause not surfaced: paused=%v until=%v", a.Paused, a.PausedUntil)
+	}
+	if a.PauseNote != "updating Unity" {
+		t.Errorf("note = %q", a.PauseNote)
+	}
+}
+
+// Busy outranks paused in the headline. A paused agent mid-build really is
+// building, and hiding that would make the running build invisible on the page
+// that lists what every machine is doing.
+func TestPausedAndBuildingShowsBoth(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac", []string{"mac"}, "https")
+
+	src := &fakeSource{
+		rows: []db.AgentRow{pausedRow("mac", now.Add(time.Hour), "")},
+		running: map[string]*models.Build{
+			"mac": {ID: 5, ProjectName: "game", Status: models.StatusRunning,
+				Executor: "mac", LastHeartbeatAt: at(now)},
+		},
+	}
+	f, _ := Build(src, reg, now)
+	a := f.Agents[0]
+	if a.State != StateBusy {
+		t.Errorf("state = %q, want busy — the build in flight is the more urgent fact", a.State)
+	}
+	if !a.Paused {
+		t.Error("the pause was lost; both facts must be shown")
+	}
+	if a.Current == nil {
+		t.Error("the running build vanished behind the pause")
+	}
+}
+
+// An expired pause is no pause. Nobody thinks to check a pause they did not
+// set, so this is the property that stops a forgotten pause becoming a dead CI
+// that looks healthy.
+func TestAnExpiredPauseIsIgnored(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac", []string{"mac"}, "https")
+
+	src := &fakeSource{rows: []db.AgentRow{pausedRow("mac", now.Add(-time.Minute), "forgot about this")}}
+	f, _ := Build(src, reg, now)
+	a := f.Agents[0]
+	if a.Paused || a.State != StateOnline {
+		t.Errorf("paused=%v state=%q, want an expired pause to be ignored", a.Paused, a.State)
+	}
+	if a.PauseNote != "" {
+		t.Errorf("note %q shown for an expired pause", a.PauseNote)
+	}
+}
+
+// The biggest risk in persisting agents. A redeploy takes about two minutes —
+// longer than the 90s tolerance — so a remembered agent whose last poll
+// predates the restart must NOT be treated as known, or every deploy paints the
+// fleet offline and drops it out of queue coverage.
+func TestARememberedAgentStillGetsTheRestartGrace(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now) // the server has just started; nothing has polled
+
+	seen := now.Add(-5 * time.Minute) // last poll, well before the redeploy
+	src := &fakeSource{
+		rows:      []db.AgentRow{{Name: "mac", Executors: []string{"mac"}, LastSeenAt: &seen}},
+		executors: []db.RemoteExecutor{{Name: "mac", Pending: 2}},
+	}
+	f, err := Build(src, reg, now.Add(10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := f.Agents[0]
+	if a.State != StateWaiting {
+		t.Errorf("state = %q, want waiting — it has had no chance to poll since this process started", a.State)
+	}
+	if !a.Remembered {
+		t.Error("the persisted row was not recognised")
+	}
+	if !f.Executors[0].Served {
+		t.Error("the queue lost its coverage during the restart grace; this is the panel's loudest warning firing wrongly")
+	}
+}
+
+// The reason to persist at all: last-seen must outlive the process.
+func TestLastSeenSurvivesARestart(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+
+	seen := now.Add(-40 * time.Second)
+	src := &fakeSource{rows: []db.AgentRow{{Name: "mac", Executors: []string{"mac"}, LastSeenAt: &seen}}}
+	f, _ := Build(src, reg, now)
+	a := f.Agents[0]
+	if a.LastSeen == nil || !a.LastSeen.Equal(seen) {
+		t.Fatalf("last seen = %v, want the persisted %v", a.LastSeen, seen)
+	}
+	if a.LastSeenFrom != "last poll before restart" {
+		t.Errorf("last seen from %q; the page must say which evidence it is showing", a.LastSeenFrom)
+	}
+}
+
+// A live sighting is better evidence than a stored one and must win.
+func TestALiveSightingBeatsTheStoredRow(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac", []string{"mac", "ios"}, "https")
+
+	old := now.Add(-time.Hour)
+	src := &fakeSource{rows: []db.AgentRow{
+		{Name: "mac", Executors: []string{"stale-queue"}, LastSeenAt: &old, LastScheme: "http"},
+	}}
+	f, _ := Build(src, reg, now)
+	a := f.Agents[0]
+	if a.LastSeenFrom != "claim poll" || !a.LastSeen.Equal(now) {
+		t.Errorf("last seen %v from %q, want the live poll", a.LastSeen, a.LastSeenFrom)
+	}
+	if len(a.Executors) != 2 {
+		t.Errorf("executors = %v, want what the open connection advertises", a.Executors)
+	}
+	if a.Scheme != "https" {
+		t.Errorf("scheme = %q, want the live connection's, not the stored one's", a.Scheme)
+	}
+}
+
+// One machine, three sources, one row.
+func TestThreeSourcesMergeIntoOneAgent(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac", []string{"mac"}, "https")
+
+	src := &fakeSource{
+		names: []string{"mac"}, // build history
+		rows:  []db.AgentRow{{Name: "mac", Executors: []string{"mac"}}},
+		recent: map[string][]models.Build{
+			"mac": {{ID: 1, Status: models.StatusSuccess}},
+		},
+	}
+	f, _ := Build(src, reg, now)
+	if len(f.Agents) != 1 {
+		t.Fatalf("listed %d agents for one machine: %+v", len(f.Agents), f.Agents)
+	}
+	a := f.Agents[0]
+	if !a.Known || !a.Remembered || len(a.Recent) != 1 {
+		t.Errorf("merge lost a source: known=%v remembered=%v recent=%d", a.Known, a.Remembered, len(a.Recent))
+	}
+}
+
+// A queue whose only agents are paused is a real problem, but a different one
+// from a queue nothing serves. Collapsing them would send an operator hunting
+// for a typo they never made.
+func TestAQueueServedOnlyByPausedAgentsSaysSo(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac", []string{"mac"}, "https")
+
+	src := &fakeSource{
+		rows:      []db.AgentRow{pausedRow("mac", now.Add(time.Hour), "")},
+		executors: []db.RemoteExecutor{{Name: "mac", Pending: 4}},
+	}
+	f, _ := Build(src, reg, now)
+	e := f.Executors[0]
+	if !e.Served {
+		t.Error("reported as unserved; that means a name nothing answers to, which is a different fix")
+	}
+	if !e.AllPaused {
+		t.Error("nothing says the queue is stalled behind a pause")
+	}
+	if e.Pending != 4 {
+		t.Errorf("pending = %d", e.Pending)
+	}
+}
+
+// With one paused and one running agent, the queue is fine.
+func TestOnePausedAgentDoesNotStallAQueueAnotherServes(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac-a", []string{"mac"}, "https")
+	reg.PollStarted("mac-b", []string{"mac"}, "https")
+
+	src := &fakeSource{
+		rows:      []db.AgentRow{pausedRow("mac-a", now.Add(time.Hour), "")},
+		executors: []db.RemoteExecutor{{Name: "mac", Pending: 1}},
+	}
+	f, _ := Build(src, reg, now)
+	e := f.Executors[0]
+	if !e.Served || e.AllPaused {
+		t.Errorf("served=%v allPaused=%v, want a working queue", e.Served, e.AllPaused)
+	}
+}
+
+// The page an operator opens when nothing is building must not 500 because one
+// agent row would not scan.
+func TestAnUnreadableAgentTableDegradesRatherThanFails(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac", []string{"mac"}, "https")
+
+	src := &fakeSource{
+		rowsErr:   errors.New("malformed row"),
+		executors: []db.RemoteExecutor{{Name: "mac", Pending: 3}},
+	}
+	f, err := Build(src, reg, now)
+	if err != nil {
+		t.Fatalf("the whole page failed because the agents table did not read: %v", err)
+	}
+	if f.Degraded == "" {
+		t.Error("degraded silently; a page missing its pause state reads as nothing being paused")
+	}
+	if len(f.Agents) != 1 || !f.Executors[0].Served {
+		t.Error("live state was lost along with the stored state")
+	}
+}
+
+// The stored timestamp is written on the same poll the registry records, a few
+// microseconds later. Taking whichever is newer therefore relabels a live,
+// actively-polling agent as one last seen before a restart — which is exactly
+// what it did the first time this ran against a real server.
+func TestALivePollIsNotLabelledAsPreRestart(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac", []string{"mac"}, "https")
+
+	// Stored a hair later than the registry's sighting, as the real write is.
+	stored := now.Add(50 * time.Microsecond)
+	src := &fakeSource{rows: []db.AgentRow{
+		{Name: "mac", Executors: []string{"mac"}, LastSeenAt: &stored},
+	}}
+	f, _ := Build(src, reg, now.Add(time.Second))
+
+	if got := f.Agents[0].LastSeenFrom; got != "claim poll" {
+		t.Errorf("last seen from %q, want %q — this agent is on the other end of an open socket right now", got, "claim poll")
 	}
 }

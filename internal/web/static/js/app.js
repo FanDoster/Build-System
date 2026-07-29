@@ -37,6 +37,8 @@
     if (!root) return;
     var coverage = document.getElementById('coverage');
     var connEl = document.getElementById('agents-conn');
+    var banner = document.getElementById('agents-banner');
+    var actionError = false;   // banner is showing an action failure, not page state
     var base = document.body.dataset.basePath || '';
     var timer = null;
 
@@ -57,9 +59,15 @@
     function coverageRow(e) {
       var row = el('div', 'coverage-row' + (e.served ? '' : ' coverage-unserved'));
       row.appendChild(el('span', 'mono coverage-name', e.name));
-      row.appendChild(e.served
-        ? el('span', 'badge badge-success', 'served by ' + join(e.agents))
-        : el('span', 'badge badge-failed', 'no agent serving this'));
+      // Three outcomes, not two. "No agent serving this" means a name nothing
+      // answers to and needs a config change; "paused" means a decision
+      // somebody made and can undo. Collapsing them sends an operator hunting
+      // for a typo they never made.
+      row.appendChild(!e.served
+        ? el('span', 'badge badge-failed', 'no agent serving this')
+        : e.all_paused
+          ? el('span', 'badge badge-paused', 'paused \u2014 nothing will be claimed')
+          : el('span', 'badge badge-success', 'served by ' + join(e.agents)));
       row.appendChild(el('span', 'coverage-pending', (e.pending || 0) + ' pending'));
       row.appendChild(el('span', 'coverage-projects', join(e.projects)));
       return row;
@@ -98,11 +106,34 @@
       } else {
         meta.appendChild(document.createTextNode('not seen since this server started'));
       }
+      if (a.first_seen) {
+        meta.appendChild(document.createTextNode(' · first seen '));
+        var fs = el('time');
+        fs.setAttribute('data-abs', '');
+        fs.setAttribute('datetime', a.first_seen);
+        setAbsLabel(fs);
+        meta.appendChild(fs);
+      }
       if (a.consecutive_failures) {
         meta.appendChild(document.createTextNode(' · '));
         meta.appendChild(el('span', 'agent-warn', a.consecutive_failures + ' failures in a row'));
       }
       row.appendChild(meta);
+
+      if (a.paused) {
+        var pz = el('div', 'agent-paused');
+        pz.appendChild(document.createTextNode('paused until '));
+        var pu = el('time');
+        pu.setAttribute('data-abs', '');
+        pu.setAttribute('datetime', a.paused_until || '');
+        setAbsLabel(pu);
+        pz.appendChild(pu);
+        if (a.pause_note) {
+          pz.appendChild(document.createTextNode(' \u2014 '));
+          pz.appendChild(el('span', 'agent-pause-note', a.pause_note));
+        }
+        row.appendChild(pz);
+      }
 
       if (a.current) {
         var cur = el('div', 'agent-current');
@@ -133,10 +164,32 @@
         }
         row.appendChild(rec);
       }
+
+      var acts = el('div', 'agent-actions');
+      acts.dataset.agent = a.name;   // never interpolated into a URL here
+      acts.appendChild(actionBtn(a.paused ? 'resume' : 'pause', a.paused ? 'Resume' : 'Pause\u2026'));
+      acts.appendChild(actionBtn('forget', 'Forget', 'btn-danger'));
+      row.appendChild(acts);
       return row;
     }
 
+    function actionBtn(act, label, extra) {
+      var b = el('button', 'btn btn-sm' + (extra ? ' ' + extra : ''), label);
+      b.dataset.act = act;
+      return b;
+    }
+
     function render(fleet) {
+      // The banner has two writers with different lifetimes: this one, which
+      // runs every five seconds, and fail(), which reports a rejected action.
+      // Without the flag the poll wipes the operator's error almost as soon as
+      // they can read it, and a refused pause reads as a silent no-op — the
+      // worst possible outcome for a control whose whole job is to be certain.
+      // The action error stays until the operator's next action clears it.
+      if (banner && !actionError) {
+        banner.hidden = !fleet.degraded;
+        banner.textContent = fleet.degraded || '';
+      }
       if (coverage) {
         coverage.textContent = '';
         if (fleet.executors && fleet.executors.length) {
@@ -162,6 +215,83 @@
         .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
         .then(function (fleet) { render(fleet); setConn('live'); })
         .catch(function () { setConn('reconnecting'); });
+    }
+
+    // Actions are delegated to the container, not bound to each button.
+    // render() replaces every row on each refresh, so per-button listeners
+    // would be discarded within five seconds of being attached.
+    //
+    // The agent name reaches the URL through encodeURIComponent, always. It is
+    // free text asserted by whoever holds the agent token — a name containing a
+    // slash would otherwise address a different endpoint entirely.
+    root.addEventListener('click', function (ev) {
+      var btn = ev.target.closest('button[data-act]');
+      if (!btn) return;
+      var host = btn.closest('.agent-actions');
+      if (!host) return;
+      var name = host.dataset.agent || '';
+      var url = base + '/api/agents/' + encodeURIComponent(name);
+
+      if (btn.dataset.act === 'pause') {
+        // The expiry is asked for rather than defaulted silently: the server
+        // requires one, and a pause nobody remembers setting is a dead CI that
+        // looks healthy.
+        var mins = window.prompt('Pause "' + name + '" for how many minutes?\n' +
+          'It resumes on its own when the time is up.', '60');
+        if (mins === null) return;
+        mins = parseInt(mins, 10);
+        if (!(mins > 0)) { fail('Enter a number of minutes greater than zero.'); return; }
+        var note = window.prompt('Why? (optional — leave blank and press OK)', '') || '';
+        send(btn, 'POST', url + '/pause', { minutes: mins, note: note });
+        return;
+      }
+      if (btn.dataset.act === 'resume') {
+        send(btn, 'POST', url + '/resume', {});
+        return;
+      }
+      if (btn.dataset.act === 'forget') {
+        if (!window.confirm('Forget "' + name + '"?\n\n' +
+          'This clears what the server remembers about the machine, including any pause. ' +
+          'Its builds are kept, and it reappears if it is still polling.')) return;
+        send(btn, 'DELETE', url, null);
+      }
+    });
+
+    function fail(msg) {
+      actionError = true;
+      if (!banner) return;
+      banner.hidden = false;
+      banner.textContent = msg;
+    }
+
+    // clearError hands the banner back to render(). Called when an action
+    // succeeds and when the next one starts, so an error never outlives the
+    // problem it described.
+    function clearError() {
+      actionError = false;
+      if (banner) { banner.hidden = true; banner.textContent = ''; }
+    }
+
+    function send(btn, method, url, body) {
+      clearError();
+      btn.disabled = true;
+      var opts = { method: method, headers: { 'X-Builds-Csrf': '1' } };
+      if (body !== null) {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
+      }
+      fetch(url, opts)
+        .then(function (res) {
+          // Checked, unlike the older trigger button: writeError answers with
+          // JSON on 400 and 403, so a response that is merely parseable is not
+          // a response that worked.
+          if (res.ok) { clearError(); return null; }
+          return res.json()
+            .catch(function () { throw new Error('HTTP ' + res.status); })
+            .then(function (d) { throw new Error(d.error || ('HTTP ' + res.status)); });
+        })
+        .then(function () { refresh(); })
+        .catch(function (err) { fail(err.message); btn.disabled = false; });
     }
 
     // Only while the tab is in front. A page left open on a second monitor

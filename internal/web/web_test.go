@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/FanDoster/Build-System/internal/agents"
+	"github.com/FanDoster/Build-System/internal/auth"
 	"github.com/FanDoster/Build-System/internal/db"
 	"github.com/FanDoster/Build-System/internal/models"
 )
@@ -116,5 +118,39 @@ func TestSettingsPageRendersWithoutSecretValues(t *testing.T) {
 	}
 	if w := get(t, mux, "/projects/999/settings"); w.Code != 404 {
 		t.Errorf("missing project settings: got %d, want 404", w.Code)
+	}
+}
+
+// The agents page renders the same fleet the JSON endpoint gates behind
+// requireOperator: every machine, every queue, and the operator's pause notes.
+// Gating one and not the other means a build machine's own token reads the lot
+// by asking for the page instead of the API.
+func TestAgentsPageRefusesAnAgentToken(t *testing.T) {
+	database, mux := setup(t)
+	h := New(database, "")
+	h.Agents = agents.NewRegistry()
+	mux = http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	a, err := auth.New(database, "operator-pw", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.SetAgentToken("agent-tok")
+	wrapped := a.Middleware(mux)
+
+	call := func(bearer string) int {
+		req := httptest.NewRequest("GET", "/agents", nil)
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		w := httptest.NewRecorder()
+		wrapped.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	if code := call("agent-tok"); code != 403 {
+		t.Errorf("agent token: %d, want 403 — the page discloses the whole fleet", code)
+	}
+	if code := call("operator-pw"); code != 200 {
+		t.Errorf("operator password: %d, want 200", code)
 	}
 }

@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type BuildStatus string
 
@@ -163,4 +166,82 @@ func (b Build) Duration() string {
 		return ""
 	}
 	return b.FinishedAt.Sub(*b.StartedAt).Round(time.Second).String()
+}
+
+// Agent pause.
+//
+// Pause is the only control here that can stop CI, so every rule below is
+// written to fail OPEN. An agent is paused only when a valid future instant
+// says so; anything unclear — no row, no value, an unreadable value, an error
+// on the way to finding out — means not paused. A bug that leaves an agent
+// running when it should be idle is a nuisance; a bug that silently pauses the
+// fleet is a dead CI that looks healthy, and nobody thinks to check a pause
+// they did not set.
+const (
+	// MaxPauseDuration bounds how long one pause can last. The expiry is
+	// mandatory rather than optional because the person who pauses to update
+	// Unity is the same person who will forget, and an unexpiring pause is
+	// indistinguishable from a broken agent until someone goes looking.
+	MaxPauseDuration = 7 * 24 * time.Hour
+
+	// MaxPauseNoteLen bounds the operator's note. It is displayed, not parsed.
+	MaxPauseNoteLen = 200
+
+	// MaxAgentNameLen bounds a name used as a primary key. Names are asserted
+	// by whoever holds the agent token and are never validated against a
+	// registration, so without a bound one request can write a 64 KiB key.
+	MaxAgentNameLen = 64
+)
+
+// AgentPaused reports whether a pause is in force.
+//
+// nil, the zero time, and any instant already past all mean "not paused". This
+// is the fail-open rule in code: there is no input to this function that turns
+// an absent or malformed pause into a paused agent.
+func AgentPaused(pausedUntil *time.Time, now time.Time) bool {
+	return pausedUntil != nil && !pausedUntil.IsZero() && pausedUntil.After(now)
+}
+
+// ValidAgentName reports whether a name is safe to use as a database key and
+// to render.
+//
+// Deliberately more permissive than executor names, which are restricted to
+// lowercase [a-z0-9_-]. An executor name is typed by an operator into a project
+// setting; an agent name arrives from a machine that is already deployed, and
+// tightening the rule under a running fleet would turn a cosmetic naming choice
+// into a claim that fails with 400 — CI stopped by a validation rule. So this
+// rejects only what is genuinely dangerous or absurd: nothing, something too
+// long to be a key, control characters, leading/trailing space that would
+// silently split one machine's history in two, and path separators.
+//
+// The separators are the one rule here that is about somewhere else. An agent
+// name is addressed as a path segment by the operator endpoints, and while Go's
+// own router handles a percent-encoded slash correctly, nginx sits in front of
+// this server in production and normalises `%2F` before Go ever sees the
+// request — so `a/../claim` would arrive at a different endpoint than the one
+// the operator clicked. Nothing legitimate has a slash in its name, so this
+// costs nobody anything.
+func ValidAgentName(name string) bool {
+	if name == "" || len(name) > MaxAgentNameLen {
+		return false
+	}
+	if strings.TrimSpace(name) != name {
+		return false
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return false
+	}
+	// "." and ".." are path segments with a meaning of their own. A browser
+	// resolves them out of the URL before the request is sent, so an agent
+	// named ".." could never be paused or forgotten from the page — the request
+	// would arrive at a different route, or none.
+	if name == "." || name == ".." {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }

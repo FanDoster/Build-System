@@ -93,19 +93,30 @@ clients. The DB row is the durable copy; the topic buffer mirrors it byte-for-by
 
 ### Knowing an agent is there
 
-An idle agent writes **nothing to the database**. Its claim poll returns 204 and
+Nothing in `builds` records an idle agent. Its claim poll returns 204 and
 `ClaimBuildForAgent` runs no UPDATE, so the newest row an agent has touched dates from
 whenever it last *built*. `max(last_heartbeat_at)` therefore means "last seen mid-build",
 not "last seen" — a healthy agent idle for a week looks a week dead.
 
-`internal/agents` closes that gap with an in-memory `Registry` written on every claim
-poll including the empty ones. `agents.Build` folds it together with the DB into the
-`/agents` page, and liveness there is a **three-term disjunction**: a poll open right
-now, a recent poll, or a recent heartbeat on a build the agent owns. The third term is
-not redundant — **an agent stops polling for the whole of a build**, so drop it and every
-busy agent reads as offline. The registry is deliberately not persisted (A2 in
-[docs/agents-page.md](docs/agents-page.md)); after a restart an agent that has not
-checked in yet reads `waiting`, not `offline`, for one `AgentHeartbeatTTL`.
+Two stores close that gap, and they are not interchangeable:
+
+- **`internal/agents.Registry`** — in memory, written on every claim poll including the
+  empty ones. The only thing that can say "a claim is being held open right now".
+- **The `agents` table** (`internal/db/agentstore.go`) — durable, written at most once
+  per `db.AgentSightingInterval` (10s) per agent. Holds pause and a last-seen that
+  outlives the process.
+
+`agents.Build` merges both with the builds table into the `/agents` page. Liveness is a
+**three-term disjunction**: a poll open right now, a recent poll, or a recent heartbeat on
+a build the agent owns. The third term is not redundant — **an agent stops polling for the
+whole of a build**, so drop it and every busy agent reads as offline.
+
+**A persisted row must never set `Agent.Known`.** That flag means "has checked in since
+*this process* started" and it gates the post-restart grace: after a restart an agent that
+has not polled yet reads `waiting`, not `offline`, for one `AgentHeartbeatTTL`. A redeploy
+here takes about two minutes — longer than that tolerance — so treating a remembered agent
+as known would show the whole fleet offline after every deploy, and since offline agents
+do not cover queues, fire the coverage panel's loudest warning every time.
 
 The page derives rather than stores: the current build comes from the `builds` table and
 the current step is scraped from the log's `##[step:` markers. Two state fields with
@@ -113,6 +124,20 @@ different lifetimes would disagree, and the agents page would claim a build is r
 that the build page shows as failed. The corollary is that an orphaned `running` row
 makes an idle agent read as busy until the janitor sweeps it — that is the janitor's job
 and it must not be second-guessed here.
+
+**Pause fails open, everywhere, on purpose.** `models.AgentPaused` treats nil, the zero
+time and any past instant as not-paused; `Server.agentIsPaused` treats a read error the
+same way and logs it. A bug that leaves an agent building when it should be idle is a
+nuisance; a bug that silently pauses the fleet is a dead CI that looks healthy, and nobody
+investigates a pause they did not set. The expiry is mandatory and capped at
+`models.MaxPauseDuration` for the same reason.
+
+Two things follow that are easy to undo by accident. The sighting upsert lists its columns
+explicitly — `INSERT OR REPLACE` would rewrite the whole row and blank `paused_until`, so
+an agent would un-pause itself on its next poll. And pause is enforced **only** in
+`handleAgentClaim`: the log, heartbeat and finish handlers must never check it, because a
+403 from any of them is fatal to the agent's job loop and would abandon a build that may
+already be uploading to Steam.
 
 ### Two live transports, on purpose
 

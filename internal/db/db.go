@@ -94,6 +94,23 @@ func (d *DB) migrate() error {
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		);
+
+		CREATE TABLE IF NOT EXISTS agents (
+			name              TEXT PRIMARY KEY,
+			executors         TEXT NOT NULL DEFAULT '',
+			first_seen_at     DATETIME,
+			last_seen_at      DATETIME,
+			last_scheme       TEXT NOT NULL DEFAULT '',
+			paused_until      DATETIME,
+			pause_note        TEXT NOT NULL DEFAULT '',
+			version           TEXT NOT NULL DEFAULT '',
+			started_at        DATETIME,
+			os_arch           TEXT NOT NULL DEFAULT '',
+			disk_free_gb      INTEGER NOT NULL DEFAULT 0,
+			disk_floor_gb     INTEGER NOT NULL DEFAULT 0,
+			status_json       TEXT NOT NULL DEFAULT '',
+			last_status_at    DATETIME
+		);
 	`)
 	if err != nil {
 		return err

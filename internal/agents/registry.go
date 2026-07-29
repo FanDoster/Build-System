@@ -8,11 +8,22 @@
 // hour ago. The only signal an idle agent produces is the claim request
 // itself, and this is where that signal is kept.
 //
-// Kept in memory on purpose. The alternative is a row written twice a minute
-// per agent forever, and the thing it would buy — knowing on Tuesday when an
-// agent was last seen on Monday — is worth less than not having that write.
-// A restart therefore starts from nothing, which is handled explicitly rather
-// than reported as a fleet of dead machines: see Registry.StartedAt.
+// This registry is the LIVE half of that answer and is kept in memory: it is
+// the only thing that can say "an open claim is being held right now", it costs
+// nothing per poll, and it is rebuilt within one poll cycle of a restart.
+//
+// The durable half lives in the agents table (internal/db/agentstore.go). That
+// was originally rejected — a row written twice a minute per agent forever, to
+// learn on Tuesday when an agent was last seen on Monday, was not worth the
+// write — and two things overturned it. A pause has to survive a redeploy, or
+// deploying the server silently resumes every paused machine. And last-seen has
+// to outlive the process, or the minutes after each deploy show a fleet that
+// has never been seen. The write is made affordable by throttling it to once
+// per AgentSightingInterval per agent rather than once per poll.
+//
+// A restart still starts this registry from nothing, which is handled
+// explicitly rather than reported as a fleet of dead machines: see
+// Registry.StartedAt, and the Known flag in fleet.go.
 package agents
 
 import (
@@ -34,6 +45,10 @@ type Sighting struct {
 	// strongest liveness evidence available: the agent is not merely known to
 	// have existed recently, it is on the other end of an open socket.
 	Polling int
+
+	// lastPersist is when this sighting was last written to the database.
+	// Unexported: it is throttle bookkeeping, not something a caller reports.
+	lastPersist time.Time
 }
 
 type Registry struct {
@@ -106,6 +121,36 @@ func (r *Registry) PollStarted(name string, executors []string, scheme string) (
 			}
 		})
 	}
+}
+
+// ShouldPersist reports whether this agent's sighting is due to be written to
+// the database, and stamps it as written if so.
+//
+// The check and the stamp are one atomic step under the registry's own lock,
+// because the claim handler is concurrent: two polls arriving together must not
+// both decide they are due. The caller does the actual write AFTER this
+// returns, never while holding a lock — a database call under a mutex that
+// every claim contends on would turn one slow write into a stalled fleet.
+//
+// The throttle is what makes a persisted sighting affordable at all. Without
+// it this is a row written twice a minute per agent forever, which is the cost
+// the in-memory registry was built to avoid.
+func (r *Registry) ShouldPersist(name string, interval time.Duration) bool {
+	if name == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.seen[name]
+	if !ok {
+		return false // no sighting to persist; PollStarted has not run
+	}
+	now := r.now()
+	if !s.lastPersist.IsZero() && now.Sub(s.lastPersist) < interval {
+		return false
+	}
+	s.lastPersist = now
+	return true
 }
 
 // Snapshot copies what is known, newest contact first.

@@ -34,7 +34,7 @@ const livePingInterval = 25 * time.Second
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-07-29-agents-page-2"
+const Version = "2026-07-29-agent-pause"
 
 // Agent long-poll defaults. The hold is deliberately under the 60s nginx
 // defaults with room to spare: a claim request that outlives proxy_read_timeout
@@ -126,6 +126,12 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// connects outwards to it.
 	mux.HandleFunc("GET /api/agents", s.handleListAgents)
 	mux.HandleFunc("POST /api/agents/claim", s.handleAgentClaim)
+	// Operator controls. Registered after the literal /api/agents/claim above,
+	// which the ServeMux prefers regardless of order — an agent named "claim"
+	// cannot shadow the claim endpoint.
+	mux.HandleFunc("POST /api/agents/{name}/pause", s.handlePauseAgent)
+	mux.HandleFunc("POST /api/agents/{name}/resume", s.handleResumeAgent)
+	mux.HandleFunc("DELETE /api/agents/{name}", s.handleForgetAgent)
 	mux.HandleFunc("POST /api/builds/{id}/log", s.handleAgentLog)
 	mux.HandleFunc("POST /api/builds/{id}/heartbeat", s.handleAgentHeartbeat)
 	mux.HandleFunc("POST /api/builds/{id}/finish", s.handleAgentFinish)

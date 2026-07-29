@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/FanDoster/Build-System/internal/agents"
+	"github.com/FanDoster/Build-System/internal/db"
 	"github.com/FanDoster/Build-System/internal/models"
 )
 
@@ -104,8 +105,23 @@ func (s *Server) handleAgentClaim(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "agent is required")
 		return
 	}
+	// Bounded before anything retains it. The name becomes a primary key and
+	// the executor list is copied into the registry and kept for the life of
+	// the process, so an unbounded body here is unbounded server memory — and
+	// the caller chooses both. Deliberately permissive: this rejects the
+	// absurd, not the unusual, because tightening naming under a deployed fleet
+	// would turn a cosmetic choice into a claim that fails and CI that stops.
+	if !models.ValidAgentName(req.Agent) {
+		writeError(w, 400, "agent name must be 1-"+strconv.Itoa(models.MaxAgentNameLen)+
+			" characters, with no control characters or surrounding space")
+		return
+	}
 	if len(req.Executors) == 0 {
 		writeError(w, 400, "executors is required")
+		return
+	}
+	if len(req.Executors) > maxAgentExecutors {
+		writeError(w, 400, "at most "+strconv.Itoa(maxAgentExecutors)+" executors")
 		return
 	}
 	for _, e := range req.Executors {
@@ -122,6 +138,7 @@ func (s *Server) handleAgentClaim(w http.ResponseWriter, r *http.Request) {
 	// is the only trace an idle agent leaves anywhere.
 	if s.Agents != nil {
 		defer s.Agents.PollStarted(req.Agent, req.Executors, requestScheme(r))()
+		s.rememberAgent(req.Agent, req.Executors, requestScheme(r))
 	}
 
 	deadline := time.Now().Add(s.pollHold())
@@ -129,6 +146,33 @@ func (s *Server) handleAgentClaim(w http.ResponseWriter, r *http.Request) {
 	defer ticker.Stop()
 
 	for {
+		// Checked every tick rather than once, so a pause takes effect at the
+		// moment of claiming rather than up to a poll later. An operator who
+		// pauses because they are about to unplug the machine gets what they
+		// asked for, instead of one more build starting twenty seconds after.
+		//
+		// The cost is one indexed single-row read per tick — and the loop
+		// already performs a write on every tick, so this adds no new order of
+		// expense. Do not "optimise" it to once per poll without reading the
+		// paragraph above.
+		if s.agentIsPaused(req.Agent) {
+			// Fall through to the wait rather than answering now. A paused
+			// agent must keep its normal poll cadence: returning immediately
+			// would turn it into a one-request-per-second loop against the
+			// server, and would make its presence flicker on the very page
+			// that is supposed to show it as calmly connected-but-paused.
+			if time.Now().After(deadline) {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+			}
+			continue
+		}
+
 		build, err := s.DB.ClaimBuildForAgent(req.Agent, req.Executors)
 		if err != nil {
 			writeError(w, 500, err.Error())
@@ -194,6 +238,150 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, fleet)
+}
+
+// handlePauseAgent stops an agent being given new builds.
+//
+// requireOperator, like every endpoint on this page. Pause is an availability
+// control — it is the one call in this API that can stop CI — and an agent
+// token lives on a build machine. A machine that could pause the fleet, or
+// pause its neighbours, would be a much more interesting thing to compromise
+// than a machine that can only build.
+//
+// The running build, if there is one, is untouched. Pause means "take no more
+// work", and killing a Unity build that may already be uploading to Steam is
+// not something an operator asking for a pause has asked for.
+func (s *Server) handlePauseAgent(w http.ResponseWriter, r *http.Request) {
+	if !requireOperator(w, r) || !requireCsrf(w, r) {
+		return
+	}
+	name := r.PathValue("name")
+	if !models.ValidAgentName(name) {
+		writeError(w, 400, "invalid agent name")
+		return
+	}
+	var req struct {
+		Minutes int    `json:"minutes"`
+		Note    string `json:"note"`
+	}
+	if !decodeAgentBody(w, r, maxAgentBody, &req) {
+		return
+	}
+	// The expiry is required, not defaulted. An open-ended pause is a dead CI
+	// that looks healthy: the person who pauses to update Unity is the person
+	// who will forget, and nobody investigates a pause they did not set. The
+	// cap means even a bad value cannot outlive the week.
+	// Bounded in minutes, BEFORE converting to a Duration. Checking the
+	// converted value instead lets the multiply overflow int64 first: minutes
+	// above about 1.5e8 wrap, a wrap into the negative passes both a
+	// "greater than zero" test on the input and a "not more than a week" test
+	// on the product, and the operator is told 200 for a pause that expired in
+	// 1822. It fails open, so nothing gets stuck paused — but an endpoint that
+	// answers 200 for work it did not do is its own bug.
+	maxMinutes := int(models.MaxPauseDuration / time.Minute)
+	if req.Minutes <= 0 {
+		writeError(w, 400, "minutes must be greater than zero — a pause has to expire on its own")
+		return
+	}
+	if req.Minutes > maxMinutes {
+		writeError(w, 400, fmt.Sprintf("a pause may last at most %d hours",
+			int(models.MaxPauseDuration.Hours())))
+		return
+	}
+	now := time.Now()
+	until := now.Add(time.Duration(req.Minutes) * time.Minute)
+	if err := s.DB.PauseAgent(name, until, req.Note); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	log.Printf("Agent %s paused until %s", name, until.Format(time.RFC3339))
+	writeJSON(w, 200, map[string]interface{}{"agent": name, "paused_until": until})
+}
+
+// handleResumeAgent lets an agent take work again.
+func (s *Server) handleResumeAgent(w http.ResponseWriter, r *http.Request) {
+	if !requireOperator(w, r) || !requireCsrf(w, r) {
+		return
+	}
+	name := r.PathValue("name")
+	if !models.ValidAgentName(name) {
+		writeError(w, 400, "invalid agent name")
+		return
+	}
+	if err := s.DB.ResumeAgent(name); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	log.Printf("Agent %s resumed", name)
+	writeJSON(w, 200, map[string]interface{}{"agent": name, "paused_until": nil})
+}
+
+// handleForgetAgent removes an agent's record.
+//
+// Ships with the table because a name is self-asserted: one typo in a config
+// file creates a row nothing else would ever remove. It clears the record, not
+// the history — the machine reappears from its past builds until those age out,
+// and reappears immediately if it is still polling, which is the correct
+// outcome for a forget aimed at the wrong name.
+func (s *Server) handleForgetAgent(w http.ResponseWriter, r *http.Request) {
+	if !requireOperator(w, r) || !requireCsrf(w, r) {
+		return
+	}
+	name := r.PathValue("name")
+	if name == "" {
+		writeError(w, 400, "invalid agent name")
+		return
+	}
+	if err := s.DB.ForgetAgent(name); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if s.Agents != nil {
+		s.Agents.Forget(name)
+	}
+	log.Printf("Agent %s forgotten", name)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// maxAgentExecutors bounds the queue list one claim may advertise. The registry
+// keeps this slice for the life of the process, keyed by a name the caller also
+// chooses, so it is retained memory an unauthenticated-by-name caller controls.
+const maxAgentExecutors = 16
+
+// rememberAgent writes the sighting to the agents table, subject to the
+// throttle, so last-seen and the agent's existence outlive this process.
+//
+// Every failure here is swallowed. This runs on the claim path, and nothing
+// about remembering an agent is worth failing a build over: a full disk, a
+// locked table or a migration that has not run must degrade the page, never
+// stop CI. The throttle decision and the write are separate steps on purpose —
+// the registry's lock is never held across a database call.
+func (s *Server) rememberAgent(name string, executors []string, scheme string) {
+	if s.DB == nil || !s.Agents.ShouldPersist(name, db.AgentSightingInterval) {
+		return
+	}
+	if err := s.DB.RecordAgentSighting(name, executors, scheme, time.Now()); err != nil {
+		log.Printf("agent %s: could not record sighting: %v", name, err)
+	}
+}
+
+// agentIsPaused reports whether an operator has stopped this agent taking work.
+//
+// Fails OPEN, and that is the whole design of it. An error reading the pause —
+// a locked database, an unreadable value, a table that is not there yet —
+// answers "not paused", so the worst case of a broken pause is an agent that
+// keeps building. The opposite default would let one bad read stop the fleet
+// silently, and nobody investigates a pause they did not set.
+func (s *Server) agentIsPaused(name string) bool {
+	if s.DB == nil {
+		return false
+	}
+	until, err := s.DB.AgentPausedUntil(name)
+	if err != nil {
+		log.Printf("agent %s: could not read pause state, treating as not paused: %v", name, err)
+		return false
+	}
+	return models.AgentPaused(until, time.Now())
 }
 
 // requestScheme reports how a request reached us.

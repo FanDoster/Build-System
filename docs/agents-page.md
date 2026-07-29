@@ -4,11 +4,11 @@ A page on the build server showing the machines that build things: whether each
 one is online, what it is running, when it was last seen, and enough about it to
 answer "why is nothing building" without opening a terminal.
 
-This is a design document that is now partly built. **A1 is done and deployed**
-— the page at `/agents`, the coverage panel, and per-agent state from data that
-already existed. A2 (persistence and pause), A3 (agent self-reporting) and A4
-(polish) are still design only; §8 says which is which. For the agent protocol,
-see [build-agents.md](build-agents.md).
+This is a design document that is now partly built. **A1 and A2 are done and
+deployed** — the page at `/agents`, the coverage panel, per-agent state, and the
+persisted `agents` table behind pause/resume/forget. A3 (agent self-reporting)
+and A4 (polish) are still design only; §8 says which is which. For the agent
+protocol, see [build-agents.md](build-agents.md).
 
 ---
 
@@ -48,6 +48,14 @@ this agent was mid-build".
 
 So liveness needs new state. That is the whole reason this feature is not a
 template and an afternoon.
+
+**A2 changed this, deliberately and narrowly.** An idle agent now writes one row
+per `db.AgentSightingInterval` — ten seconds, not per poll. The constraint above
+is still what shapes everything, because the *reason* the write exists is that
+nothing else records an idle agent at all; but "an idle agent writes nothing" is
+no longer literally true, and A2's throttle is the price of a pause that
+survives a redeploy and a last-seen that outlives the process. Read the rest of
+this section as the problem statement, not as current behaviour.
 
 A second, subtler constraint: **an agent stops polling while it builds.** The
 claim loop runs one build to completion before claiming again. Any liveness rule
@@ -361,10 +369,62 @@ build *in flight* reset the run, which blanked the warning at the moment
 somebody was watching a retry; it now steps over non-terminal builds and stops
 only at a success or a cancel.
 
-**A2 — persistence.** The `agents` table, last-seen across restarts, forget, and
-pause/resume enforced in the claim handler. *Accept:* last-seen survives a
-server redeploy; a paused agent keeps polling and reads as connected-but-paused;
-its pause expires on its own.
+**A2 — persistence. Done, 2026-07-29.** The `agents` table, last-seen across
+restarts, forget, and pause/resume enforced in the claim handler. *Accept:*
+last-seen survives a server redeploy; a paused agent keeps polling and reads as
+connected-but-paused; its pause expires on its own.
+
+*Verified* against a server on a temporary database, driven by a script speaking
+the real protocol. A pause left the queued build pending while the agent stayed
+`paused` with `polling: true`; the coverage panel said "paused — nothing will be
+claimed" rather than "no agent serving this". Resume let the same build be
+claimed. Killing and restarting the server preserved both the pause and
+`first_seen`, and a remembered-but-absent agent decayed `online` → `waiting` →
+`offline` over the tolerance, taking its queue coverage with it only at the end.
+Pause, resume and forget were exercised through the page's own buttons.
+
+Three decisions are worth keeping, because each has a wrong answer that looks
+right:
+
+- **Pause is checked on every tick of the claim loop, not once per poll.** An
+  operator pausing because they are about to unplug the machine should not get
+  one more build twenty seconds later. The loop already writes on every tick, so
+  the extra indexed read is not a new order of cost.
+- **A paused claim still holds the connection for the full poll before
+  answering 204.** Returning immediately would turn a paused agent into a
+  one-request-per-second loop — the agent's own floor is a second — and make its
+  presence flicker on the page that is supposed to show it calmly connected.
+- **A persisted row does not set `Known`.** That flag gates the post-restart
+  grace, and a redeploy takes longer than the 90s tolerance; marking remembered
+  agents as known would show the fleet offline after every deploy and, because
+  offline agents do not cover queues, fire the coverage warning every time.
+
+Two bugs were caught by running it rather than by tests. The first showed a
+live, actively-polling agent as "last poll before restart": the stored timestamp
+is written microseconds after the registry records the same poll, so taking
+whichever was newer always picked the stored one. The persisted value is now
+used only when there is no live sighting at all. The second was that
+`ValidAgentName` accepted `/`; Go's own router handles a percent-encoded slash
+correctly, but nginx normalises `%2F` in front of this server, so an agent named
+`a/../claim` would have addressed a different endpoint than the operator
+clicked.
+
+A review pass over the finished code found six more, all fixed, none of which a
+passing test suite would have shown:
+
+| Defect | Why it mattered |
+| --- | --- |
+| `GET /agents` (the HTML page) had no operator check | Its JSON twin did. A build machine's own token could read the whole fleet — every machine, every queue, every pause note — by asking for the page instead of the API. |
+| The pause cap was applied to the converted `Duration`, not the operator's input | `minutes * time.Minute` overflows int64 above ~1.5e8, and a wrap into the negative passes *both* "greater than zero" on the input and "no more than a week" on the product. The endpoint answered `200` for a pause that expired in 1822. It fails open, so nothing got stuck, but an endpoint reporting success for work it did not do is its own bug. |
+| `PauseAgent` stamped `first_seen_at` when it created a row | Pausing a machine that has never connected recorded a contact that never happened, and nothing corrected it — the sighting path fills that column only while it is NULL. |
+| The pause note was cut at a byte offset | Any note containing an accent had its last character split, and the invalid bytes survived into SQLite and back onto the page. |
+| The five-second poll wiped the action-error banner | A refused pause or forget read as a silent no-op, which is the worst outcome for a control whose whole job is to be certain. The error now survives until the operator's next action. |
+| `.` and `..` were valid agent names | A browser resolves them out of a URL path before sending, so such an agent could never be paused or forgotten from the page. |
+
+Three further candidates were raised and refuted on inspection: that the seven
+A3 columns needed `addColumnIfMissing` entries (the table is new, so no database
+can exist with a narrower one), and two readings of `Forget` on a live agent
+that rested on a state the claim handler cannot be in.
 
 **A3 — the agent reports on itself.** Claim-poll block plus
 `/api/agents/status`; doctor on a timer; the page shows problems, disk against
