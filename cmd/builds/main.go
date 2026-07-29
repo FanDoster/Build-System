@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/FanDoster/Build-System/internal/agents"
 	"github.com/FanDoster/Build-System/internal/api"
 	"github.com/FanDoster/Build-System/internal/auth"
 	"github.com/FanDoster/Build-System/internal/db"
@@ -84,11 +85,13 @@ func main() {
 	// Notifier: agent builds reach their terminal state through the API rather
 	// than the worker's finish(), so the mail hook has to be reachable from
 	// there too.
-	apiServer := &api.Server{DB: database, BuildCh: buildCh, Bus: bus, Runner: r, Live: liveHub, BasePath: basePath, Notifier: r}
+	registry := agents.NewRegistry()
+	apiServer := &api.Server{DB: database, BuildCh: buildCh, Bus: bus, Runner: r, Live: liveHub, BasePath: basePath, Notifier: r, Agents: registry}
 	apiServer.RegisterRoutes(mux)
 
 	// Web UI
 	webHandler := web.New(database, basePath)
+	webHandler.Agents = registry
 	webHandler.RegisterRoutes(mux)
 
 	// Authentication: everything behind a password when one is configured.

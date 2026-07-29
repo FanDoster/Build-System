@@ -1,0 +1,76 @@
+{{define "content"}}
+<div class="page-head">
+  <h2>Agents <span class="log-conn" id="agents-conn" hidden style="font-weight:400"></span></h2>
+</div>
+
+<!-- Coverage first, and deliberately. "Why is nothing building" is almost
+     always an executor nothing serves, and that has no other symptom: the
+     agent looks fine, the build sits pending, and no log anywhere mentions
+     it. Everything below this is detail by comparison. -->
+<section class="settings-card" id="coverage-card">
+  <h3 class="settings-heading">Queues</h3>
+  <p class="form-hint">A project's <span class="mono">Executor</span> names the queue its builds wait on. A queue no agent asks for is a build that waits forever.</p>
+  <div id="coverage">
+    {{if .Fleet.Executors}}
+      {{range .Fleet.Executors}}
+        <div class="coverage-row {{if not .Served}}coverage-unserved{{end}}">
+          <span class="mono coverage-name">{{.Name}}</span>
+          {{if .Served}}
+            <span class="badge badge-success">served by {{range $i, $a := .Agents}}{{if $i}}, {{end}}{{$a}}{{end}}</span>
+          {{else}}
+            <span class="badge badge-failed">no agent serving this</span>
+          {{end}}
+          <span class="coverage-pending">{{.Pending}} pending</span>
+          <span class="coverage-projects">{{range $i, $p := .Projects}}{{if $i}}, {{end}}{{$p}}{{end}}</span>
+        </div>
+      {{end}}
+    {{else}}
+      <p class="empty">No project uses a remote executor. Set one on a project's settings page to route its builds to an agent.</p>
+    {{end}}
+  </div>
+</section>
+
+<section class="settings-card">
+  <h3 class="settings-heading">Machines</h3>
+  <div id="agent-list">
+    {{if .Fleet.Agents}}
+      {{range .Fleet.Agents}}
+        <div class="agent-row">
+          <div class="agent-head">
+            <span class="badge badge-{{.State}}">{{.State}}</span>
+            <span class="agent-name mono">{{.Name}}</span>
+            {{if eq .Scheme "http"}}<span class="badge badge-failed" title="This agent's requests arrived unencrypted. Its token has crossed the network in clear and should be rotated.">NOT ENCRYPTED</span>{{end}}
+            {{if .Executors}}<span class="agent-execs">serves {{range $i, $e := .Executors}}{{if $i}}, {{end}}<span class="mono">{{$e}}</span>{{end}}</span>{{end}}
+          </div>
+
+          <div class="agent-meta">
+            {{if .LastSeen}}
+              last seen <time data-abs datetime="{{.LastSeen.Format "2006-01-02T15:04:05Z07:00"}}">{{.LastSeen.Format "15:04:05"}}</time> ({{.LastSeenFrom}})
+            {{else}}
+              not seen since this server started
+            {{end}}
+            {{if .ConsecutiveFailures}}· <span class="agent-warn">{{.ConsecutiveFailures}} failures in a row</span>{{end}}
+          </div>
+
+          {{if .Current}}
+            <div class="agent-current">
+              building <a href="{{$.BasePath}}/builds/{{.Current.ID}}">#{{.Current.ID}}</a>
+              {{.Current.Project}}
+              {{if .Current.Step}}· step <span class="mono">{{.Current.Step}}</span>{{end}}
+              {{if .Current.StepDetail}}<span class="agent-step-detail">{{.Current.StepDetail}}</span>{{end}}
+            </div>
+          {{end}}
+
+          {{if .Recent}}
+            <div class="agent-recent">
+              {{range .Recent}}<a class="chip chip-{{.Status}}" href="{{$.BasePath}}/builds/{{.ID}}" title="{{.Project}} — {{.Status}}{{if .Duration}} in {{.Duration}}{{end}}">#{{.ID}}</a>{{end}}
+            </div>
+          {{end}}
+        </div>
+      {{end}}
+    {{else}}
+      <p class="empty">No agent has ever claimed a build here. Point one at this server and set a project's executor to a queue it serves.</p>
+    {{end}}
+  </div>
+</section>
+{{end}}

@@ -4,9 +4,11 @@ A page on the build server showing the machines that build things: whether each
 one is online, what it is running, when it was last seen, and enough about it to
 answer "why is nothing building" without opening a terminal.
 
-This is a design document, not a description of something that exists. Nothing
-in here is built yet. For the agent protocol that *does* exist, see
-[build-agents.md](build-agents.md).
+This is a design document that is now partly built. **A1 is done and deployed**
+— the page at `/agents`, the coverage panel, and per-agent state from data that
+already existed. A2 (persistence and pause), A3 (agent self-reporting) and A4
+(polish) are still design only; §8 says which is which. For the agent protocol,
+see [build-agents.md](build-agents.md).
 
 ---
 
@@ -322,12 +324,32 @@ small JSON document is the honest answer, and it keeps the invariant intact.
 
 ## 8. Milestones
 
-**A1 — the page, from data that already exists.** In-memory registry, coverage
-panel, per-agent state/executors/current build/recent history, current step
-scraped from the log. No schema change, no agent change, no protocol change.
+**A1 — the page, from data that already exists. Done, 2026-07-29.** In-memory
+registry, coverage panel, per-agent state/executors/current build/recent
+history, current step scraped from the log. No schema change, no agent change,
+no protocol change.
 *Accept:* stopping the agent flips it to offline within 90s; starting it flips
 back within 30s; renaming a project's executor to something no agent serves
 shows the coverage warning with the pending count.
+
+*Verified* against a server on a temporary database, driven by a script that
+speaks the real claim/log/heartbeat/finish protocol: offline at 91s against the
+90s tolerance, back online at 2s, and a project pointed at `macos` while the
+agent served `mac` showed the queue unserved with its pending count and
+oldest-pending time while the agent itself stayed green — which is the whole
+point of the panel. Consecutive failures counted correctly, the offline agent
+stopped covering its queue, and the current step tracked the build through
+checkout → unity → steam.
+
+Two things surfaced only in that run and are worth recording. An orphaned
+`running` row — an agent killed mid-build — makes an idle agent read as busy
+until the janitor sweeps it, at most `AgentHeartbeatTTL`. This is left alone
+deliberately: the janitor is the single authority on stale builds, and a second
+staleness rule in the view is exactly the kind of duplicated state §6 avoids. It
+self-heals, and it was seen to. Separately, the failure counter originally let a
+build *in flight* reset the run, which blanked the warning at the moment
+somebody was watching a retry; it now steps over non-terminal builds and stops
+only at a success or a cancel.
 
 **A2 — persistence.** The `agents` table, last-seen across restarts, forget, and
 pause/resume enforced in the claim handler. *Accept:* last-seen survives a

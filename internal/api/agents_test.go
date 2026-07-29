@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FanDoster/Build-System/internal/agents"
+	"github.com/FanDoster/Build-System/internal/auth"
 	"github.com/FanDoster/Build-System/internal/db"
 	"github.com/FanDoster/Build-System/internal/logbus"
 	"github.com/FanDoster/Build-System/internal/models"
@@ -58,6 +60,18 @@ func claimOne(t *testing.T, mux *http.ServeMux) {
 		map[string]interface{}{"agent": "mac-1", "executors": []string{"mac"}})
 	if w.Code != 200 {
 		t.Fatalf("claim: status %d body %s", w.Code, w.Body.String())
+	}
+}
+
+// pollEmpty is the poll an idle agent makes all day: nothing is waiting, so it
+// answers 204. It writes nothing to the database, which is exactly why the
+// registry has to notice it.
+func pollEmpty(t *testing.T, mux *http.ServeMux) {
+	t.Helper()
+	w := doJSON(t, mux, "POST", "/api/agents/claim",
+		map[string]interface{}{"agent": "mac-1", "executors": []string{"mac"}})
+	if w.Code != 204 {
+		t.Fatalf("empty claim: status %d body %s, want 204", w.Code, w.Body.String())
 	}
 }
 
@@ -823,5 +837,143 @@ func TestTerminalStatusBackfillsAReasonWrittenOnlyToTheRow(t *testing.T) {
 	// And exactly once — the backfill must not replay what was already sent.
 	if n := strings.Count(joined, "compiling"); n != 1 {
 		t.Errorf("earlier output appears %d times, want 1", n)
+	}
+}
+
+// The agents endpoint discloses every machine and every queue, so unlike the
+// rest of this file it must refuse an agent's own token. An agent credential
+// lives on a build machine; the fleet is operator information.
+func TestListAgentsRefusesAnAgentToken(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+
+	a, err := auth.New(s.DB, "operator-pw", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.SetAgentToken("agent-tok")
+	h := a.Middleware(mux)
+
+	call := func(bearer string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("GET", "/api/agents", nil)
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
+
+	if w := call("agent-tok"); w.Code != 403 {
+		t.Errorf("agent token: status %d, want 403 — an agent must not be able to enumerate the fleet", w.Code)
+	}
+	if w := call("operator-pw"); w.Code != 200 {
+		t.Fatalf("operator: status %d body %s", w.Code, w.Body.String())
+	}
+}
+
+// The page's whole purpose, end to end against a real database: an agent that
+// polls appears, and the queue it serves is reported as covered.
+func TestListAgentsReflectsARealClaimPoll(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	macProject(t, s)
+
+	pollEmpty(t, mux) // an ordinary idle poll: no build waiting
+
+	w := doJSON(t, mux, "GET", "/api/agents", nil)
+	if w.Code != 200 {
+		t.Fatalf("status %d body %s", w.Code, w.Body.String())
+	}
+	var fleet agents.Fleet
+	decodeJSON(t, w, &fleet)
+
+	if len(fleet.Agents) != 1 || fleet.Agents[0].Name != "mac-1" {
+		t.Fatalf("agents = %+v, want mac-1 — a poll that claimed nothing is still a sighting", fleet.Agents)
+	}
+	if got := fleet.Agents[0].State; got != agents.StateOnline {
+		t.Errorf("state = %q, want online", got)
+	}
+	if len(fleet.Executors) != 1 || !fleet.Executors[0].Served {
+		t.Errorf("executors = %+v, want the mac queue reported as served", fleet.Executors)
+	}
+}
+
+// A build in flight has to show up as busy with its build attached, or the page
+// answers "is anything happening" with silence.
+func TestListAgentsShowsTheBuildInFlight(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	p := macProject(t, s)
+	b := pending(t, s, p.ID)
+
+	claimOne(t, mux)
+	agentLog(t, mux, b.ID, "mac-1", 0, "[12:00:00] ##[step:unity] building\n")
+
+	w := doJSON(t, mux, "GET", "/api/agents", nil)
+	var fleet agents.Fleet
+	decodeJSON(t, w, &fleet)
+
+	if len(fleet.Agents) != 1 {
+		t.Fatalf("agents = %+v", fleet.Agents)
+	}
+	got := fleet.Agents[0]
+	if got.State != agents.StateBusy {
+		t.Errorf("state = %q, want busy", got.State)
+	}
+	if got.Current == nil {
+		t.Fatal("no current build on a busy agent")
+	}
+	if got.Current.ID != b.ID || got.Current.Project != "game" {
+		t.Errorf("current = %+v, want build %d of game", got.Current, b.ID)
+	}
+	if got.Current.Step != "unity" {
+		t.Errorf("step = %q, want unity read from the log", got.Current.Step)
+	}
+}
+
+// A project pointed at a queue nothing serves is the failure this page exists
+// to catch: the build waits forever and nothing else reports it.
+func TestListAgentsFlagsAQueueNoAgentServes(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	p := createProject(t, s, models.Project{
+		Name: "typo", RepoURL: "https://github.com/nmr/ship", Branch: "main",
+		DockerfilePath: "Dockerfile", ImageName: "typo", Executor: "macos",
+	})
+	pending(t, s, p.ID)
+
+	pollEmpty(t, mux) // mac-1 serves "mac", not "macos"
+
+	w := doJSON(t, mux, "GET", "/api/agents", nil)
+	var fleet agents.Fleet
+	decodeJSON(t, w, &fleet)
+
+	if len(fleet.Executors) != 1 {
+		t.Fatalf("executors = %+v, want the macos queue listed", fleet.Executors)
+	}
+	e := fleet.Executors[0]
+	if e.Name != "macos" || e.Served {
+		t.Errorf("executor %+v, want macos reported as unserved", e)
+	}
+	if e.Pending != 1 {
+		t.Errorf("pending = %d, want 1", e.Pending)
+	}
+	if e.OldestPending == nil {
+		t.Error("no oldest-pending time on a stuck queue")
+	}
+}
+
+// No agent token means no clone token in the response. The fleet view reads
+// projects, and a project row carries the credential that clones it.
+func TestListAgentsNeverDisclosesACloneToken(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	p := macProject(t, s) // CloneToken: ghp_secret
+	b := pending(t, s, p.ID)
+	claimOne(t, mux)
+	agentLog(t, mux, b.ID, "mac-1", 0, "starting\n")
+
+	w := doJSON(t, mux, "GET", "/api/agents", nil)
+	if strings.Contains(w.Body.String(), "ghp_secret") {
+		t.Error("the agents payload carried a clone token")
 	}
 }

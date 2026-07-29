@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/FanDoster/Build-System/internal/agents"
 	"github.com/FanDoster/Build-System/internal/auth"
 	"github.com/FanDoster/Build-System/internal/db"
 	"github.com/FanDoster/Build-System/internal/live"
@@ -33,7 +34,7 @@ const livePingInterval = 25 * time.Second
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-07-28-build-agents"
+const Version = "2026-07-29-agents-page"
 
 // Agent long-poll defaults. The hold is deliberately under the 60s nginx
 // defaults with room to spare: a claim request that outlives proxy_read_timeout
@@ -69,6 +70,10 @@ type Server struct {
 	BasePath string // e.g. "/builds"
 	// Notifier mails the outcome of agent-finished builds. Optional.
 	Notifier Notifier
+	// Agents remembers which agents have been in touch. An idle agent writes
+	// nothing to the database, so this is the only record that one exists.
+	// Optional; without it the agents page shows history only.
+	Agents *agents.Registry
 
 	// AgentPollHold/AgentPollInterval tune the claim long-poll; zero means the
 	// defaults above. Tests set them small.
@@ -119,6 +124,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// Build agents. Everything an agent does is a POST it initiates itself:
 	// the Mac running these builds sits behind NAT, so nothing here ever
 	// connects outwards to it.
+	mux.HandleFunc("GET /api/agents", s.handleListAgents)
 	mux.HandleFunc("POST /api/agents/claim", s.handleAgentClaim)
 	mux.HandleFunc("POST /api/builds/{id}/log", s.handleAgentLog)
 	mux.HandleFunc("POST /api/builds/{id}/heartbeat", s.handleAgentHeartbeat)

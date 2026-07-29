@@ -12,6 +12,7 @@
     <h1><a href="{{.BasePath}}/">Build-System</a></h1>
     <nav>
       <a href="{{.BasePath}}/">Dashboard</a>
+      <a href="{{.BasePath}}/agents">Agents</a>
       <a href="{{.BasePath}}/api/health">API</a>
       {{if .Authed}}<button type="button" class="nav-signout" id="btn-signout" data-url="{{.BasePath}}/api/logout" data-login-url="{{.BasePath}}/login">Sign out</button>{{end}}
     </nav>

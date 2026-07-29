@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/FanDoster/Build-System/internal/agents"
 	"github.com/FanDoster/Build-System/internal/models"
 )
 
@@ -117,6 +118,12 @@ func (s *Server) handleAgentClaim(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Recorded before the wait, and closed however this returns. An empty poll
+	// is the only trace an idle agent leaves anywhere.
+	if s.Agents != nil {
+		defer s.Agents.PollStarted(req.Agent, req.Executors, requestScheme(r))()
+	}
+
 	deadline := time.Now().Add(s.pollHold())
 	ticker := time.NewTicker(s.pollInterval())
 	defer ticker.Stop()
@@ -165,6 +172,44 @@ func (s *Server) handleAgentClaim(w http.ResponseWriter, r *http.Request) {
 		case <-ticker.C:
 		}
 	}
+}
+
+// handleListAgents serves the fleet: who is here, what they serve, what they
+// are doing, and which executors nothing is serving.
+//
+// requireOperator, unlike the rest of the agent endpoints: an agent's own token
+// authenticates against anything that does not check, and this discloses every
+// machine and every queue rather than the one build the caller is working on.
+func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
+	if !requireOperator(w, r) {
+		return
+	}
+	if s.Agents == nil {
+		writeError(w, 503, "agent registry not configured")
+		return
+	}
+	fleet, err := agents.Build(s.DB, s.Agents, time.Now())
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, fleet)
+}
+
+// requestScheme reports how a request reached us.
+//
+// X-Forwarded-Proto because the server sits behind nginx and never sees TLS
+// itself. The header is only trustworthy because that nginx overwrites it, so
+// this is used to warn on the agents page and never to decide whether a
+// request is allowed.
+func requestScheme(r *http.Request) string {
+	if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
+		return p
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
 }
 
 // handleAgentLog appends a chunk of build output at a byte offset.

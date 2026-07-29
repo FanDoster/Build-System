@@ -14,10 +14,165 @@
     initTriggerButton();
     initBuildPage();
     initListLive();
+    initAgentsPage();
     initSettingsForm();
     initLoginForm();
     initSignOut();
   });
+
+  // --- Agents page ---
+  // Plain polling, not the WebSocket: /api/live carries builds, and an agent
+  // that is merely *present* changes nothing in that snapshot. Putting an
+  // always-moving liveness field there would defeat the dedupe that makes N
+  // idle dashboards cost zero bytes — see docs/agents-page.md §7.
+  //
+  // Row markup below mirrors templates/agents.html. Change one, change the
+  // other, the same way buildCard/buildRow mirror index.html.
+  //
+  // Everything here goes in through textContent. An agent name is whatever
+  // string a machine put in its config: it is never operator-authored and
+  // never HTML.
+  function initAgentsPage() {
+    var root = document.getElementById('agent-list');
+    if (!root) return;
+    var coverage = document.getElementById('coverage');
+    var connEl = document.getElementById('agents-conn');
+    var base = document.body.dataset.basePath || '';
+    var timer = null;
+
+    function el(tag, cls, text) {
+      var e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text !== undefined) e.textContent = text;
+      return e;
+    }
+    function setConn(kind) {
+      if (!connEl) return;
+      connEl.hidden = false;
+      connEl.className = 'log-conn' + (kind === 'live' ? ' log-conn--live' : ' log-conn--polling');
+      connEl.textContent = kind === 'live' ? '● live' : '↻ reconnecting';
+    }
+    function join(list) { return (list || []).join(', '); }
+
+    function coverageRow(e) {
+      var row = el('div', 'coverage-row' + (e.served ? '' : ' coverage-unserved'));
+      row.appendChild(el('span', 'mono coverage-name', e.name));
+      row.appendChild(e.served
+        ? el('span', 'badge badge-success', 'served by ' + join(e.agents))
+        : el('span', 'badge badge-failed', 'no agent serving this'));
+      row.appendChild(el('span', 'coverage-pending', (e.pending || 0) + ' pending'));
+      row.appendChild(el('span', 'coverage-projects', join(e.projects)));
+      return row;
+    }
+
+    function agentRow(a) {
+      var row = el('div', 'agent-row');
+
+      var head = el('div', 'agent-head');
+      head.appendChild(el('span', 'badge badge-' + a.state, a.state));
+      head.appendChild(el('span', 'agent-name mono', a.name));
+      if (a.scheme === 'http') {
+        var warn = el('span', 'badge badge-failed', 'NOT ENCRYPTED');
+        warn.title = "This agent's requests arrived unencrypted. Its token has crossed the network in clear and should be rotated.";
+        head.appendChild(warn);
+      }
+      if (a.executors && a.executors.length) {
+        var ex = el('span', 'agent-execs', 'serves ');
+        for (var i = 0; i < a.executors.length; i++) {
+          if (i) ex.appendChild(document.createTextNode(', '));
+          ex.appendChild(el('span', 'mono', a.executors[i]));
+        }
+        head.appendChild(ex);
+      }
+      row.appendChild(head);
+
+      var meta = el('div', 'agent-meta');
+      if (a.last_seen) {
+        meta.appendChild(document.createTextNode('last seen '));
+        var t = el('time');
+        t.setAttribute('data-abs', '');
+        t.setAttribute('datetime', a.last_seen);
+        setAbsLabel(t);
+        meta.appendChild(t);
+        if (a.last_seen_from) meta.appendChild(document.createTextNode(' (' + a.last_seen_from + ')'));
+      } else {
+        meta.appendChild(document.createTextNode('not seen since this server started'));
+      }
+      if (a.consecutive_failures) {
+        meta.appendChild(document.createTextNode(' · '));
+        meta.appendChild(el('span', 'agent-warn', a.consecutive_failures + ' failures in a row'));
+      }
+      row.appendChild(meta);
+
+      if (a.current) {
+        var cur = el('div', 'agent-current');
+        cur.appendChild(document.createTextNode('building '));
+        var link = el('a', null, '#' + a.current.id);
+        link.href = base + '/builds/' + a.current.id;
+        cur.appendChild(link);
+        cur.appendChild(document.createTextNode(' ' + (a.current.project || '')));
+        if (a.current.step) {
+          cur.appendChild(document.createTextNode(' · step '));
+          cur.appendChild(el('span', 'mono', a.current.step));
+        }
+        if (a.current.step_detail) {
+          cur.appendChild(document.createTextNode(' '));
+          cur.appendChild(el('span', 'agent-step-detail', a.current.step_detail));
+        }
+        row.appendChild(cur);
+      }
+
+      if (a.recent && a.recent.length) {
+        var rec = el('div', 'agent-recent');
+        for (var j = 0; j < a.recent.length; j++) {
+          var b = a.recent[j];
+          var chip = el('a', 'chip chip-' + b.status, '#' + b.id);
+          chip.href = base + '/builds/' + b.id;
+          chip.title = (b.project || '') + ' — ' + b.status + (b.duration ? ' in ' + b.duration : '');
+          rec.appendChild(chip);
+        }
+        row.appendChild(rec);
+      }
+      return row;
+    }
+
+    function render(fleet) {
+      if (coverage) {
+        coverage.textContent = '';
+        if (fleet.executors && fleet.executors.length) {
+          for (var i = 0; i < fleet.executors.length; i++) {
+            coverage.appendChild(coverageRow(fleet.executors[i]));
+          }
+        } else {
+          coverage.appendChild(el('p', 'empty',
+            "No project uses a remote executor. Set one on a project's settings page to route its builds to an agent."));
+        }
+      }
+      root.textContent = '';
+      if (fleet.agents && fleet.agents.length) {
+        for (var j = 0; j < fleet.agents.length; j++) root.appendChild(agentRow(fleet.agents[j]));
+      } else {
+        root.appendChild(el('p', 'empty',
+          "No agent has ever claimed a build here. Point one at this server and set a project's executor to a queue it serves."));
+      }
+    }
+
+    function refresh() {
+      fetch(base + '/api/agents', { headers: { 'Accept': 'application/json' } })
+        .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+        .then(function (fleet) { render(fleet); setConn('live'); })
+        .catch(function () { setConn('reconnecting'); });
+    }
+
+    // Only while the tab is in front. A page left open on a second monitor
+    // otherwise polls all night for nobody.
+    function start() { if (!timer) { refresh(); timer = setInterval(refresh, 5000); } }
+    function stop() { if (timer) { clearInterval(timer); timer = null; } }
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) stop(); else start();
+    });
+    if (!document.hidden) start();
+  }
 
   // --- Login page ---
   function initLoginForm() {

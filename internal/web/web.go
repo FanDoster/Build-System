@@ -8,6 +8,9 @@ import (
 	"strconv"
 	"strings"
 
+	"time"
+
+	"github.com/FanDoster/Build-System/internal/agents"
 	"github.com/FanDoster/Build-System/internal/auth"
 	"github.com/FanDoster/Build-System/internal/db"
 	"github.com/FanDoster/Build-System/internal/models"
@@ -32,6 +35,9 @@ var staticFS embed.FS
 type Handler struct {
 	DB       *db.DB
 	BasePath string
+	// Agents is the in-memory record of which agents have been in touch.
+	// Optional; the agents page 503s without it.
+	Agents *agents.Registry
 }
 
 func New(database *db.DB, basePath string) *Handler {
@@ -46,6 +52,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// Pages
 	mux.HandleFunc("GET /", h.handleIndex)
 	mux.HandleFunc("GET /login", h.handleLogin)
+	mux.HandleFunc("GET /agents", h.handleAgents)
 	mux.HandleFunc("GET /projects/{id}", h.handleProject)
 	mux.HandleFunc("GET /projects/{id}/settings", h.handleProjectSettings)
 	mux.HandleFunc("GET /builds/{id}", h.handleBuild)
@@ -75,6 +82,26 @@ func (h *Handler) render(w http.ResponseWriter, r *http.Request, name string, da
 	data["Authed"] = auth.IsAuthed(r.Context())
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	tmpl.ExecuteTemplate(w, "base", data)
+}
+
+// handleAgents renders the machines that build things.
+//
+// Server-rendered from the same view model the JSON endpoint returns, so the
+// page is right before any script runs — the script only keeps it current.
+func (h *Handler) handleAgents(w http.ResponseWriter, r *http.Request) {
+	if h.Agents == nil {
+		http.Error(w, "agent registry not configured", 503)
+		return
+	}
+	fleet, err := agents.Build(h.DB, h.Agents, time.Now())
+	if err != nil {
+		http.Error(w, "failed to load agents: "+err.Error(), 500)
+		return
+	}
+	h.render(w, r, "agents", map[string]interface{}{
+		"Title": "Agents",
+		"Fleet": fleet,
+	})
 }
 
 func (h *Handler) handleIndex(w http.ResponseWriter, r *http.Request) {

@@ -5,9 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This file is for working **on** the build server. For putting a *new project* onto it
 (create → trigger → deploy → expose), see [docs/adding-a-project.md](docs/adding-a-project.md).
 For builds that run on another machine (Unity on a Mac, say), see
-[docs/build-agents.md](docs/build-agents.md). A planned page for looking at
-those machines is designed in [docs/agents-page.md](docs/agents-page.md) — not
-built yet.
+[docs/build-agents.md](docs/build-agents.md). The page for looking at those
+machines is at `/agents`, designed in
+[docs/agents-page.md](docs/agents-page.md) — milestone A1 of that plan is built;
+A2–A4 are still design only.
 
 ## What this is
 
@@ -89,6 +90,29 @@ Two consequences worth holding on to here:
 
 `internal/logbus` is the in-memory pub/sub hub connecting the runner's output to SSE
 clients. The DB row is the durable copy; the topic buffer mirrors it byte-for-byte.
+
+### Knowing an agent is there
+
+An idle agent writes **nothing to the database**. Its claim poll returns 204 and
+`ClaimBuildForAgent` runs no UPDATE, so the newest row an agent has touched dates from
+whenever it last *built*. `max(last_heartbeat_at)` therefore means "last seen mid-build",
+not "last seen" — a healthy agent idle for a week looks a week dead.
+
+`internal/agents` closes that gap with an in-memory `Registry` written on every claim
+poll including the empty ones. `agents.Build` folds it together with the DB into the
+`/agents` page, and liveness there is a **three-term disjunction**: a poll open right
+now, a recent poll, or a recent heartbeat on a build the agent owns. The third term is
+not redundant — **an agent stops polling for the whole of a build**, so drop it and every
+busy agent reads as offline. The registry is deliberately not persisted (A2 in
+[docs/agents-page.md](docs/agents-page.md)); after a restart an agent that has not
+checked in yet reads `waiting`, not `offline`, for one `AgentHeartbeatTTL`.
+
+The page derives rather than stores: the current build comes from the `builds` table and
+the current step is scraped from the log's `##[step:` markers. Two state fields with
+different lifetimes would disagree, and the agents page would claim a build is running
+that the build page shows as failed. The corollary is that an orphaned `running` row
+makes an idle agent read as busy until the janitor sweeps it — that is the janitor's job
+and it must not be second-guessed here.
 
 ### Two live transports, on purpose
 
