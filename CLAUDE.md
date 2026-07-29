@@ -5,7 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This file is for working **on** the build server. For putting a *new project* onto it
 (create → trigger → deploy → expose), see [docs/adding-a-project.md](docs/adding-a-project.md).
 For builds that run on another machine (Unity on a Mac, say), see
-[docs/build-agents.md](docs/build-agents.md).
+[docs/build-agents.md](docs/build-agents.md). A planned page for looking at
+those machines is designed in [docs/agents-page.md](docs/agents-page.md) — not
+built yet.
 
 ## What this is
 
@@ -345,6 +347,13 @@ causes a restart that interrupts whatever runs next. Requeueing makes that survi
 rather than lossy; it does not stop the interruption. Removing the label and having the
 server deploy itself deliberately would, at the cost of a self-restart mechanism.
 
+
+**The live hub's dedupe is already defeated by agent heartbeats.** `live.publish` fans
+out only when the serialized snapshot changed, which is what makes N idle dashboards cost
+zero bytes — but `/api/live` carries `last_heartbeat_at` per build, so every 20s heartbeat
+of a running agent build broadcasts a full snapshot to every open list page. Only while an
+agent build runs, today. Do not make it permanent by putting an always-moving field for
+*idle* agents in the same snapshot; see [docs/agents-page.md](docs/agents-page.md) §7.
 
 An agent log append publishes to the bus before writing the row (the house ordering, so
 a subscriber's DB-fallback replay can never double up with a queued publish). If that DB
