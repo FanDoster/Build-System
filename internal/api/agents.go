@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/FanDoster/Build-System/internal/agents"
@@ -101,9 +102,12 @@ func (s *Server) handleAgentClaim(w http.ResponseWriter, r *http.Request) {
 		// is decoded without complaint (nothing here sets DisallowUnknownFields,
 		// in either direction), and an absent or zero field leaves whatever is
 		// already stored alone rather than blanking it.
-		Version     string     `json:"version"`
-		OSArch      string     `json:"os_arch"`
-		StartedAt   *time.Time `json:"started_at"`
+		Version   string     `json:"version"`
+		OSArch    string     `json:"os_arch"`
+		StartedAt *time.Time `json:"started_at"`
+		// Clock is what time the agent thinks it is, right now. Compared with
+		// ours on arrival and then forgotten — see Registry.NoteClock.
+		Clock       *time.Time `json:"clock"`
 		DiskFreeGB  *int       `json:"disk_free_gb"`
 		DiskFloorGB *int       `json:"disk_floor_gb"`
 	}
@@ -147,6 +151,9 @@ func (s *Server) handleAgentClaim(w http.ResponseWriter, r *http.Request) {
 	// is the only trace an idle agent leaves anywhere.
 	if s.Agents != nil {
 		defer s.Agents.PollStarted(req.Agent, req.Executors, requestScheme(r))()
+		if req.Clock != nil {
+			s.Agents.NoteClock(req.Agent, *req.Clock)
+		}
 		s.rememberAgent(req.Agent, req.Executors, requestScheme(r), db.SelfReport{
 			Version:     req.Version,
 			OSArch:      req.OSArch,
@@ -444,13 +451,24 @@ func (s *Server) agentIsPaused(name string) bool {
 // this is used to warn on the agents page and never to decide whether a
 // request is allowed.
 func requestScheme(r *http.Request) string {
+	// The header wins, normalised. A proxy may send "HTTP" or, when several are
+	// chained, "https, http" — and the page compares this against "http"
+	// exactly, so an unnormalised value silently renders no warning at all.
 	if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
-		return p
+		if i := strings.IndexByte(p, ','); i >= 0 {
+			p = p[:i]
+		}
+		return strings.ToLower(strings.TrimSpace(p))
 	}
 	if r.TLS != nil {
 		return "https"
 	}
-	return "http"
+	// Not "http". This server listens in plaintext on loopback with nginx in
+	// front, so r.TLS is nil for every request it will ever serve: guessing
+	// "http" here would accuse every agent in the fleet of having leaked its
+	// token the moment that one nginx header went missing. We do not know, and
+	// saying so is the only honest answer.
+	return ""
 }
 
 // handleAgentLog appends a chunk of build output at a byte offset.

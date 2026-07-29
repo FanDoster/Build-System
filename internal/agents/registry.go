@@ -46,6 +46,28 @@ type Sighting struct {
 	// have existed recently, it is on the other end of an open socket.
 	Polling int
 
+	// Skew is how far the agent's clock is from ours, and SkewKnown says
+	// whether it was ever reported. Kept here rather than in the agents table
+	// for the same reason the rest of this is: a clock reading is only
+	// meaningful while the agent is live, and it is re-measured within one poll
+	// of a restart. A column would have to be aged, and would outlive the fact.
+	Skew      time.Duration
+	SkewKnown bool
+
+	// DoubleSince and LastDouble bracket the period over which this name has
+	// had more than one claim open at once. Two live processes under one name
+	// is the duplicate case: ownership is name equality, so either can write
+	// into the other's build.
+	//
+	// Two instants rather than one flag, because neither alone works. A single
+	// agent can briefly overlap two polls — a retry landing on a fresh
+	// connection — so an instantaneous flag cries wolf. But two real agents
+	// poll in cycles and BOTH close between them, so a rule that reset on every
+	// gap would never fire at all: the span, not the continuity, is the
+	// evidence.
+	DoubleSince time.Time
+	LastDouble  time.Time
+
 	// lastPersist is when this sighting was last written to the database.
 	// Unexported: it is throttle bookkeeping, not something a caller reports.
 	lastPersist time.Time
@@ -104,6 +126,17 @@ func (r *Registry) PollStarted(name string, executors []string, scheme string) (
 	s.Scheme = scheme
 	s.LastPoll = now
 	s.Polling++
+	if s.Polling > 1 {
+		// Forget an old episode before starting a new one, so a machine that
+		// was briefly duplicated last week does not stay flagged forever.
+		if !s.LastDouble.IsZero() && now.Sub(s.LastDouble) > DuplicateForget {
+			s.DoubleSince = time.Time{}
+		}
+		if s.DoubleSince.IsZero() {
+			s.DoubleSince = now
+		}
+		s.LastDouble = now
+	}
 	r.mu.Unlock()
 
 	var once sync.Once
@@ -151,6 +184,26 @@ func (r *Registry) ShouldPersist(name string, interval time.Duration) bool {
 	}
 	s.lastPersist = now
 	return true
+}
+
+// NoteClock records how far an agent's clock is from this server's.
+//
+// Measured here, at the moment the request arrives, because that is the only
+// point where both clocks are readable at once. The figure includes the network
+// latency of the request that carried it — a few milliseconds on this path, and
+// nothing next to a skew worth telling anybody about.
+func (r *Registry) NoteClock(name string, agentClock time.Time) {
+	if name == "" || agentClock.IsZero() {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.seen[name]
+	if !ok {
+		return
+	}
+	s.Skew = agentClock.Sub(r.now())
+	s.SkewKnown = true
 }
 
 // Snapshot copies what is known, newest contact first.

@@ -47,17 +47,19 @@
             <span class="badge badge-{{.State}}">{{.State}}</span>
             <span class="agent-name mono">{{.Name}}</span>
             {{if eq .Scheme "http"}}<span class="badge badge-failed" title="This agent's requests arrived unencrypted. Its token has crossed the network in clear and should be rotated.">NOT ENCRYPTED</span>{{end}}
+            {{if .Duplicate}}<span class="badge badge-failed" title="Two processes are claiming under this name at once. Ownership here is name equality, so either can write into the other's build. Give one of them a different agent_name.">DUPLICATE NAME</span>{{end}}
             {{if .Executors}}<span class="agent-execs">serves {{range $i, $e := .Executors}}{{if $i}}, {{end}}<span class="mono">{{$e}}</span>{{end}}</span>{{end}}
           </div>
 
           <div class="agent-meta">
             {{if .LastSeen}}
-              last seen <time data-abs datetime="{{.LastSeen.Format "2006-01-02T15:04:05Z07:00"}}">{{.LastSeen.Format "15:04:05"}}</time> ({{.LastSeenFrom}})
+              last seen {{if .SeenAgo}}{{.SeenAgo}} ago · {{end}}<time data-abs datetime="{{.LastSeen.Format "2006-01-02T15:04:05Z07:00"}}">{{.LastSeen.Format "15:04:05"}}</time> ({{.LastSeenFrom}})
             {{else}}
               not seen since this server started
             {{end}}
             {{if .FirstSeen}}· first seen <time data-abs datetime="{{.FirstSeen.Format "2006-01-02T15:04:05Z07:00"}}">{{.FirstSeen.Format "2006-01-02"}}</time>{{end}}
             {{if .ConsecutiveFailures}}· <span class="agent-warn">{{.ConsecutiveFailures}} failures in a row</span>{{end}}
+            {{if .ClockOff}}· <span class="agent-warn" title="This agent's clock disagrees with the server's. Build log timestamps are written by the agent, so the duration of a build's last step is measured across both clocks and will be wrong by about this much.">clock {{.ClockSkew}}</span>{{end}}
           </div>
 
           {{if .Paused}}
@@ -80,6 +82,16 @@
                only a person standing at the machine can clear, and the Detail
                strings are the agent's own words because each carries its
                remedy. Re-wording them here would lose the fix. -->
+          {{if .FailureRun}}
+            <div class="agent-problems">
+              <div class="agent-problem agent-problem--operator">
+                <span class="badge badge-failed">check the machine</span>
+                <span class="mono agent-problem-name">builds</span>
+                <span class="agent-problem-detail">{{.ConsecutiveFailures}} builds in a row have failed here. If other machines are green, the fault is more likely this one than the code.</span>
+              </div>
+            </div>
+          {{end}}
+
           {{if .Problems}}
             <div class="agent-problems">
               {{range .Problems}}

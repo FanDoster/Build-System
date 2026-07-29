@@ -4,11 +4,12 @@ A page on the build server showing the machines that build things: whether each
 one is online, what it is running, when it was last seen, and enough about it to
 answer "why is nothing building" without opening a terminal.
 
-This is a design document that is now mostly built. **A1, A2 and A3 are done
-and deployed** — the page at `/agents`, the coverage panel, per-agent state, the
-persisted `agents` table behind pause/resume/forget, and the agent's own report
-on what is wrong with the machine. A4 (polish) is still design only; §8 says
-which is which. For the agent protocol, see [build-agents.md](build-agents.md).
+This document is now built. **A1 through A4 are done and deployed** — the page
+at `/agents`, the coverage panel, per-agent state, the persisted `agents` table
+behind pause/resume/forget, the agent's own report on what is wrong with the
+machine, and the transport, clock and identity warnings. §8 records what each
+milestone did, and the two A4 items that were deliberately not built. For the
+agent protocol, see [build-agents.md](build-agents.md).
 
 ---
 
@@ -482,9 +483,71 @@ Nine further candidates were raised by review and refuted on inspection —
 several of them variations on the two write paths in `RecordAgentSighting`,
 whose `ON CONFLICT` branch is only reachable in a race that cannot lose data.
 
-**A4 — polish.** Transport warning and certificate expiry; clock-skew readout (the log grammar is agent-authored and UTC,
-so a skewed Mac clock makes every step duration silently wrong); duplicate-name
-and changed-hostname warnings; consecutive-failure highlighting.
+**A4 — polish. Done, 2026-07-29.** Transport warning and certificate expiry;
+clock-skew readout; duplicate-name and changed-hostname warnings;
+consecutive-failure highlighting.
+
+Investigation changed this list, and two items were **deliberately not built**.
+Both omissions are recorded here rather than left as silent gaps.
+
+**Certificate expiry: not built.** The plan hedged it with "if it is cheap to
+get", and it is not. The container cannot read the certificate — only
+`/opt/docker`, the data volume and the docker socket are mounted, and
+`/etc/letsencrypt/live/*` are symlinks into `archive/`, so exposing them means
+mounting every private key on the box into a container that also runs build
+steps. Nor can it dial the public host: the machine's own `/etc/hosts` maps
+`fandoster.com` to `127.0.0.1`, which the container inherits, so a TLS dial
+resolves to its own loopback. Verified — `curl https://fandoster.com` from
+inside the container returns `000`, while the same request with the name
+resolved to the real address returns `200` with `ssl_verify_result=0`. Making it
+work would mean pinning the public IP in configuration, where a stale value
+silently reports somebody else's certificate. Set against that: an expired
+certificate stops every agent at once, and this page already renders that in its
+two loudest forms — the whole fleet offline, and every queue reading "no agent
+serving this". The date would be diagnosis, not detection, and `certbot renew`
+plus its own mail already covers the diagnosis.
+
+**Changed-hostname warning: not built.** The premise does not survive the code.
+`config.go` defaults `agent_name` to `os.Hostname()`, so on a default agent the
+hostname *is* the name: changing it produces a new row with nothing to compare
+against, and the rename this warning exists to catch is invisible for exactly
+the same reason the warning would be. On an agent with an explicit name, the
+hostname is a second self-asserted string from the same untrusted source — an
+attacker who can forge the name can forge the hostname beside it. It would cost
+a protocol field, a column, a migration and a clamp, to produce a signal that is
+absent when it would help and forgeable when it would not.
+
+What was built:
+
+- **The transport signal was wrong, and that was the real find.** The badge has
+  existed since A1, but `requestScheme` fell back to `"http"` when
+  `X-Forwarded-Proto` was absent — and this server listens in plaintext on
+  loopback behind nginx, so `r.TLS` is nil for *every* request it will ever
+  serve. One missing nginx directive would have accused every agent in the fleet
+  of having leaked its token. Absent now means unknown, and unknown says
+  nothing. The header is also normalised: `HTTPS` and `https, http` previously
+  matched neither branch, so a genuinely plaintext hop behind a chained proxy
+  would have shown no warning at all.
+- **Clock skew**, measured at the moment a claim arrives and kept in memory
+  beside the rest of the live sighting — a clock reading is only meaningful
+  while the agent is live, and a column would outlive the fact it records. The
+  plan's premise is narrower than stated: intermediate step durations are
+  agent-stamp minus agent-stamp, so a constant offset cancels exactly. Only the
+  final step mixes an agent stamp with a server one. That is still worth
+  knowing, and nothing else would ever reveal it.
+- **Duplicate names**, from a sustained overlap of two open claims under one
+  name. Free — the registry already counts them — and it needs no agent change.
+  It is deliberately not instantaneous: one agent can briefly hold two polls
+  open when a retry lands on a fresh connection, so only an overlap outlasting
+  `DuplicateDwell` counts. This is the case that actually hurts, because
+  ownership is name equality: either process can log into, heartbeat and finish
+  the other's build.
+- **The failure run promoted** from a number in the margin to a statement on the
+  row at `FailureRun` consecutive failures. The count has been there since A1
+  and reads as trivia; past the threshold it is the most actionable thing the
+  page can say about a machine.
+- **Relative age beside the absolute** — §5.2 item 1, never actually done, and
+  free: `Fleet.Now` was already on the wire.
 
 ---
 

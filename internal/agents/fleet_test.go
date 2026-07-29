@@ -828,3 +828,188 @@ func TestAReachableAgentReportsUptime(t *testing.T) {
 		t.Errorf("uptime = %q, want 3h25m", got)
 	}
 }
+
+// --- A4 ---
+
+// The container listens in plaintext on loopback with nginx in front, so r.TLS
+// is nil for every request it will ever serve. If the scheme were guessed as
+// "http" when the header is missing, one nginx config regression would accuse
+// every agent in the fleet of having leaked its token.
+func TestAnUnknownTransportIsNotAnAccusation(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac", []string{"mac"}, "") // nothing said
+
+	f, _ := Build(&fakeSource{}, reg, now)
+	if got := f.Agents[0].Scheme; got != "" {
+		t.Errorf("scheme = %q, want empty — unknown is not the same as plaintext", got)
+	}
+}
+
+// Two live processes under one name is not cosmetic: ownership is name
+// equality, so either can log into, heartbeat and finish the other's build.
+func TestASustainedDoubleClaimIsFlagged(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac", []string{"mac"}, "https") // left open
+	reg.PollStarted("mac", []string{"mac"}, "https") // a second machine
+
+	// Not yet: one agent can briefly hold two polls open when a retry lands on
+	// a fresh connection, and flagging that would cry wolf at a healthy Mac.
+	if f, _ := Build(&fakeSource{}, reg, now.Add(5*time.Second)); f.Agents[0].Duplicate {
+		t.Error("flagged a momentary overlap as a duplicate")
+	}
+	// The span only grows when an overlap is OBSERVED again, so poll once more
+	// past the dwell — which is exactly what a second live agent does.
+	reg.SetClock(func() time.Time { return now.Add(DuplicateDwell + time.Second) })
+	reg.PollStarted("mac", []string{"mac"}, "https")
+	if f, _ := Build(&fakeSource{}, reg, now.Add(DuplicateDwell+2*time.Second)); !f.Agents[0].Duplicate {
+		t.Error("a sustained double claim was not flagged")
+	}
+}
+
+// The case that matters, and the one a continuity rule silently misses: two
+// real agents poll in cycles and BOTH close between them. Demanding an unbroken
+// overlap would mean this never fires — which is what running it actually did.
+func TestTwoAgentsPollingInCyclesAreDetected(t *testing.T) {
+	base := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	now := base
+	reg := NewRegistry()
+	reg.SetClock(func() time.Time { return now })
+
+	// Four poll cycles of two agents each, closing together as real ones do.
+	for cycle := 0; cycle < 4; cycle++ {
+		now = base.Add(time.Duration(cycle) * 30 * time.Second)
+		d1 := reg.PollStarted("mac", []string{"mac"}, "https")
+		d2 := reg.PollStarted("mac", []string{"mac"}, "https")
+		now = now.Add(29 * time.Second)
+		d1()
+		d2()
+	}
+	now = base.Add(2 * time.Minute)
+	f, _ := Build(&fakeSource{}, reg, now)
+	if !f.Agents[0].Duplicate {
+		t.Error("two agents polling in ordinary cycles were not detected; a rule needing continuous overlap never fires against real agents")
+	}
+}
+
+// And it clears once the second process goes away.
+func TestADuplicateWarningClearsWhenTheSecondProcessStops(t *testing.T) {
+	base := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	now := base
+	reg := NewRegistry()
+	reg.SetClock(func() time.Time { return now })
+
+	for cycle := 0; cycle < 4; cycle++ {
+		now = base.Add(time.Duration(cycle) * 30 * time.Second)
+		d1 := reg.PollStarted("mac", []string{"mac"}, "https")
+		d2 := reg.PollStarted("mac", []string{"mac"}, "https")
+		now = now.Add(29 * time.Second)
+		d1()
+		d2()
+	}
+	if f, _ := Build(&fakeSource{}, reg, base.Add(2*time.Minute)); !f.Agents[0].Duplicate {
+		t.Fatal("not detected in the first place")
+	}
+	// Long enough after the last overlap that the episode is over.
+	if f, _ := Build(&fakeSource{}, reg, base.Add(2*time.Minute+DuplicateForget)); f.Agents[0].Duplicate {
+		t.Error("the warning outlived the duplicate")
+	}
+}
+
+func TestOneAgentPollingNormallyIsNotADuplicate(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	done := reg.PollStarted("mac", []string{"mac"}, "https")
+	done()
+	reg.PollStarted("mac", []string{"mac"}, "https")
+
+	if f, _ := Build(&fakeSource{}, reg, now.Add(10*time.Minute)); f.Agents[0].Duplicate {
+		t.Error("sequential polls were read as two machines")
+	}
+}
+
+// The build log's timestamps are agent-authored, so a skewed Mac makes the
+// final step's duration wrong in a way nothing else would reveal.
+func TestClockSkewIsReportedOnlyWhenItMatters(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name     string
+		skew     time.Duration
+		wantOff  bool
+		wantText string
+	}{
+		{"agreeing", 2 * time.Second, false, "+2s"},
+		{"a minute ahead", 90 * time.Second, true, "+1m"},
+		{"an hour behind", -time.Hour, true, "-1h00m"},
+		{"exactly at the tolerance", MaxClockSkew, false, "+1m"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := registryAt(now)
+			reg.PollStarted("mac", []string{"mac"}, "https")
+			reg.NoteClock("mac", now.Add(tc.skew))
+
+			f, _ := Build(&fakeSource{}, reg, now)
+			a := f.Agents[0]
+			if !a.ClockKnown {
+				t.Fatal("clock not recorded")
+			}
+			if a.ClockOff != tc.wantOff {
+				t.Errorf("clock off = %v, want %v (skew %s)", a.ClockOff, tc.wantOff, tc.skew)
+			}
+			if a.ClockSkew != tc.wantText {
+				t.Errorf("skew = %q, want %q", a.ClockSkew, tc.wantText)
+			}
+		})
+	}
+
+	// An agent too old to report its clock says nothing, rather than appearing
+	// to agree perfectly.
+	reg := registryAt(now)
+	reg.PollStarted("old", []string{"mac"}, "https")
+	f, _ := Build(&fakeSource{}, reg, now)
+	if f.Agents[0].ClockKnown || f.Agents[0].ClockOff {
+		t.Error("an agent that reported no clock was treated as having one")
+	}
+}
+
+// A count in the margin reads as trivia. Past the threshold it is the most
+// actionable thing the page can say about a machine.
+func TestAFailureRunIsPromotedPastTheThreshold(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	build := func(n int) Agent {
+		reg := registryAt(now)
+		reg.PollStarted("mac", []string{"mac"}, "https")
+		var recent []models.Build
+		for i := 0; i < n; i++ {
+			recent = append(recent, models.Build{ID: int64(i), Status: models.StatusFailed})
+		}
+		src := &fakeSource{recent: map[string][]models.Build{"mac": recent}}
+		f, _ := Build(src, reg, now)
+		return f.Agents[0]
+	}
+	if a := build(FailureRun - 1); a.FailureRun {
+		t.Errorf("%d failures promoted; the threshold is %d", FailureRun-1, FailureRun)
+	}
+	if a := build(FailureRun); !a.FailureRun {
+		t.Errorf("%d failures not promoted", FailureRun)
+	}
+}
+
+// Section 5.2: show the age relative AND absolute. A badge the operator cannot
+// verify is a badge they will not trust during an incident.
+func TestTheAgeIsShownRelativeAsWellAsAbsolute(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now.Add(-34 * time.Second))
+	reg.PollStarted("mac", []string{"mac"}, "https")()
+
+	f, _ := Build(&fakeSource{}, reg, now)
+	a := f.Agents[0]
+	if a.SeenAgo != "34s" {
+		t.Errorf("seen ago = %q, want 34s", a.SeenAgo)
+	}
+	if a.LastSeen == nil {
+		t.Error("the absolute time was dropped; both are needed")
+	}
+}

@@ -88,6 +88,11 @@
         warn.title = "This agent's requests arrived unencrypted. Its token has crossed the network in clear and should be rotated.";
         head.appendChild(warn);
       }
+      if (a.duplicate) {
+        var dup = el('span', 'badge badge-failed', 'DUPLICATE NAME');
+        dup.title = "Two processes are claiming under this name at once. Ownership here is name equality, so either can write into the other's build. Give one of them a different agent_name.";
+        head.appendChild(dup);
+      }
       if (a.executors && a.executors.length) {
         var ex = el('span', 'agent-execs', 'serves ');
         for (var i = 0; i < a.executors.length; i++) {
@@ -100,7 +105,7 @@
 
       var meta = el('div', 'agent-meta');
       if (a.last_seen) {
-        meta.appendChild(document.createTextNode('last seen '));
+        meta.appendChild(document.createTextNode('last seen ' + (a.seen_ago ? a.seen_ago + ' ago \u00b7 ' : '')));
         var t = el('time');
         t.setAttribute('data-abs', '');
         t.setAttribute('datetime', a.last_seen);
@@ -121,6 +126,12 @@
       if (a.consecutive_failures) {
         meta.appendChild(document.createTextNode(' · '));
         meta.appendChild(el('span', 'agent-warn', a.consecutive_failures + ' failures in a row'));
+      }
+      if (a.clock_off) {
+        meta.appendChild(document.createTextNode(' · '));
+        var ck = el('span', 'agent-warn', 'clock ' + a.clock_skew);
+        ck.title = "This agent's clock disagrees with the server's. Build log timestamps are written by the agent, so the duration of a build's last step is measured across both clocks and will be wrong by about this much.";
+        meta.appendChild(ck);
       }
       row.appendChild(meta);
 
@@ -159,6 +170,17 @@
 
       // Problems, then the reported facts, then the disclosure. Mirrors
       // agents.html — see the note at the top of this function.
+      if (a.failure_run) {
+        var fr = el('div', 'agent-problems');
+        var frRow = el('div', 'agent-problem agent-problem--operator');
+        frRow.appendChild(el('span', 'badge badge-failed', 'check the machine'));
+        frRow.appendChild(el('span', 'mono agent-problem-name', 'builds'));
+        frRow.appendChild(el('span', 'agent-problem-detail',
+          a.consecutive_failures + ' builds in a row have failed here. If other machines are green, ' +
+          'the fault is more likely this one than the code.'));
+        fr.appendChild(frRow);
+        row.appendChild(fr);
+      }
       if (a.problems && a.problems.length) {
         var probs = el('div', 'agent-problems');
         for (var p = 0; p < a.problems.length; p++) {

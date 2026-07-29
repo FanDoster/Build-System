@@ -60,7 +60,9 @@ type Agent struct {
 	State     State    `json:"state"`
 	Executors []string `json:"executors,omitempty"`
 	// Scheme is how its last request reached us. "http" means the agent token
-	// and any clone token it was handed crossed the network in clear.
+	// and any clone token it was handed crossed the network in clear. Empty
+	// means we do not know — which is NOT the same as plaintext, and must not
+	// be rendered as an accusation. See requestScheme in internal/api.
 	Scheme string `json:"scheme,omitempty"`
 	// LastSeen and LastSeenFrom say when we last had evidence of this agent,
 	// and what that evidence was. Both are shown: a badge nobody can check is
@@ -101,6 +103,32 @@ type Agent struct {
 	// Remembered is true when the agent has a persisted row. It separates "we
 	// have never heard of this machine" from "we know it, it is just not here".
 	Remembered bool `json:"remembered,omitempty"`
+
+	// SeenAgo is how long ago the freshest evidence was, phrased for a human.
+	// Shown beside the absolute time rather than instead of it: a badge nobody
+	// can check is a badge nobody trusts at three in the morning, and "34
+	// seconds ago" is the half an operator reads first.
+	SeenAgo string `json:"seen_ago,omitempty"`
+
+	// ClockSkew is how far this agent's clock is from the server's, and
+	// ClockOff marks a difference large enough to matter. It matters because
+	// the log timestamps on a build page are written by the agent: the duration
+	// of the final step is measured from an agent stamp to a server stamp, so a
+	// skewed Mac makes that one figure silently wrong.
+	ClockSkew  string `json:"clock_skew,omitempty"`
+	ClockKnown bool   `json:"clock_known,omitempty"`
+	ClockOff   bool   `json:"clock_off,omitempty"`
+
+	// Duplicate marks a name that two live processes are claiming under at
+	// once. Ownership here is name equality, so a duplicate is not cosmetic:
+	// either machine can log into, heartbeat, and finish the other's build.
+	Duplicate bool `json:"duplicate,omitempty"`
+
+	// FailureRun promotes the consecutive-failure count from a number in the
+	// margin to a statement on the row. The count alone has been there since
+	// A1 and reads as trivia; past FailureRun it is the most actionable thing
+	// the page can say about a machine.
+	FailureRun bool `json:"failure_run,omitempty"`
 
 	// What the machine says about itself (milestone A3). All of it is written
 	// by the agent, so all of it is display-only and none of it is trusted.
@@ -215,6 +243,22 @@ func Build(src Source, reg *Registry, now time.Time) (*Fleet, error) {
 		a.Scheme = s.Scheme
 		a.Polling = s.Polling > 0
 		a.Known = true
+		if s.SkewKnown {
+			a.ClockKnown = true
+			a.ClockSkew = signedDuration(s.Skew)
+			a.ClockOff = s.Skew < -MaxClockSkew || s.Skew > MaxClockSkew
+		}
+		// Sustained, not instantaneous, and measured as a SPAN rather than an
+		// unbroken stretch. One agent can briefly overlap two polls when a retry
+		// lands on a fresh connection, so an instantaneous flag cries wolf — but
+		// two real agents poll in cycles and both close between them, so a rule
+		// demanding continuity would never fire. Overlap seen repeatedly over
+		// more than DuplicateDwell, and seen recently, is the evidence.
+		if !s.DoubleSince.IsZero() &&
+			s.LastDouble.Sub(s.DoubleSince) > DuplicateDwell &&
+			now.Sub(s.LastDouble) < DuplicateForget {
+			a.Duplicate = true
+		}
 		last := s.LastPoll
 		a.LastSeen, a.LastSeenFrom = &last, "claim poll"
 	}
@@ -253,6 +297,12 @@ func Build(src Source, reg *Registry, now time.Time) (*Fleet, error) {
 		}
 		a.State = stateOf(a, reg.StartedAt(), now)
 		setUptime(a, now)
+		if a.LastSeen != nil {
+			if d := now.Sub(*a.LastSeen); d >= 0 {
+				a.SeenAgo = shortDuration(d)
+			}
+		}
+		a.FailureRun = a.ConsecutiveFailures >= FailureRun
 	}
 	sort.Slice(order, func(i, j int) bool { return order[i].Name < order[j].Name })
 	f.Agents = make([]Agent, 0, len(order))
@@ -380,6 +430,38 @@ func setUptime(a *Agent, now time.Time) {
 	if d := now.Sub(*a.StartedAt); d >= 0 && d < maxPlausibleUptime {
 		a.Uptime = shortDuration(d)
 	}
+}
+
+// MaxClockSkew is how far an agent's clock may differ from the server's before
+// the page says so. Generous on purpose: a second or two is ordinary, and a
+// warning that fires on every healthy machine is a warning nobody reads. A
+// minute is far past anything NTP leaves behind and far short of the hours a
+// wrong timezone or a dead RTC produces.
+const MaxClockSkew = 60 * time.Second
+
+// DuplicateDwell is how long overlapping claims under one name must go on
+// before it counts as two machines rather than one agent retrying.
+const DuplicateDwell = 45 * time.Second
+
+// DuplicateForget is how long after the last overlap the warning clears, and
+// how long an old episode is remembered before a new one starts its own span.
+// Comfortably more than a poll cycle, so an ordinary gap between polls does not
+// end the episode.
+const DuplicateForget = 5 * time.Minute
+
+// FailureRun is the number of consecutive failures at which the count stops
+// being a statistic and starts being a diagnosis. Three reds on one machine
+// while other machines are green is the fastest available evidence that the box
+// is broken rather than the code.
+const FailureRun = 3
+
+// signedDuration renders a clock difference with its direction, because which
+// way it is wrong is the first thing anybody asks.
+func signedDuration(d time.Duration) string {
+	if d < 0 {
+		return "-" + shortDuration(-d)
+	}
+	return "+" + shortDuration(d)
 }
 
 // maxPlausibleUptime rejects a start time from a badly wrong clock. Ten years
