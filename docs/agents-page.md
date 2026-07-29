@@ -341,7 +341,17 @@ point of the panel. Consecutive failures counted correctly, the offline agent
 stopped covering its queue, and the current step tracked the build through
 checkout → unity → steam.
 
-Two things surfaced only in that run and are worth recording. An orphaned
+The first production deploy then found what a local harness could not. The
+coverage panel called the `mac` queue **unserved while the Mac agent was
+building from it** — the loudest warning on the page, firing at the one moment
+it was wrong. The cause is the same fact the liveness rule is built around: an
+agent does not poll while it builds, so after a redeploy a busy agent has no
+registry sighting and advertises no executors, and coverage was reading only the
+advertised list. A build in flight is now itself the proof — an agent running a
+build from queue E serves E, which is stronger evidence than advertising it.
+`p.executor` was already on the build summary, so this needed no new query.
+
+Two more things surfaced in the local run and are worth recording. An orphaned
 `running` row — an agent killed mid-build — makes an idle agent read as busy
 until the janitor sweeps it, at most `AgentHeartbeatTTL`. This is left alone
 deliberately: the janitor is the single authority on stale builds, and a second

@@ -287,3 +287,61 @@ func TestPlainHTTPIsRecordedAgainstTheAgent(t *testing.T) {
 		t.Errorf("scheme = %q, want http recorded so the page can warn", f.Agents[0].Scheme)
 	}
 }
+
+// The production case that this page got wrong on its first deploy.
+//
+// The server had just redeployed, so the registry was empty. The Mac agent was
+// mid-build and therefore not polling — an agent polls only between builds — so
+// it was known only from history and advertised nothing. The coverage panel
+// concluded that nothing served the "mac" queue and said so in red, while the
+// agent was at that moment building from it.
+func TestABusyAgentWithNoSightingStillCoversItsQueue(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now) // empty: the server has just restarted
+
+	src := &fakeSource{
+		names: []string{"mac-m4max-dan"}, // known only from build history
+		running: map[string]*models.Build{
+			"mac-m4max-dan": {ID: 122, ProjectName: "Cruise Control Demo Debug",
+				Status: models.StatusRunning, Executor: "mac",
+				LastHeartbeatAt: at(now.Add(-8 * time.Second))},
+		},
+		executors: []db.RemoteExecutor{{Name: "mac", Projects: []string{"Cruise Control Demo Debug"}}},
+	}
+	f, err := Build(src, reg, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a := f.Agents[0]
+	if a.State != StateBusy {
+		t.Fatalf("state = %q, want busy", a.State)
+	}
+	if !contains(a.Executors, "mac") {
+		t.Errorf("executors = %v, want mac inferred from the build in flight", a.Executors)
+	}
+	if !f.Executors[0].Served {
+		t.Error("coverage says nothing serves the mac queue while an agent is building from it")
+	}
+	if len(f.Executors[0].Agents) != 1 || f.Executors[0].Agents[0] != "mac-m4max-dan" {
+		t.Errorf("queue served by %v, want the building agent named", f.Executors[0].Agents)
+	}
+}
+
+// A local build must never be mistaken for queue coverage.
+func TestALocalBuildIsNotQueueCoverage(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+
+	src := &fakeSource{
+		names: []string{"odd"},
+		running: map[string]*models.Build{
+			"odd": {ID: 1, ProjectName: "p", Status: models.StatusRunning,
+				Executor: models.ExecutorLocal, LastHeartbeatAt: at(now)},
+		},
+	}
+	f, _ := Build(src, reg, now)
+	if len(f.Agents[0].Executors) != 0 {
+		t.Errorf("executors = %v, want none — local is not a queue", f.Agents[0].Executors)
+	}
+}

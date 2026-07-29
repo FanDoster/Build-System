@@ -32,10 +32,13 @@ var stepRE = regexp.MustCompile(`##\[step:([a-z]+)\] ?(.*)`)
 
 // CurrentBuild is what an agent is doing now.
 type CurrentBuild struct {
-	ID          int64      `json:"id"`
-	Project     string     `json:"project"`
-	CommitSHA   string     `json:"commit_sha"`
-	Step        string     `json:"step,omitempty"`
+	ID        int64  `json:"id"`
+	Project   string `json:"project"`
+	CommitSHA string `json:"commit_sha"`
+	Step      string `json:"step,omitempty"`
+	// Executor is the queue this build came from — which is also the proof
+	// that the agent running it serves that queue.
+	Executor    string     `json:"executor,omitempty"`
 	StepDetail  string     `json:"step_detail,omitempty"`
 	StartedAt   *time.Time `json:"started_at,omitempty"`
 	HeartbeatAt *time.Time `json:"heartbeat_at,omitempty"`
@@ -192,7 +195,22 @@ func fill(src Source, a *Agent) error {
 			HeartbeatAt: running.LastHeartbeatAt,
 		}
 		cur.Step, cur.StepDetail = currentStep(src, running.ID)
+		cur.Executor = running.Executor
 		a.Current = cur
+
+		// A build in flight is proof the agent serves the queue it came from —
+		// better proof than the advertised list, which is only what the agent
+		// last claimed to want.
+		//
+		// This is not a nicety. The advertised list lives in the registry, and
+		// an agent that is building has not polled since the server started, so
+		// for a busy agent the list is empty. Without this the coverage panel
+		// calls a queue unserved while an agent is actively building from it,
+		// which is the loudest warning on the page firing at the one moment it
+		// is wrong. Seen in production the first time this shipped.
+		if models.Remote(running.Executor) && !contains(a.Executors, running.Executor) {
+			a.Executors = append(a.Executors, running.Executor)
+		}
 
 		// A running build's heartbeat is evidence of life, and better evidence
 		// than a claim poll: an agent stops polling for the whole of a build,
@@ -229,6 +247,15 @@ func fill(src Source, a *Agent) error {
 		}
 	}
 	return nil
+}
+
+func contains(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 // currentStep reads the tail of a running build's log for the last step

@@ -34,7 +34,7 @@ const livePingInterval = 25 * time.Second
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-07-29-agents-page"
+const Version = "2026-07-29-agents-page-2"
 
 // Agent long-poll defaults. The hold is deliberately under the 60s nginx
 // defaults with room to spare: a claim request that outlives proxy_read_timeout
