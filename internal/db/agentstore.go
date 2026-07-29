@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"time"
-	"unicode/utf8"
 
 	"github.com/FanDoster/Build-System/internal/models"
 )
@@ -64,6 +63,38 @@ type AgentRow struct {
 	LastScheme  string
 	PausedUntil *time.Time
 	PauseNote   string
+
+	// What the agent says about itself. Everything below is reported by the
+	// machine being described and is therefore untrusted — bounded on arrival,
+	// escaped on the way out.
+	Version     string
+	OSArch      string
+	StartedAt   *time.Time // the AGENT's start, for uptime — not the server's
+	DiskFreeGB  int
+	DiskFloorGB int
+	// Status is the last full self-report, already parsed. Nil when the agent
+	// has never sent one, which is a different thing from having sent a healthy
+	// one and must not look the same on the page.
+	Status       *models.AgentStatus
+	LastStatusAt *time.Time
+}
+
+// SelfReport is the small block an agent attaches to its claim poll.
+//
+// Separate from the fuller status on purpose: this rides a request that fires
+// twice a minute forever, so it stays a handful of scalars. A zero field means
+// "not reported" and never overwrites what is already stored — an older agent
+// that sends nothing must not blank what a newer one said.
+type SelfReport struct {
+	Version   string
+	OSArch    string
+	StartedAt *time.Time
+	// Pointers, so that "did not report" and "reported zero" are different
+	// things. They have to be: a disk that has genuinely filled reports 0 GB
+	// free, and treating that as "no reading" would keep the last healthy
+	// number on the page at the exact moment it stops being true.
+	DiskFreeGB  *int
+	DiskFloorGB *int
 }
 
 // Paused reports whether this row's pause is still in force at now.
@@ -71,20 +102,30 @@ func (a *AgentRow) Paused(now time.Time) bool {
 	return models.AgentPaused(a.PausedUntil, now)
 }
 
-const agentCols = `name, executors, first_seen_at, last_seen_at, last_scheme, paused_until, pause_note`
+const agentCols = `name, executors, first_seen_at, last_seen_at, last_scheme, paused_until, pause_note,
+	version, os_arch, started_at, disk_free_gb, disk_floor_gb, status_json, last_status_at`
 
 func scanAgentRow(s scanner) (*AgentRow, error) {
 	var a AgentRow
-	var executors string
+	var executors, status string
 	if err := s.Scan(&a.Name, &executors, &a.FirstSeenAt, &a.LastSeenAt,
-		&a.LastScheme, &a.PausedUntil, &a.PauseNote); err != nil {
+		&a.LastScheme, &a.PausedUntil, &a.PauseNote,
+		&a.Version, &a.OSArch, &a.StartedAt, &a.DiskFreeGB, &a.DiskFloorGB,
+		&status, &a.LastStatusAt); err != nil {
 		return nil, err
 	}
-	// A malformed list is left empty rather than failing the read: this column
-	// is display and coverage information, and losing it must not take down the
-	// page that exists to explain why nothing is building.
+	// Neither JSON column can fail the read. Both are display information
+	// written by a machine we do not control, and losing the whole page —
+	// including the coverage panel — because one agent stored something
+	// unparseable would take the page down exactly when it is wanted.
 	if executors != "" {
 		_ = json.Unmarshal([]byte(executors), &a.Executors)
+	}
+	if status != "" {
+		var st models.AgentStatus
+		if json.Unmarshal([]byte(status), &st) == nil {
+			a.Status = &st
+		}
 	}
 	return &a, nil
 }
@@ -98,7 +139,15 @@ func scanAgentRow(s scanner) (*AgentRow, error) {
 // first_seen_at is written once and never again. The excluded.first_seen_at
 // spelling would be wrong here: it would reset the moment an agent restarted,
 // throwing away the one fact this table keeps that nothing else can.
-func (d *DB) RecordAgentSighting(name string, executors []string, scheme string, now time.Time) error {
+//
+// The self block is folded into the same write. Every one of its fields is
+// held to "reported, or leave what is there": an agent too old to send the
+// block, or one that could not measure its disk this time round, must not blank
+// what a newer or healthier poll already stored. NULLIF turns the zero value
+// into NULL and COALESCE then keeps the column — so "not reported" and
+// "reported as zero" stay distinguishable, which matters because 0 GB free is a
+// real and alarming reading.
+func (d *DB) RecordAgentSighting(name string, executors []string, scheme string, self SelfReport, now time.Time) error {
 	if !models.ValidAgentName(name) {
 		return nil // not an error: a bad name must never fail a claim
 	}
@@ -107,6 +156,17 @@ func (d *DB) RecordAgentSighting(name string, executors []string, scheme string,
 		list = []byte("[]")
 	}
 	now = now.UTC()
+	version := models.ClampText(self.Version, models.MaxAgentVersionLen)
+	osArch := models.ClampText(self.OSArch, models.MaxOSArchLen)
+	var startedAt interface{}
+	if self.StartedAt != nil && !self.StartedAt.IsZero() {
+		startedAt = self.StartedAt.UTC()
+	}
+	// A negative reading is a broken measurement, not a disk, and is dropped so
+	// the page keeps the last number that made sense. Zero is NOT dropped: it
+	// is what a full disk reports.
+	free := nonNegative(self.DiskFreeGB)
+	floor := nonNegative(self.DiskFloorGB)
 
 	// The cap is checked only for names that are not already present, so a
 	// known agent keeps working no matter how full the table is.
@@ -117,9 +177,15 @@ func (d *DB) RecordAgentSighting(name string, executors []string, scheme string,
 	// sighting. This poll is the first one, so it is what first-seen means.
 	res, err := d.conn.Exec(
 		`UPDATE agents SET executors = ?, last_seen_at = ?, last_scheme = ?,
-		     first_seen_at = COALESCE(first_seen_at, ?)
+		     first_seen_at = COALESCE(first_seen_at, ?),
+		     version       = COALESCE(NULLIF(?, ''), version),
+		     os_arch       = COALESCE(NULLIF(?, ''), os_arch),
+		     started_at    = COALESCE(?, started_at),
+		     disk_free_gb  = COALESCE(?, disk_free_gb),
+		     disk_floor_gb = COALESCE(?, disk_floor_gb)
 		 WHERE name = ?`,
-		string(list), now, scheme, now, name)
+		string(list), now, scheme, now,
+		version, osArch, startedAt, free, floor, name)
 	if err != nil {
 		return err
 	}
@@ -134,14 +200,101 @@ func (d *DB) RecordAgentSighting(name string, executors []string, scheme string,
 	if count >= MaxAgentRows {
 		return nil // full: serve the claim, remember nothing
 	}
+	// The INSERT carries the block too. Without it a brand-new agent's very
+	// first claim would store none of this and the page would stay blank until
+	// the next throttle window — the row is created here, not by the UPDATE
+	// above, which affected nothing.
 	_, err = d.conn.Exec(
-		`INSERT INTO agents (name, executors, first_seen_at, last_seen_at, last_scheme)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO agents (name, executors, first_seen_at, last_seen_at, last_scheme,
+		                     version, os_arch, started_at, disk_free_gb, disk_floor_gb)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 0), COALESCE(?, 0))
 		 ON CONFLICT(name) DO UPDATE SET
-		     executors    = excluded.executors,
-		     last_seen_at = excluded.last_seen_at,
-		     last_scheme  = excluded.last_scheme`,
-		name, string(list), now, now, scheme)
+		     executors     = excluded.executors,
+		     last_seen_at  = excluded.last_seen_at,
+		     last_scheme   = excluded.last_scheme,
+		     version       = COALESCE(NULLIF(excluded.version, ''), agents.version),
+		     os_arch       = COALESCE(NULLIF(excluded.os_arch, ''), agents.os_arch),
+		     started_at    = COALESCE(excluded.started_at, agents.started_at),
+		     disk_free_gb  = COALESCE(excluded.disk_free_gb, agents.disk_free_gb),
+		     disk_floor_gb = COALESCE(excluded.disk_floor_gb, agents.disk_floor_gb)`,
+		name, string(list), now, now, scheme,
+		version, osArch, startedAt, free, floor)
+	return err
+}
+
+// nonNegative passes a reported figure through, dropping only a negative one —
+// that is a broken measurement rather than a disk. nil means the agent said
+// nothing, and the stored value is left alone.
+func nonNegative(v *int) interface{} {
+	if v == nil || *v < 0 {
+		return nil
+	}
+	return *v
+}
+
+// RecordAgentStatus stores an agent's full self-report.
+//
+// Its own endpoint rather than the claim poll, because the claim carries only
+// what is cheap enough to send twice a minute forever. Its own row update
+// rather than part of the sighting, because an agent reports this on its own
+// timer — including while it is building, when it does not poll at all, which
+// is exactly when an operator wants to know the disk is filling up.
+//
+// A row is created if the agent is not known yet: a machine that reports a
+// problem before its first successful claim is the most interesting kind.
+func (d *DB) RecordAgentStatus(name string, status *models.AgentStatus, now time.Time) error {
+	if !models.ValidAgentName(name) || status == nil {
+		return nil
+	}
+	status.Clamp()
+	blob, err := json.Marshal(status)
+	if err != nil {
+		return err
+	}
+	// Clamped and still oversized. Give ground in the order an operator would:
+	// the inventory first, then checks from the end. Never all of it — a report
+	// dropped whole leaves the page silent about a machine that was trying to
+	// say something, which is the opposite of what this endpoint is for.
+	if len(blob) > models.MaxStatusBytes {
+		trimmed := &models.AgentStatus{Checks: status.Checks}
+		for {
+			if blob, err = json.Marshal(trimmed); err != nil {
+				return err
+			}
+			if len(blob) <= models.MaxStatusBytes || len(trimmed.Checks) <= 1 {
+				break
+			}
+			trimmed.Checks = trimmed.Checks[:len(trimmed.Checks)-1]
+		}
+		if len(blob) > models.MaxStatusBytes {
+			return nil // a single check longer than the cap; nothing to salvage
+		}
+	}
+	now = now.UTC()
+
+	res, err := d.conn.Exec(
+		`UPDATE agents SET status_json = ?, last_status_at = ? WHERE name = ?`,
+		string(blob), now, name)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return nil
+	}
+
+	var count int
+	if err := d.conn.QueryRow(`SELECT COUNT(*) FROM agents`).Scan(&count); err != nil {
+		return err
+	}
+	if count >= MaxAgentRows {
+		return nil
+	}
+	_, err = d.conn.Exec(
+		`INSERT INTO agents (name, status_json, last_status_at) VALUES (?, ?, ?)
+		 ON CONFLICT(name) DO UPDATE SET
+		     status_json    = excluded.status_json,
+		     last_status_at = excluded.last_status_at`,
+		name, string(blob), now)
 	return err
 }
 
@@ -173,7 +326,7 @@ func (d *DB) AgentPausedUntil(name string) (*time.Time, error) {
 // and a first-seen recording a contact that never happened would never be
 // corrected: the sighting path fills that column only while it is NULL.
 func (d *DB) PauseAgent(name string, until time.Time, note string) error {
-	note = truncateRunes(note, models.MaxPauseNoteLen)
+	note = models.ClampText(note, models.MaxPauseNoteLen)
 	_, err := d.conn.Exec(
 		`INSERT INTO agents (name, paused_until, pause_note)
 		 VALUES (?, ?, ?)
@@ -182,22 +335,6 @@ func (d *DB) PauseAgent(name string, until time.Time, note string) error {
 		     pause_note   = excluded.pause_note`,
 		name, until.UTC(), note)
 	return err
-}
-
-// truncateRunes cuts a string to at most n bytes without splitting a rune.
-//
-// A plain s[:n] cuts mid-sequence for any note containing a non-ASCII
-// character, and the invalid bytes survive into SQLite and back out onto the
-// page. The note is display text an operator typed; mangling its last character
-// because it happened to be an accent is a poor way to enforce a length.
-func truncateRunes(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	for n > 0 && !utf8.RuneStart(s[n]) {
-		n--
-	}
-	return s[:n]
 }
 
 // ResumeAgent clears a pause. Resuming an agent that is not paused, or that has

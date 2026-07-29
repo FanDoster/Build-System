@@ -76,6 +76,58 @@
             </div>
           {{end}}
 
+          <!-- Problems first among the reported things: these are the failures
+               only a person standing at the machine can clear, and the Detail
+               strings are the agent's own words because each carries its
+               remedy. Re-wording them here would lose the fix. -->
+          {{if .Problems}}
+            <div class="agent-problems">
+              {{range .Problems}}
+                <div class="agent-problem{{if .NeedsOperator}} agent-problem--operator{{end}}">
+                  <span class="badge {{if .NeedsOperator}}badge-failed{{else}}badge-waiting{{end}}">{{if .NeedsOperator}}needs operator{{else}}problem{{end}}</span>
+                  <span class="mono agent-problem-name">{{.Name}}</span>
+                  <span class="agent-problem-detail">{{.Detail}}</span>
+                </div>
+              {{end}}
+            </div>
+          {{end}}
+
+          <div class="agent-report">
+            {{if .DiskKnown}}
+              <span class="agent-disk{{if .DiskLow}} agent-disk--low{{end}}">
+                {{.DiskFreeGB}} GB free{{if .DiskFloorGB}}, floor {{.DiskFloorGB}}{{end}}
+                {{if .DiskLow}}— the next build is already refused{{end}}
+              </span>
+            {{end}}
+            {{if .Version}}<span class="agent-fact">{{.Version}}</span>{{end}}
+            {{if .OSArch}}<span class="agent-fact mono">{{.OSArch}}</span>{{end}}
+            {{if .Uptime}}<span class="agent-fact">up {{.Uptime}}</span>{{end}}
+            {{if .Remembered}}
+              {{if not .StatusReported}}
+                <span class="agent-fact agent-unreported">has never reported its health</span>
+              {{else if .StatusStale}}
+                <span class="agent-fact agent-unreported">health last reported <time data-abs datetime="{{.StatusAt.Format "2006-01-02T15:04:05Z07:00"}}">{{.StatusAt.Format "15:04:05"}}</time></span>
+              {{end}}
+            {{end}}
+          </div>
+
+          {{if or .Unity .Tools .Workspaces .Timeouts}}
+            <details class="agent-details">
+              <summary>Machine detail</summary>
+              <div class="agent-detail-body">
+                {{if .Unity}}<div><span class="agent-detail-key">Unity</span> {{range $i, $v := .Unity}}{{if $i}}, {{end}}<span class="mono">{{$v}}</span>{{end}}</div>{{end}}
+                {{range $k, $v := .Tools}}<div><span class="agent-detail-key">{{$k}}</span> <span class="mono">{{$v}}</span></div>{{end}}
+                {{range $k, $v := .Timeouts}}<div><span class="agent-detail-key">{{$k}} timeout</span> {{$v}}</div>{{end}}
+                {{if .Workspaces}}
+                  <div><span class="agent-detail-key">Workspaces</span> <span class="agent-detail-hint">least recently used first — the order the agent's own sweep deletes them in</span></div>
+                  {{range .Workspaces}}
+                    <div class="agent-workspace"><span class="mono">{{.Name}}</span>{{if .Used}} <time data-abs datetime="{{.Used.Format "2006-01-02T15:04:05Z07:00"}}">{{.Used.Format "2006-01-02"}}</time>{{end}}</div>
+                  {{end}}
+                {{end}}
+              </div>
+            </details>
+          {{end}}
+
           {{if .Recent}}
             <div class="agent-recent">
               {{range .Recent}}<a class="chip chip-{{.Status}}" href="{{$.BasePath}}/builds/{{.ID}}" title="{{.Project}} — {{.Status}}{{if .Duration}} in {{.Duration}}{{end}}">#{{.ID}}</a>{{end}}

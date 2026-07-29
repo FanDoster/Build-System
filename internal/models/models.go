@@ -1,8 +1,10 @@
 package models
 
 import (
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type BuildStatus string
@@ -238,10 +240,180 @@ func ValidAgentName(name string) bool {
 	if name == "." || name == ".." {
 		return false
 	}
+	// Ranging over a string decodes invalid bytes to U+FFFD, which is above the
+	// control range and would pass the loop below. That matters here more than
+	// it looks: this name is a primary key, a URL path segment, and a string
+	// rendered on an operator's page, so it must be text before it is any of
+	// those.
+	if !utf8.ValidString(name) {
+		return false
+	}
 	for _, r := range name {
 		if r < 0x20 || r == 0x7f {
 			return false
 		}
 	}
 	return true
+}
+
+// What an agent reports about itself.
+//
+// Two channels, deliberately split. The small block below rides the claim poll,
+// which fires twice a minute forever, so it stays a handful of scalars. The
+// fuller AgentStatus goes to its own endpoint on the agent's own timer —
+// explicitly NOT on the heartbeat, because the heartbeat only exists while a
+// build is running and would deliver nothing while the agent is idle, which is
+// exactly when somebody is asking what is wrong with it.
+//
+// Everything here is written by the machine being described, so every field is
+// untrusted: bounded on arrival, escaped on the way out.
+const (
+	// MaxAgentVersionLen bounds the agent's self-reported version string.
+	MaxAgentVersionLen = 64
+	// MaxOSArchLen bounds the reported platform.
+	MaxOSArchLen = 32
+	// MaxStatusChecks, MaxStatusDetailLen and the rest bound one status report.
+	// The agent caps its own payload too; these are what stops a hostile or
+	// broken one filling the row that the page has to read on every poll.
+	MaxStatusChecks     = 32
+	MaxStatusDetailLen  = 500
+	MaxStatusNameLen    = 64
+	MaxStatusList       = 32
+	MaxStatusWorkspaces = 50
+	// MaxStatusBytes caps the stored JSON. Deliberately larger than the worst
+	// case the field caps above can produce (32 checks x ~564 bytes is roughly
+	// 18 KiB) — set it below that and a report that has already been clamped to
+	// the documented limits still fails the byte check, and the fallback path
+	// becomes the normal one. Still well under the 64 KiB request cap, so a
+	// report is trimmed by the agent before it is sent rather than rejected at
+	// the door: a 413 is answered identically forever, so an over-large report
+	// would never arrive at all.
+	MaxStatusBytes = 32 << 10
+	// StatusStale is how old a status report may be before the page stops
+	// presenting it as current. Comfortably more than the agent's reporting
+	// interval, so an ordinary gap does not read as a problem.
+	StatusStale = 20 * time.Minute
+)
+
+// AgentCheck is one of the agent's own self-checks, carried verbatim.
+//
+// Detail is shipped word for word rather than re-worded here: each one was
+// written for the person who has to walk over to the machine, and carries its
+// own remedy ("brew install git-lfs, and check the LaunchAgent's PATH includes
+// /opt/homebrew/bin"). Rephrasing it server-side loses the fix.
+type AgentCheck struct {
+	Name          string `json:"name"`
+	Detail        string `json:"detail"`
+	OK            bool   `json:"ok"`
+	NeedsOperator bool   `json:"needs_operator,omitempty"`
+}
+
+// AgentWorkspace is one checkout on the agent, with when it was last touched.
+// Least recently used first — which is the order the agent's own sweep deletes
+// them in, so the list doubles as a prediction.
+type AgentWorkspace struct {
+	Name string     `json:"name"`
+	Used *time.Time `json:"used,omitempty"`
+}
+
+// AgentStatus is the fuller report.
+type AgentStatus struct {
+	Checks     []AgentCheck      `json:"checks,omitempty"`
+	Unity      []string          `json:"unity,omitempty"`
+	Tools      map[string]string `json:"tools,omitempty"`
+	Workspaces []AgentWorkspace  `json:"workspaces,omitempty"`
+	Timeouts   map[string]string `json:"timeouts,omitempty"`
+}
+
+// Clamp trims a report to the bounds above, in place.
+//
+// Trims rather than rejects. A report that is too long is still worth most of
+// what it says, and refusing it outright would leave the page showing nothing
+// at the moment the machine is least healthy.
+func (s *AgentStatus) Clamp() {
+	if len(s.Checks) > MaxStatusChecks {
+		s.Checks = s.Checks[:MaxStatusChecks]
+	}
+	for i := range s.Checks {
+		s.Checks[i].Name = ClampText(s.Checks[i].Name, MaxStatusNameLen)
+		s.Checks[i].Detail = ClampText(s.Checks[i].Detail, MaxStatusDetailLen)
+	}
+	if len(s.Unity) > MaxStatusList {
+		s.Unity = s.Unity[:MaxStatusList]
+	}
+	for i := range s.Unity {
+		s.Unity[i] = ClampText(s.Unity[i], MaxStatusNameLen)
+	}
+	if len(s.Workspaces) > MaxStatusWorkspaces {
+		s.Workspaces = s.Workspaces[:MaxStatusWorkspaces]
+	}
+	for i := range s.Workspaces {
+		s.Workspaces[i].Name = ClampText(s.Workspaces[i].Name, MaxStatusNameLen)
+	}
+	s.Tools = clampMap(s.Tools, MaxStatusList, MaxStatusDetailLen)
+	s.Timeouts = clampMap(s.Timeouts, MaxStatusList, MaxStatusNameLen)
+}
+
+// Problems returns the failing checks, the ones needing a person first.
+//
+// That order is the whole point of separating them: "Unity has no licence" and
+// "git-lfs is missing" are both failures, but only one of them needs somebody
+// to walk over to the machine and click something.
+func (s *AgentStatus) Problems() []AgentCheck {
+	if s == nil {
+		return nil
+	}
+	var operator, other []AgentCheck
+	for _, c := range s.Checks {
+		if c.OK {
+			continue
+		}
+		if c.NeedsOperator {
+			operator = append(operator, c)
+		} else {
+			other = append(other, c)
+		}
+	}
+	return append(operator, other...)
+}
+
+// ClampText bounds a string and strips what has no business being rendered:
+// invalid UTF-8, and control characters that would break a line of the page.
+//
+// Trims on a rune boundary. A plain s[:n] splits the last character of any
+// string containing an accent, and the invalid bytes survive into storage and
+// back out onto the page.
+func ClampText(s string, n int) string {
+	s = strings.Map(func(r rune) rune {
+		if r == utf8.RuneError || (r < 0x20 && r != '\t') || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+func clampMap(m map[string]string, maxKeys, maxVal int) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // a map iterates at random; the page must not reshuffle
+	if len(keys) > maxKeys {
+		keys = keys[:maxKeys]
+	}
+	out := make(map[string]string, len(keys))
+	for _, k := range keys {
+		out[ClampText(k, MaxStatusNameLen)] = ClampText(m[k], maxVal)
+	}
+	return out
 }

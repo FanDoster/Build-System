@@ -11,7 +11,7 @@ import (
 
 func sighting(t *testing.T, d *DB, name string, execs []string, scheme string, at time.Time) {
 	t.Helper()
-	if err := d.RecordAgentSighting(name, execs, scheme, at); err != nil {
+	if err := d.RecordAgentSighting(name, execs, scheme, SelfReport{}, at); err != nil {
 		t.Fatalf("record sighting: %v", err)
 	}
 }
@@ -219,7 +219,7 @@ func TestAbsurdNamesAreNotStoredButNeverError(t *testing.T) {
 		"nul\x00byte",
 		"line\nbreak",
 	} {
-		if err := d.RecordAgentSighting(name, []string{"mac"}, "https", now); err != nil {
+		if err := d.RecordAgentSighting(name, []string{"mac"}, "https", SelfReport{}, now); err != nil {
 			t.Errorf("name %q returned an error; a bad name must never fail a claim: %v", name, err)
 		}
 	}
@@ -236,7 +236,7 @@ func TestTheTableIsCappedButKnownAgentsKeepWorking(t *testing.T) {
 	sighting(t, d, "real-agent", []string{"mac"}, "https", now)
 	for i := 0; i < MaxAgentRows+50; i++ {
 		name := "junk-" + strings.Repeat("x", i%10) + string(rune('a'+i%26)) + itoa(i)
-		if err := d.RecordAgentSighting(name, []string{"mac"}, "https", now); err != nil {
+		if err := d.RecordAgentSighting(name, []string{"mac"}, "https", SelfReport{}, now); err != nil {
 			t.Fatalf("cap must never surface as an error: %v", err)
 		}
 	}
@@ -355,5 +355,279 @@ func TestALongNoteIsCutOnACharacterBoundary(t *testing.T) {
 	}
 	if !utf8.ValidString(a.PauseNote) {
 		t.Errorf("stored note is not valid UTF-8: %q", a.PauseNote)
+	}
+}
+
+// --- A3: what the agent says about itself ---
+
+func TestTheClaimBlockIsStored(t *testing.T) {
+	d := openTestDB(t)
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	up := now.Add(-3 * time.Hour)
+
+	self := SelfReport{Version: "2026-07-29", OSArch: "darwin/arm64",
+		StartedAt: &up, DiskFreeGB: ptr(120), DiskFloorGB: ptr(40)}
+	if err := d.RecordAgentSighting("mac", []string{"mac"}, "https", self, now); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := d.GetAgentRow("mac")
+	if a.Version != "2026-07-29" || a.OSArch != "darwin/arm64" {
+		t.Errorf("version=%q os=%q", a.Version, a.OSArch)
+	}
+	if a.DiskFreeGB != 120 || a.DiskFloorGB != 40 {
+		t.Errorf("disk free=%d floor=%d", a.DiskFreeGB, a.DiskFloorGB)
+	}
+	if a.StartedAt == nil || !a.StartedAt.Equal(up) {
+		t.Errorf("started = %v, want %v", a.StartedAt, up)
+	}
+}
+
+// The block rides the INSERT as well as the UPDATE. Without that a brand-new
+// agent's very first claim would store none of it, and the page would stay
+// blank until the next throttle window for no visible reason.
+func TestTheFirstClaimEverStoresTheBlock(t *testing.T) {
+	d := openTestDB(t)
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+
+	self := SelfReport{Version: "v1", OSArch: "darwin/arm64", DiskFreeGB: ptr(90), DiskFloorGB: ptr(40)}
+	if err := d.RecordAgentSighting("brand-new", []string{"mac"}, "https", self, now); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := d.GetAgentRow("brand-new")
+	if a == nil || a.Version != "v1" || a.DiskFreeGB != 90 {
+		t.Errorf("first sighting stored %+v", a)
+	}
+}
+
+// An agent too old to send the block must not blank what a newer one reported.
+// This is the rollout case: the server ships first, so for a while every poll
+// arrives with none of these fields set.
+func TestAnOlderAgentDoesNotBlankTheReportedBlock(t *testing.T) {
+	d := openTestDB(t)
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	up := now.Add(-time.Hour)
+
+	if err := d.RecordAgentSighting("mac", []string{"mac"}, "https",
+		SelfReport{Version: "2026-07-29", OSArch: "darwin/arm64",
+			StartedAt: &up, DiskFreeGB: ptr(120), DiskFloorGB: ptr(40)}, now); err != nil {
+		t.Fatal(err)
+	}
+	// The same machine, polling from a build of the agent that knows nothing
+	// about any of this.
+	if err := d.RecordAgentSighting("mac", []string{"mac"}, "https",
+		SelfReport{}, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := d.GetAgentRow("mac")
+	if a.Version != "2026-07-29" {
+		t.Errorf("version = %q, want it preserved through a poll that reported none", a.Version)
+	}
+	if a.OSArch != "darwin/arm64" || a.DiskFreeGB != 120 || a.DiskFloorGB != 40 {
+		t.Errorf("block was blanked: %+v", a)
+	}
+	if a.StartedAt == nil || !a.StartedAt.Equal(up) {
+		t.Errorf("started_at = %v, want it preserved", a.StartedAt)
+	}
+	// The ordinary fields still move, or the sighting would not be a sighting.
+	if !a.LastSeenAt.Equal(now.Add(time.Minute)) {
+		t.Errorf("last seen = %v, want it updated", a.LastSeenAt)
+	}
+}
+
+func TestStatusRoundTripsAndOrdersProblems(t *testing.T) {
+	d := openTestDB(t)
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	used := now.Add(-48 * time.Hour)
+
+	st := &models.AgentStatus{
+		Checks: []models.AgentCheck{
+			{Name: "git", Detail: "git 2.39.5", OK: true},
+			{Name: "git-lfs", Detail: "not installed; brew install git-lfs", OK: false},
+			{Name: "unity", Detail: "no licence; open Unity Hub and sign in", OK: false, NeedsOperator: true},
+		},
+		Unity:      []string{"2022.3.62f2"},
+		Tools:      map[string]string{"git": "/usr/bin/git"},
+		Timeouts:   map[string]string{"build": "90m"},
+		Workspaces: []models.AgentWorkspace{{Name: "ship-main", Used: &used}},
+	}
+	if err := d.RecordAgentStatus("mac", st, now); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := d.GetAgentRow("mac")
+	if a.Status == nil {
+		t.Fatal("no status stored")
+	}
+	if a.LastStatusAt == nil || !a.LastStatusAt.Equal(now) {
+		t.Errorf("last status at = %v", a.LastStatusAt)
+	}
+	probs := a.Status.Problems()
+	if len(probs) != 2 {
+		t.Fatalf("problems = %+v, want the two failures and not the passing check", probs)
+	}
+	if !probs[0].NeedsOperator {
+		t.Errorf("problems[0] = %q; the one needing a person must come first", probs[0].Name)
+	}
+	if len(a.Status.Workspaces) != 1 || a.Status.Workspaces[0].Used == nil {
+		t.Errorf("workspaces = %+v", a.Status.Workspaces)
+	}
+}
+
+// A status report must not be able to displace a pause or a sighting.
+func TestAStatusReportTouchesNothingElse(t *testing.T) {
+	d := openTestDB(t)
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+
+	if err := d.RecordAgentSighting("mac", []string{"mac"}, "https",
+		SelfReport{Version: "v1"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PauseAgent("mac", now.Add(time.Hour), "moving it"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.RecordAgentStatus("mac", &models.AgentStatus{
+		Checks: []models.AgentCheck{{Name: "disk", Detail: "fine", OK: true}}}, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := d.GetAgentRow("mac")
+	if !a.Paused(now.Add(time.Minute)) || a.PauseNote != "moving it" {
+		t.Error("a status report cleared the pause")
+	}
+	if a.Version != "v1" || !a.LastSeenAt.Equal(now) {
+		t.Errorf("a status report disturbed the sighting: %+v", a)
+	}
+}
+
+// An agent can report a problem before it has ever successfully claimed —
+// which is the most interesting time for it to do so.
+func TestAnUnseenAgentCanReportStatus(t *testing.T) {
+	d := openTestDB(t)
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+
+	if err := d.RecordAgentStatus("never-claimed", &models.AgentStatus{
+		Checks: []models.AgentCheck{{Name: "unity", Detail: "no licence", NeedsOperator: true}}}, now); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := d.GetAgentRow("never-claimed")
+	if a == nil || a.Status == nil || len(a.Status.Problems()) != 1 {
+		t.Errorf("row = %+v", a)
+	}
+	if a.FirstSeenAt != nil {
+		t.Error("a status report invented a first contact")
+	}
+}
+
+// The report is written by the machine being described, so it is bounded on
+// arrival rather than trusted to be reasonable.
+func TestAnAbsurdStatusIsTrimmedNotRejected(t *testing.T) {
+	d := openTestDB(t)
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+
+	st := &models.AgentStatus{}
+	for i := 0; i < models.MaxStatusChecks*4; i++ {
+		st.Checks = append(st.Checks, models.AgentCheck{
+			Name:   strings.Repeat("n", models.MaxStatusNameLen*2),
+			Detail: strings.Repeat("é", models.MaxStatusDetailLen),
+		})
+	}
+	for i := 0; i < models.MaxStatusWorkspaces*3; i++ {
+		st.Workspaces = append(st.Workspaces, models.AgentWorkspace{Name: "w"})
+	}
+	if err := d.RecordAgentStatus("mac", st, now); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := d.GetAgentRow("mac")
+	if a.Status == nil {
+		t.Fatal("an oversized report was dropped entirely; the checks are the part an operator acts on")
+	}
+	if len(a.Status.Checks) > models.MaxStatusChecks {
+		t.Errorf("stored %d checks, past the %d cap", len(a.Status.Checks), models.MaxStatusChecks)
+	}
+	for _, c := range a.Status.Checks {
+		if len(c.Detail) > models.MaxStatusDetailLen || len(c.Name) > models.MaxStatusNameLen {
+			t.Errorf("check not clamped: name=%d detail=%d", len(c.Name), len(c.Detail))
+		}
+		if !utf8.ValidString(c.Detail) || !utf8.ValidString(c.Name) {
+			t.Error("clamping split a character and stored invalid UTF-8")
+		}
+	}
+	if len(a.Status.Workspaces) > models.MaxStatusWorkspaces {
+		t.Errorf("stored %d workspaces", len(a.Status.Workspaces))
+	}
+}
+
+// Control characters and invalid bytes are stripped, so nothing reaches the
+// page that could break a line of it.
+func TestStatusTextIsLaundered(t *testing.T) {
+	d := openTestDB(t)
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+
+	if err := d.RecordAgentStatus("mac", &models.AgentStatus{
+		Checks: []models.AgentCheck{{Name: "x", Detail: "bad\x00\x07byte\xffhere\nsecond line"}},
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := d.GetAgentRow("mac")
+	got := a.Status.Checks[0].Detail
+	if strings.ContainsAny(got, "\x00\x07\n") {
+		t.Errorf("control characters survived: %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("invalid UTF-8 survived: %q", got)
+	}
+}
+
+func ptr(n int) *int { return &n }
+
+// A disk that has genuinely filled reports 0 GB free. Treating that as "no
+// reading" would leave the last healthy number on the page at the exact moment
+// it stops being true — the most alarming reading there is, silently dropped.
+func TestAFullDiskIsStoredRatherThanDiscarded(t *testing.T) {
+	d := openTestDB(t)
+	t0 := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+
+	if err := d.RecordAgentSighting("mac", []string{"mac"}, "https",
+		SelfReport{DiskFreeGB: ptr(210), DiskFloorGB: ptr(40)}, t0); err != nil {
+		t.Fatal(err)
+	}
+	// statfs now says a few hundred megabytes; FreeGB truncates that to 0.
+	if err := d.RecordAgentSighting("mac", []string{"mac"}, "https",
+		SelfReport{DiskFreeGB: ptr(0), DiskFloorGB: ptr(40)}, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := d.GetAgentRow("mac")
+	if a.DiskFreeGB != 0 {
+		t.Errorf("stored free = %d GB; the agent reported 0 and the page would show a stale, reassuring number", a.DiskFreeGB)
+	}
+	if a.DiskFloorGB != 40 {
+		t.Errorf("floor = %d", a.DiskFloorGB)
+	}
+
+	// And an agent that reports nothing at all still leaves the reading alone.
+	if err := d.RecordAgentSighting("mac", []string{"mac"}, "https",
+		SelfReport{}, t0.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	a, _ = d.GetAgentRow("mac")
+	if a.DiskFloorGB != 40 {
+		t.Errorf("an agent that reported nothing blanked the floor: %d", a.DiskFloorGB)
+	}
+}
+
+// A negative figure is a broken measurement, not a disk.
+func TestANegativeDiskReadingIsIgnored(t *testing.T) {
+	d := openTestDB(t)
+	t0 := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+
+	if err := d.RecordAgentSighting("mac", []string{"mac"}, "https",
+		SelfReport{DiskFreeGB: ptr(210), DiskFloorGB: ptr(40)}, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.RecordAgentSighting("mac", []string{"mac"}, "https",
+		SelfReport{DiskFreeGB: ptr(-5), DiskFloorGB: ptr(40)}, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := d.GetAgentRow("mac")
+	if a.DiskFreeGB != 210 {
+		t.Errorf("free = %d, want the last figure that made sense", a.DiskFreeGB)
 	}
 }

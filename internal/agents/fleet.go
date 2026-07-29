@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"fmt"
 	"regexp"
 	"sort"
 	"time"
@@ -100,6 +101,42 @@ type Agent struct {
 	// Remembered is true when the agent has a persisted row. It separates "we
 	// have never heard of this machine" from "we know it, it is just not here".
 	Remembered bool `json:"remembered,omitempty"`
+
+	// What the machine says about itself (milestone A3). All of it is written
+	// by the agent, so all of it is display-only and none of it is trusted.
+	Version string `json:"version,omitempty"`
+	OSArch  string `json:"os_arch,omitempty"`
+	// StartedAt is the AGENT's start time, and Uptime is what to show for it.
+	// Formatted here rather than in two renderers, and computed defensively:
+	// the value is a clock on another machine, so a skewed one must read as
+	// unknown rather than as a negative age.
+	StartedAt *time.Time `json:"started_at,omitempty"`
+	Uptime    string     `json:"uptime,omitempty"`
+
+	// Disk is free space against the agent's own floor. The floor is the real
+	// refusal threshold — workspace.Root.CheckSpace on the agent turns a build
+	// away below it — so "38 GB free, floor 40" means the next build is already
+	// refused, which no absolute number conveys.
+	DiskFreeGB  int  `json:"disk_free_gb,omitempty"`
+	DiskFloorGB int  `json:"disk_floor_gb,omitempty"`
+	DiskKnown   bool `json:"disk_known,omitempty"`
+	DiskLow     bool `json:"disk_low,omitempty"`
+
+	// Problems are the agent's failing self-checks, the ones needing a person
+	// first, carried verbatim. Empty for a healthy agent — which is why
+	// StatusReported exists: never having reported is a different state from
+	// reporting nothing wrong, and the two must not look alike.
+	Problems       []models.AgentCheck `json:"problems,omitempty"`
+	StatusReported bool                `json:"status_reported,omitempty"`
+	StatusAt       *time.Time          `json:"status_at,omitempty"`
+	// StatusStale marks a report old enough that it describes the past. The
+	// agent reports on a timer, so a gap much longer than that timer means the
+	// agent stopped, not that the machine is fine.
+	StatusStale bool                    `json:"status_stale,omitempty"`
+	Unity       []string                `json:"unity,omitempty"`
+	Tools       map[string]string       `json:"tools,omitempty"`
+	Timeouts    map[string]string       `json:"timeouts,omitempty"`
+	Workspaces  []models.AgentWorkspace `json:"workspaces,omitempty"`
 }
 
 // Executor is a queue, and whether anything is serving it.
@@ -215,6 +252,7 @@ func Build(src Source, reg *Registry, now time.Time) (*Fleet, error) {
 			return nil, err
 		}
 		a.State = stateOf(a, reg.StartedAt(), now)
+		setUptime(a, now)
 	}
 	sort.Slice(order, func(i, j int) bool { return order[i].Name < order[j].Name })
 	f.Agents = make([]Agent, 0, len(order))
@@ -287,6 +325,80 @@ func applyRow(a *Agent, row *db.AgentRow, now time.Time) {
 	// updated on every poll, the row only once per throttle interval.
 	if a.LastSeen == nil && row.LastSeenAt != nil {
 		a.LastSeen, a.LastSeenFrom = row.LastSeenAt, "last poll before restart"
+	}
+	applySelfReport(a, row, now)
+}
+
+// applySelfReport folds in what the agent says about itself.
+//
+// Every value here came off another machine, so each is checked for being
+// sensible before it is shown rather than after somebody notices the page is
+// nonsense. A clock that disagrees with ours produces no uptime instead of a
+// negative one; a disk reading of zero means "not reported" because the write
+// path stores nothing for a zero.
+func applySelfReport(a *Agent, row *db.AgentRow, now time.Time) {
+	a.Version = row.Version
+	a.OSArch = row.OSArch
+
+	if row.StartedAt != nil && !row.StartedAt.IsZero() {
+		a.StartedAt = row.StartedAt
+	}
+
+	// A floor of zero means the agent has no floor configured, so there is
+	// nothing to compare against and nothing useful to colour.
+	a.DiskFreeGB, a.DiskFloorGB = row.DiskFreeGB, row.DiskFloorGB
+	a.DiskKnown = row.DiskFloorGB > 0 || row.DiskFreeGB > 0
+	a.DiskLow = row.DiskFloorGB > 0 && row.DiskFreeGB < row.DiskFloorGB
+
+	if row.LastStatusAt != nil {
+		a.StatusReported = true
+		a.StatusAt = row.LastStatusAt
+		a.StatusStale = now.Sub(*row.LastStatusAt) > models.StatusStale
+	}
+	if row.Status != nil {
+		a.Problems = row.Status.Problems()
+		a.Unity = row.Status.Unity
+		a.Tools = row.Status.Tools
+		a.Timeouts = row.Status.Timeouts
+		a.Workspaces = row.Status.Workspaces
+	}
+}
+
+// setUptime derives how long the agent process has been running.
+//
+// Computed here rather than in applySelfReport because it needs the state, and
+// withheld entirely from an agent we cannot reach. The stored start time does
+// not decay, so an age measured against the server's clock keeps growing after
+// the machine is switched off: a Mac shut down on Friday reads "up 3d15h" on
+// Monday, beside an offline badge, for a process that has not existed since
+// Friday. Every other stale fact on the row was true when it was observed —
+// this one would never have been true at any instant.
+func setUptime(a *Agent, now time.Time) {
+	if a.StartedAt == nil || a.State == StateOffline {
+		return
+	}
+	if d := now.Sub(*a.StartedAt); d >= 0 && d < maxPlausibleUptime {
+		a.Uptime = shortDuration(d)
+	}
+}
+
+// maxPlausibleUptime rejects a start time from a badly wrong clock. Ten years
+// is far past any real agent and far short of the epoch, which is what a
+// zeroed or misparsed timestamp usually lands on.
+const maxPlausibleUptime = 10 * 365 * 24 * time.Hour
+
+// shortDuration formats an uptime the way an operator reads it: the largest
+// two units, and never more precision than the question deserves.
+func shortDuration(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	default:
+		return fmt.Sprintf("%dd%dh", int(d.Hours())/24, int(d.Hours())%24)
 	}
 }
 

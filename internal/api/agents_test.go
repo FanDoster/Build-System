@@ -1317,3 +1317,135 @@ func TestClaimRejectsPathSegmentNames(t *testing.T) {
 		}
 	}
 }
+
+// --- A3: the agent reports on itself ---
+
+// The status endpoint is the machine describing itself, so unlike pause,
+// resume and forget it must ACCEPT an agent token. Getting this backwards
+// would make every agent's report 403 forever, silently.
+func TestStatusEndpointAcceptsAnAgentToken(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+
+	a, err := auth.New(s.DB, "operator-pw", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.SetAgentToken("agent-tok")
+	h := a.Middleware(mux)
+
+	body := `{"agent":"mac-1","checks":[{"name":"unity","detail":"no licence","needs_operator":true}]}`
+	req := httptest.NewRequest("POST", "/api/agents/status", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer agent-tok")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Builds-Csrf", "1")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != 204 {
+		t.Fatalf("agent token: %d %s, want 204 — an agent must be able to report its own health", w.Code, w.Body.String())
+	}
+	row, err := s.DB.GetAgentRow("mac-1")
+	if err != nil || row == nil || row.Status == nil {
+		t.Fatalf("status not stored: %+v %v", row, err)
+	}
+	if len(row.Status.Problems()) != 1 {
+		t.Errorf("problems = %+v", row.Status.Problems())
+	}
+}
+
+func TestStatusRejectsAnInvalidName(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+
+	w := doJSON(t, mux, "POST", "/api/agents/status",
+		map[string]interface{}{"agent": strings.Repeat("x", models.MaxAgentNameLen+1)})
+	if w.Code != 400 {
+		t.Errorf("status %d, want 400", w.Code)
+	}
+}
+
+// The claim block rides the poll and reaches the page.
+func TestTheClaimBlockReachesTheFleet(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	macProject(t, s)
+
+	started := time.Now().Add(-2 * time.Hour).UTC()
+	w := doJSON(t, mux, "POST", "/api/agents/claim", map[string]interface{}{
+		"agent": "mac-1", "executors": []string{"mac"},
+		"version": "2026-07-29", "os_arch": "darwin/arm64",
+		"started_at": started, "disk_free_gb": 38, "disk_floor_gb": 40,
+	})
+	if w.Code != 204 {
+		t.Fatalf("claim: %d %s", w.Code, w.Body.String())
+	}
+
+	w = doJSON(t, mux, "GET", "/api/agents", nil)
+	var fleet agents.Fleet
+	decodeJSON(t, w, &fleet)
+	a := fleet.Agents[0]
+	if a.Version != "2026-07-29" || a.OSArch != "darwin/arm64" {
+		t.Errorf("version=%q os=%q", a.Version, a.OSArch)
+	}
+	if !a.DiskKnown || !a.DiskLow {
+		t.Errorf("disk known=%v low=%v, want 38 GB against a 40 GB floor flagged", a.DiskKnown, a.DiskLow)
+	}
+	if a.Uptime == "" {
+		t.Error("no uptime derived from the reported start time")
+	}
+}
+
+// The rollout case, in both directions. An agent that knows nothing about the
+// block must still claim, and must not blank what a newer one reported.
+func TestAnOlderAgentStillClaimsAndKeepsItsReportedBlock(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	p := macProject(t, s)
+	b := pending(t, s, p.ID)
+
+	// A new agent reports; then the same machine polls from an older build.
+	if w := doJSON(t, mux, "POST", "/api/agents/claim", map[string]interface{}{
+		"agent": "mac-1", "executors": []string{"mac"},
+		"version": "2026-07-29", "disk_free_gb": 100, "disk_floor_gb": 40,
+	}); w.Code != 200 {
+		t.Fatalf("claim: %d %s", w.Code, w.Body.String())
+	}
+	if err := s.DB.FinishBuild(b.ID, models.StatusSuccess); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force the throttle open so the second poll really writes.
+	s.Agents.Forget("mac-1")
+	if w := doJSON(t, mux, "POST", "/api/agents/claim",
+		map[string]interface{}{"agent": "mac-1", "executors": []string{"mac"}}); w.Code != 204 {
+		t.Fatalf("old-style claim: %d %s", w.Code, w.Body.String())
+	}
+	row, _ := s.DB.GetAgentRow("mac-1")
+	if row.Version != "2026-07-29" || row.DiskFreeGB != 100 {
+		t.Errorf("an older agent's poll blanked the reported block: %+v", row)
+	}
+}
+
+// Nothing about reporting may fail a claim.
+func TestAnUnparseableStatusNeverBreaksAnything(t *testing.T) {
+	s, mux := newAgentServer(t)
+	s.Agents = agents.NewRegistry()
+	macProject(t, s)
+
+	// Junk in an unknown field, and a checks list of the wrong shape.
+	w := doJSON(t, mux, "POST", "/api/agents/status", map[string]interface{}{
+		"agent": "mac-1", "unknown_future_field": map[string]int{"a": 1},
+	})
+	if w.Code != 204 {
+		t.Errorf("status with an unknown field: %d %s, want 204", w.Code, w.Body.String())
+	}
+	// And a claim carrying a field this server has never heard of still works,
+	// which is what lets the agent ship before the server.
+	w = doJSON(t, mux, "POST", "/api/agents/claim", map[string]interface{}{
+		"agent": "mac-1", "executors": []string{"mac"}, "a_future_field": "hello",
+	})
+	if w.Code != 204 {
+		t.Errorf("claim with an unknown field: %d %s, want 204 — an agent must be able to ship first", w.Code, w.Body.String())
+	}
+}

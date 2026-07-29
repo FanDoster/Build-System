@@ -72,8 +72,42 @@ silent; and returning `204` immediately would drop the agent onto its one-second
 floor and turn a pause into a request flood.
 
 The agent name is limited to `models.MaxAgentNameLen` (64) characters, with no control
-characters, no surrounding whitespace, and no `/` or `\` — it is a database key and a URL
-path segment on the operator endpoints. `executors` is capped at 16 entries.
+characters, no surrounding whitespace, no invalid UTF-8, and no `/` or `\` — it is a
+database key and a URL path segment on the operator endpoints. `executors` is capped at
+16 entries.
+
+The claim may also carry a small block describing the agent itself: `version`,
+`os_arch`, `started_at`, `disk_free_gb`, `disk_floor_gb`. All optional. An agent that
+sends none of them is not penalised — each field is stored only when present, so an older
+agent cannot blank what a newer one reported.
+
+### `POST /api/agents/status`
+
+The agent's own report on its health, sent when it starts and then every few minutes.
+Answers `204`.
+
+```json
+{"agent": "mac-m4max-dan",
+ "checks": [{"name": "unity", "detail": "no licence; open Unity Hub and sign in",
+             "ok": false, "needs_operator": true}],
+ "unity": ["2022.3.62f2"],
+ "tools": {"steamcmd": "/Users/x/Steam/steamcmd.sh"},
+ "workspaces": [{"name": "ship-main", "used": "2026-07-27T09:14:00Z"}],
+ "timeouts": {"build": "90m", "silence": "20m"}}
+```
+
+Authenticated as an **agent**, not an operator — this is the machine describing itself,
+and it is the only endpoint under `/api/agents` that is. It is deliberately not folded
+into the heartbeat: the heartbeat exists only while a build runs, so it would report
+nothing while the agent is idle, which is when an operator is asking.
+
+`detail` strings are rendered on the agents page **verbatim**, because each carries the
+remedy for the thing it is reporting. The whole report is bounded server-side
+(`models.AgentStatus.Clamp`) and trimmed rather than rejected when it is too long.
+
+A server that predates this endpoint answers **405**, not 404 — the path matches another
+route's pattern under a different method. An agent should treat both as "there is nothing
+here" and stop asking until it restarts.
 
 `200` returns the claimed build and the **full project row, clone token included** — the
 agent has to authenticate the same private clone the local runner would. This is the one

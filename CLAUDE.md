@@ -125,6 +125,29 @@ that the build page shows as failed. The corollary is that an orphaned `running`
 makes an idle agent read as busy until the janitor sweeps it — that is the janitor's job
 and it must not be second-guessed here.
 
+**The agent reports on itself over two channels, and the split is load-bearing.**
+A small block (`version`, `os_arch`, `started_at`, `disk_free_gb`, `disk_floor_gb`) rides
+every claim poll, because that is cheap and free disk is only useful if it is current.
+The fuller report — the agent's own `doctor` findings, installed Unity versions, tool
+paths, workspaces, effective timeouts — goes to `POST /api/agents/status` on the agent's
+own timer. It is **not** on the heartbeat: the heartbeat exists only while a build runs,
+so it would deliver nothing while the agent is idle, which is exactly when someone is
+asking what is wrong with the machine. `handleAgentStatus` is the one agents endpoint
+that must **not** `requireOperator` — it is the machine describing itself.
+
+Everything the agent reports is untrusted: bounded by `models.AgentStatus.Clamp` on
+arrival, escaped by `html/template` and `textContent` on the way out. The `doctor`
+`Detail` strings are rendered **verbatim** — each was written for the person who has to
+walk over to the machine and carries its own remedy, so re-wording them loses the fix.
+
+Two rules keep a rollout safe in either order. A server without the status endpoint
+answers **405**, not 404 (the path matches another route's pattern under a different
+method), and neither is fatal to the agent client — so the agent asks once and latches
+off rather than retrying forever. And every self-reported column is written
+`COALESCE(NULLIF(?, ...), col)` on **both** of `RecordAgentSighting`'s write paths, so an
+older agent that sends none of it cannot blank what a newer one stored, and a brand-new
+agent's first claim still records it.
+
 **Pause fails open, everywhere, on purpose.** `models.AgentPaused` treats nil, the zero
 time and any past instant as not-paused; `Server.agentIsPaused` treats a read error the
 same way and logs it. A bug that leaves an agent building when it should be idle is a

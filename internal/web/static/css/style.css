@@ -621,3 +621,32 @@ h2 { font-size: 20px; margin-bottom: 16px; }
 .agent-pause-note { color: var(--text); font-style: italic; }
 .agent-actions { margin-top: 10px; display: flex; gap: 8px; }
 .btn-sm { height: 26px; padding: 0 10px; font-size: 12px; }
+
+/* Agents page — self-reported health (A3) */
+.agent-problems { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.agent-problem {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: rgba(139,148,158,0.08);
+}
+/* Louder, because this one needs a person to walk over to the machine. */
+.agent-problem--operator { background: rgba(248,81,73,0.08); }
+.agent-problem-name { font-weight: 600; }
+.agent-problem-detail { color: var(--text-muted); }
+.agent-report { margin-top: 8px; display: flex; gap: 12px; flex-wrap: wrap; font-size: 13px; }
+.agent-fact { color: var(--text-muted); }
+.agent-unreported { font-style: italic; }
+.agent-disk { color: var(--text-muted); }
+.agent-disk--low { color: var(--red); font-weight: 600; }
+.agent-details { margin-top: 8px; font-size: 13px; }
+.agent-details > summary { cursor: pointer; color: var(--text-muted); }
+.agent-details > summary:hover { color: var(--text); }
+.agent-detail-body { margin-top: 6px; padding-left: 12px; display: flex; flex-direction: column; gap: 3px; }
+.agent-detail-key { color: var(--text-muted); display: inline-block; min-width: 90px; }
+.agent-detail-hint { color: var(--text-muted); font-size: 12px; }
+.agent-workspace { padding-left: 98px; color: var(--text-muted); }

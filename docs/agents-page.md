@@ -4,11 +4,11 @@ A page on the build server showing the machines that build things: whether each
 one is online, what it is running, when it was last seen, and enough about it to
 answer "why is nothing building" without opening a terminal.
 
-This is a design document that is now partly built. **A1 and A2 are done and
-deployed** — the page at `/agents`, the coverage panel, per-agent state, and the
-persisted `agents` table behind pause/resume/forget. A3 (agent self-reporting)
-and A4 (polish) are still design only; §8 says which is which. For the agent
-protocol, see [build-agents.md](build-agents.md).
+This is a design document that is now mostly built. **A1, A2 and A3 are done
+and deployed** — the page at `/agents`, the coverage panel, per-agent state, the
+persisted `agents` table behind pause/resume/forget, and the agent's own report
+on what is wrong with the machine. A4 (polish) is still design only; §8 says
+which is which. For the agent protocol, see [build-agents.md](build-agents.md).
 
 ---
 
@@ -426,10 +426,61 @@ A3 columns needed `addColumnIfMissing` entries (the table is new, so no database
 can exist with a narrower one), and two readings of `Forget` on a live agent
 that rested on a state the claim handler cannot be in.
 
-**A3 — the agent reports on itself.** Claim-poll block plus
+**A3 — the agent reports on itself. Done, 2026-07-29.** Claim-poll block plus
 `/api/agents/status`; doctor on a timer; the page shows problems, disk against
 floor, version, uptime and workspaces. *Accept:* pulling the Unity licence shows
 the needs-operator check on the page with the agent's own remedy text.
+
+*Verified* with the real agent binary against a real server. Pointing the agent
+at a Unity Hub directory with no editors in it and a steamcmd that is not there
+put three `needs operator` rows on the page within seconds, each carrying
+Doctor's own sentence — "install the version the project's ProjectVersion.txt
+asks for with Unity Hub" — because the `Detail` strings are shipped word for
+word. A healthy run reported nine installed editors, 184 GB free against a 40 GB
+floor, `darwin/arm64`, and a version of `2026-07-29-self-report+157ec682-dirty`.
+
+The split matters more than it looks. The claim block is four scalars because it
+rides a request that fires twice a minute forever; the fuller report has its own
+endpoint on the agent's own timer. It is deliberately **not** on the heartbeat,
+which exists only while a build runs and would therefore deliver nothing while
+the agent is idle — exactly when somebody is asking what is wrong with it. Free
+disk is measured on every claim rather than cached, because a Unity build moves
+it by tens of gigabytes while it runs.
+
+Two properties are what make this safe to ship in either order:
+
+- **A server without the endpoint answers 405, not 404** — the path matches
+  another route's pattern under a different method. Neither is in the agent
+  client's fatal set, so a reporter that simply retried would ask a server that
+  can never answer, every five minutes, forever. It asks once, says so once, and
+  stops until the agent restarts. Verified against a build of the previously
+  deployed server: one log line, no repeats, claiming unaffected.
+- **An older agent sends none of this, and must not blank what a newer one
+  stored.** Every column in the block is written `COALESCE(NULLIF(?, ...), col)`,
+  on both of `RecordAgentSighting`'s write paths — the `UPDATE` and the
+  fall-through `INSERT`. Miss the second and a brand-new agent's first claim
+  stores nothing, with no visible reason.
+
+Three defects were found after the code was written, all fixed:
+
+- **The `<details>` panel snapped shut every five seconds.** The client renderer
+  rebuilds each row from scratch, and a re-render destroys the element holding
+  that state. Which machines have the panel open is now remembered by name on
+  the container, not on the element.
+- **A full disk was discarded.** `NULLIF(?, 0)` treated a reported zero as "not
+  reported" — and 0 GB free is exactly what a disk that has filled reports. The
+  page would have kept showing the last healthy figure at the moment it stopped
+  being true. The reported fields are now nullable end to end, so "did not
+  measure" and "measured zero" are different things.
+- **Uptime kept counting for a machine that was switched off.** The stored start
+  time does not decay, so a Mac shut down on Friday read "up 3d15h" on Monday
+  beside an `offline` badge. Every other stale fact on the row was true when it
+  was observed; that one was never true at any instant. Uptime is now withheld
+  from an agent that cannot be reached.
+
+Nine further candidates were raised by review and refuted on inspection —
+several of them variations on the two write paths in `RecordAgentSighting`,
+whose `ON CONFLICT` branch is only reachable in a race that cannot lose data.
 
 **A4 — polish.** Transport warning and certificate expiry; clock-skew readout (the log grammar is agent-authored and UTC,
 so a skewed Mac clock makes every step duration silently wrong); duplicate-name

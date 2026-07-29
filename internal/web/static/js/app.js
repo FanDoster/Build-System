@@ -39,6 +39,10 @@
     var connEl = document.getElementById('agents-conn');
     var banner = document.getElementById('agents-banner');
     var actionError = false;   // banner is showing an action failure, not page state
+    // Which machines have their detail panel open, by name. render() rebuilds
+    // every row from scratch, so without this an operator reading the panel
+    // would have it snap shut under them every five seconds.
+    var openDetail = Object.create(null);
     var base = document.body.dataset.basePath || '';
     var timer = null;
 
@@ -153,6 +157,93 @@
         row.appendChild(cur);
       }
 
+      // Problems, then the reported facts, then the disclosure. Mirrors
+      // agents.html — see the note at the top of this function.
+      if (a.problems && a.problems.length) {
+        var probs = el('div', 'agent-problems');
+        for (var p = 0; p < a.problems.length; p++) {
+          var pr = a.problems[p];
+          var prow = el('div', 'agent-problem' + (pr.needs_operator ? ' agent-problem--operator' : ''));
+          prow.appendChild(el('span', 'badge ' + (pr.needs_operator ? 'badge-failed' : 'badge-waiting'),
+            pr.needs_operator ? 'needs operator' : 'problem'));
+          prow.appendChild(el('span', 'mono agent-problem-name', pr.name || ''));
+          // textContent, via el(). The Detail string is written by the machine
+          // being described and is the one place on this page where untrusted
+          // prose is rendered at length.
+          prow.appendChild(el('span', 'agent-problem-detail', pr.detail || ''));
+          probs.appendChild(prow);
+        }
+        row.appendChild(probs);
+      }
+
+      var report = el('div', 'agent-report');
+      if (a.disk_known) {
+        var disk = el('span', 'agent-disk' + (a.disk_low ? ' agent-disk--low' : ''),
+          (a.disk_free_gb || 0) + ' GB free' + (a.disk_floor_gb ? ', floor ' + a.disk_floor_gb : '') +
+          (a.disk_low ? ' \u2014 the next build is already refused' : ''));
+        report.appendChild(disk);
+      }
+      if (a.version) report.appendChild(el('span', 'agent-fact', a.version));
+      if (a.os_arch) report.appendChild(el('span', 'agent-fact mono', a.os_arch));
+      if (a.uptime) report.appendChild(el('span', 'agent-fact', 'up ' + a.uptime));
+      if (a.remembered && !a.status_reported) {
+        report.appendChild(el('span', 'agent-fact agent-unreported', 'has never reported its health'));
+      } else if (a.remembered && a.status_stale) {
+        var st = el('span', 'agent-fact agent-unreported', 'health last reported ');
+        var stt = el('time');
+        stt.setAttribute('data-abs', '');
+        stt.setAttribute('datetime', a.status_at || '');
+        setAbsLabel(stt);
+        st.appendChild(stt);
+        report.appendChild(st);
+      }
+      if (report.childNodes.length) row.appendChild(report);
+
+      var hasDetail = (a.unity && a.unity.length) || (a.workspaces && a.workspaces.length) ||
+        (a.tools && Object.keys(a.tools).length) || (a.timeouts && Object.keys(a.timeouts).length);
+      if (hasDetail) {
+        var det = el('details', 'agent-details');
+        det.open = !!openDetail[a.name];
+        det.dataset.agent = a.name;
+        det.appendChild(el('summary', null, 'Machine detail'));
+        var body = el('div', 'agent-detail-body');
+        if (a.unity && a.unity.length) {
+          var u = el('div');
+          u.appendChild(el('span', 'agent-detail-key', 'Unity'));
+          for (var ui = 0; ui < a.unity.length; ui++) {
+            u.appendChild(document.createTextNode(ui ? ', ' : ' '));
+            u.appendChild(el('span', 'mono', a.unity[ui]));
+          }
+          body.appendChild(u);
+        }
+        body.appendChild(kvRows(a.tools, ''));
+        body.appendChild(kvRows(a.timeouts, ' timeout'));
+        if (a.workspaces && a.workspaces.length) {
+          var wh = el('div');
+          wh.appendChild(el('span', 'agent-detail-key', 'Workspaces'));
+          wh.appendChild(document.createTextNode(' '));
+          wh.appendChild(el('span', 'agent-detail-hint',
+            "least recently used first \u2014 the order the agent's own sweep deletes them in"));
+          body.appendChild(wh);
+          for (var wi = 0; wi < a.workspaces.length; wi++) {
+            var ws = a.workspaces[wi];
+            var wr = el('div', 'agent-workspace');
+            wr.appendChild(el('span', 'mono', ws.name || ''));
+            if (ws.used) {
+              wr.appendChild(document.createTextNode(' '));
+              var wt = el('time');
+              wt.setAttribute('data-abs', '');
+              wt.setAttribute('datetime', ws.used);
+              setAbsLabel(wt);
+              wr.appendChild(wt);
+            }
+            body.appendChild(wr);
+          }
+        }
+        det.appendChild(body);
+        row.appendChild(det);
+      }
+
       if (a.recent && a.recent.length) {
         var rec = el('div', 'agent-recent');
         for (var j = 0; j < a.recent.length; j++) {
@@ -171,6 +262,22 @@
       acts.appendChild(actionBtn('forget', 'Forget', 'btn-danger'));
       row.appendChild(acts);
       return row;
+    }
+
+    // Sorted, so a map that the server iterates at random does not reshuffle
+    // the panel between two five-second refreshes.
+    function kvRows(map, suffix) {
+      var frag = document.createDocumentFragment();
+      if (!map) return frag;
+      var keys = Object.keys(map).sort();
+      for (var i = 0; i < keys.length; i++) {
+        var d = el('div');
+        d.appendChild(el('span', 'agent-detail-key', keys[i] + suffix));
+        d.appendChild(document.createTextNode(' '));
+        d.appendChild(el('span', 'mono', map[keys[i]]));
+        frag.appendChild(d);
+      }
+      return frag;
     }
 
     function actionBtn(act, label, extra) {
@@ -224,6 +331,15 @@
     // The agent name reaches the URL through encodeURIComponent, always. It is
     // free text asserted by whoever holds the agent token — a name containing a
     // slash would otherwise address a different endpoint entirely.
+    // Remembered on the container, because the element it happened to is
+    // replaced by the next refresh.
+    root.addEventListener('toggle', function (ev) {
+      var det = ev.target;
+      if (!det || det.tagName !== 'DETAILS' || !det.dataset.agent) return;
+      if (det.open) openDetail[det.dataset.agent] = true;
+      else delete openDetail[det.dataset.agent];
+    }, true);   // capture: toggle does not bubble
+
     root.addEventListener('click', function (ev) {
       var btn = ev.target.closest('button[data-act]');
       if (!btn) return;

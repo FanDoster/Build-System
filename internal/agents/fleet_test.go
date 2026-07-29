@@ -608,3 +608,223 @@ func TestALivePollIsNotLabelledAsPreRestart(t *testing.T) {
 		t.Errorf("last seen from %q, want %q — this agent is on the other end of an open socket right now", got, "claim poll")
 	}
 }
+
+// --- A3: what the agent says about itself ---
+
+func statusRow(name string, at time.Time, checks ...models.AgentCheck) db.AgentRow {
+	t := at
+	return db.AgentRow{
+		Name: name, Executors: []string{"mac"},
+		Status: &models.AgentStatus{Checks: checks}, LastStatusAt: &t,
+	}
+}
+
+// Never having reported is a completely different state from having reported
+// nothing wrong, and an operator has to be able to tell them apart. A silent
+// agent showing the same clean panel as a healthy one is the page lying.
+func TestNeverReportedIsNotTheSameAsHealthy(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("silent", []string{"mac"}, "https")
+	reg.PollStarted("healthy", []string{"mac"}, "https")
+
+	src := &fakeSource{rows: []db.AgentRow{
+		{Name: "silent", Executors: []string{"mac"}},
+		statusRow("healthy", now, models.AgentCheck{Name: "disk", Detail: "plenty", OK: true}),
+	}}
+	f, err := Build(src, reg, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]Agent{}
+	for _, a := range f.Agents {
+		byName[a.Name] = a
+	}
+	if byName["silent"].StatusReported {
+		t.Error("an agent that has never reported is marked as having reported")
+	}
+	if !byName["healthy"].StatusReported {
+		t.Error("an agent that reported a clean bill is not marked as having reported")
+	}
+	if len(byName["healthy"].Problems) != 0 {
+		t.Errorf("healthy agent has problems: %+v", byName["healthy"].Problems)
+	}
+}
+
+// The ones needing a person come first, and the agent's own words are carried
+// through untouched — each Detail carries its own remedy.
+func TestProblemsLeadWithTheOnesNeedingAPerson(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac", []string{"mac"}, "https")
+
+	remedy := "not installed; brew install git-lfs, and check the LaunchAgent's PATH includes /opt/homebrew/bin"
+	src := &fakeSource{rows: []db.AgentRow{statusRow("mac", now,
+		models.AgentCheck{Name: "git", Detail: "git 2.39.5", OK: true},
+		models.AgentCheck{Name: "git-lfs", Detail: remedy, OK: false},
+		models.AgentCheck{Name: "unity", Detail: "no licence; open Unity Hub", NeedsOperator: true},
+	)}}
+	f, _ := Build(src, reg, now)
+	p := f.Agents[0].Problems
+	if len(p) != 2 {
+		t.Fatalf("problems = %+v, want only the two failures", p)
+	}
+	if p[0].Name != "unity" {
+		t.Errorf("problems[0] = %q, want the one that needs somebody at the machine", p[0].Name)
+	}
+	if p[1].Detail != remedy {
+		t.Errorf("detail was altered:\n got %q\nwant %q", p[1].Detail, remedy)
+	}
+}
+
+// The floor is the agent's real refusal threshold, so below it the next build
+// is already refused — which no absolute number conveys.
+func TestDiskBelowTheFloorIsFlagged(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name               string
+		free, floor        int
+		wantKnown, wantLow bool
+	}{
+		{"below the floor", 38, 40, true, true},
+		{"above the floor", 120, 40, true, false},
+		{"exactly at the floor", 40, 40, true, false},
+		{"never reported", 0, 0, false, false},
+		{"no floor configured", 90, 0, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := registryAt(now)
+			reg.PollStarted("mac", []string{"mac"}, "https")
+			src := &fakeSource{rows: []db.AgentRow{
+				{Name: "mac", Executors: []string{"mac"}, DiskFreeGB: tc.free, DiskFloorGB: tc.floor},
+			}}
+			f, _ := Build(src, reg, now)
+			a := f.Agents[0]
+			if a.DiskKnown != tc.wantKnown {
+				t.Errorf("disk known = %v, want %v", a.DiskKnown, tc.wantKnown)
+			}
+			if a.DiskLow != tc.wantLow {
+				t.Errorf("disk low = %v, want %v", a.DiskLow, tc.wantLow)
+			}
+		})
+	}
+}
+
+// A report from hours ago describes the past. Saying so is the difference
+// between "this machine is fine" and "this machine was fine".
+func TestAnOldStatusReportIsMarkedStale(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac", []string{"mac"}, "https")
+
+	fresh := statusRow("mac", now.Add(-2*time.Minute))
+	src := &fakeSource{rows: []db.AgentRow{fresh}}
+	if f, _ := Build(src, reg, now); f.Agents[0].StatusStale {
+		t.Error("a two-minute-old report was called stale")
+	}
+
+	old := statusRow("mac", now.Add(-models.StatusStale-time.Minute))
+	src = &fakeSource{rows: []db.AgentRow{old}}
+	if f, _ := Build(src, reg, now); !f.Agents[0].StatusStale {
+		t.Error("an hours-old report was presented as current")
+	}
+}
+
+// The start time comes off another machine's clock. A skewed one must read as
+// unknown rather than as a negative or absurd age.
+func TestUptimeIsDefensiveAboutAnotherMachinesClock(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name    string
+		started time.Time
+		want    string
+	}{
+		{"three hours", now.Add(-3*time.Hour - 25*time.Minute), "3h25m"},
+		{"two days", now.Add(-50 * time.Hour), "2d2h"},
+		{"forty seconds", now.Add(-40 * time.Second), "40s"},
+		{"a clock running fast", now.Add(time.Hour), ""},
+		{"the epoch", time.Unix(0, 0).UTC(), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := registryAt(now)
+			reg.PollStarted("mac", []string{"mac"}, "https")
+			st := tc.started
+			src := &fakeSource{rows: []db.AgentRow{{Name: "mac", StartedAt: &st}}}
+			f, _ := Build(src, reg, now)
+			if got := f.Agents[0].Uptime; got != tc.want {
+				t.Errorf("uptime = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestVersionAndInventoryReachTheView(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac", []string{"mac"}, "https")
+
+	used := now.Add(-72 * time.Hour)
+	at := now
+	src := &fakeSource{rows: []db.AgentRow{{
+		Name: "mac", Version: "2026-07-29", OSArch: "darwin/arm64",
+		LastStatusAt: &at,
+		Status: &models.AgentStatus{
+			Unity:      []string{"2022.3.62f2"},
+			Tools:      map[string]string{"git": "/usr/bin/git"},
+			Timeouts:   map[string]string{"build": "90m"},
+			Workspaces: []models.AgentWorkspace{{Name: "ship-main", Used: &used}},
+		},
+	}}}
+	f, _ := Build(src, reg, now)
+	a := f.Agents[0]
+	if a.Version != "2026-07-29" || a.OSArch != "darwin/arm64" {
+		t.Errorf("version=%q os=%q", a.Version, a.OSArch)
+	}
+	if len(a.Unity) != 1 || len(a.Tools) != 1 || len(a.Timeouts) != 1 || len(a.Workspaces) != 1 {
+		t.Errorf("inventory did not reach the view: %+v", a)
+	}
+}
+
+// The stored start time does not decay, so an age measured against the server's
+// clock keeps growing after the machine is switched off. A Mac shut down on
+// Friday would read "up 3d15h" on Monday, beside an offline badge, for a
+// process that has not existed since Friday. Every other stale fact on the row
+// was true when it was observed; this one was never true at any instant.
+func TestAnOfflineAgentReportsNoUptime(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now.Add(-time.Hour)) // well past the restart grace
+
+	started := now.Add(-80 * time.Hour)
+	lastSeen := now.Add(-72 * time.Hour)
+	src := &fakeSource{rows: []db.AgentRow{
+		{Name: "mac", Executors: []string{"mac"}, StartedAt: &started, LastSeenAt: &lastSeen},
+	}}
+	f, _ := Build(src, reg, now)
+	a := f.Agents[0]
+	if a.State != StateOffline {
+		t.Fatalf("state = %q, want offline", a.State)
+	}
+	if a.Uptime != "" {
+		t.Errorf("uptime = %q for a machine last seen three days ago", a.Uptime)
+	}
+	// The raw start time is still carried, so the page can say when it began.
+	if a.StartedAt == nil {
+		t.Error("the start time was dropped along with the derived uptime")
+	}
+}
+
+// A reachable agent still reports one — that is the whole point of the field.
+func TestAReachableAgentReportsUptime(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	reg := registryAt(now)
+	reg.PollStarted("mac", []string{"mac"}, "https")
+
+	started := now.Add(-3*time.Hour - 25*time.Minute)
+	src := &fakeSource{rows: []db.AgentRow{{Name: "mac", StartedAt: &started}}}
+	f, _ := Build(src, reg, now)
+	if got := f.Agents[0].Uptime; got != "3h25m" {
+		t.Errorf("uptime = %q, want 3h25m", got)
+	}
+}

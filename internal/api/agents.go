@@ -97,6 +97,15 @@ func (s *Server) handleAgentClaim(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		agentIdent
 		Executors []string `json:"executors"`
+		// The self block. Optional in every sense: an agent too old to send it
+		// is decoded without complaint (nothing here sets DisallowUnknownFields,
+		// in either direction), and an absent or zero field leaves whatever is
+		// already stored alone rather than blanking it.
+		Version     string     `json:"version"`
+		OSArch      string     `json:"os_arch"`
+		StartedAt   *time.Time `json:"started_at"`
+		DiskFreeGB  *int       `json:"disk_free_gb"`
+		DiskFloorGB *int       `json:"disk_floor_gb"`
 	}
 	if !decodeAgentBody(w, r, maxAgentBody, &req) {
 		return
@@ -138,7 +147,13 @@ func (s *Server) handleAgentClaim(w http.ResponseWriter, r *http.Request) {
 	// is the only trace an idle agent leaves anywhere.
 	if s.Agents != nil {
 		defer s.Agents.PollStarted(req.Agent, req.Executors, requestScheme(r))()
-		s.rememberAgent(req.Agent, req.Executors, requestScheme(r))
+		s.rememberAgent(req.Agent, req.Executors, requestScheme(r), db.SelfReport{
+			Version:     req.Version,
+			OSArch:      req.OSArch,
+			StartedAt:   req.StartedAt,
+			DiskFreeGB:  req.DiskFreeGB,
+			DiskFloorGB: req.DiskFloorGB,
+		})
 	}
 
 	deadline := time.Now().Add(s.pollHold())
@@ -238,6 +253,44 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, fleet)
+}
+
+// handleAgentStatus takes an agent's report on its own health.
+//
+// Deliberately NOT requireOperator, unlike every other endpoint on this page:
+// this is the machine describing itself, and the credential it holds is the
+// agent token. Deliberately not on the heartbeat either — the heartbeat exists
+// only while a build runs, so it would deliver nothing while the agent is idle,
+// which is exactly when somebody is asking what is wrong with it. And
+// deliberately not on the claim poll, which fires twice a minute forever and
+// has to stay small.
+//
+// Everything here is written by the machine being described. It is bounded on
+// arrival by AgentStatus.Clamp and escaped on the way out; nothing in it is
+// ever treated as a fact about the server.
+func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
+	if !requireCsrf(w, r) {
+		return
+	}
+	var req struct {
+		agentIdent
+		models.AgentStatus
+	}
+	if !decodeAgentBody(w, r, maxAgentBody, &req) {
+		return
+	}
+	if !models.ValidAgentName(req.Agent) {
+		writeError(w, 400, "invalid agent name")
+		return
+	}
+	status := req.AgentStatus
+	if err := s.DB.RecordAgentStatus(req.Agent, &status, time.Now()); err != nil {
+		// Logged, not returned. A status report is information, and an agent
+		// that treats a failure to file one as a reason to stop working would
+		// have turned a reporting feature into an outage.
+		log.Printf("agent %s: could not record status: %v", req.Agent, err)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handlePauseAgent stops an agent being given new builds.
@@ -356,11 +409,11 @@ const maxAgentExecutors = 16
 // locked table or a migration that has not run must degrade the page, never
 // stop CI. The throttle decision and the write are separate steps on purpose —
 // the registry's lock is never held across a database call.
-func (s *Server) rememberAgent(name string, executors []string, scheme string) {
+func (s *Server) rememberAgent(name string, executors []string, scheme string, self db.SelfReport) {
 	if s.DB == nil || !s.Agents.ShouldPersist(name, db.AgentSightingInterval) {
 		return
 	}
-	if err := s.DB.RecordAgentSighting(name, executors, scheme, time.Now()); err != nil {
+	if err := s.DB.RecordAgentSighting(name, executors, scheme, self, time.Now()); err != nil {
 		log.Printf("agent %s: could not record sighting: %v", name, err)
 	}
 }
