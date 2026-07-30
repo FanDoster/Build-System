@@ -7,8 +7,8 @@ This file is for working **on** the build server. For putting a *new project* on
 For builds that run on another machine (Unity on a Mac, say), see
 [docs/build-agents.md](docs/build-agents.md). The page for looking at those
 machines is at `/agents`, designed in
-[docs/agents-page.md](docs/agents-page.md) — milestone A1 of that plan is built;
-A2–A4 are still design only.
+[docs/agents-page.md](docs/agents-page.md) — all four milestones of that plan are
+built, and §8 records the two A4 items deliberately left out and why.
 
 ## What this is
 
