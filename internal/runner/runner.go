@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -344,6 +345,22 @@ func (r *Runner) runBuild(ctx context.Context, build *models.Build, startedAt ti
 		}
 	}
 
+	// A repository that uses LFS clones perfectly well without git-lfs present
+	// — and lands every large file as a text pointer, which Docker builds into
+	// an image that is wrong in a way nothing reports. The image ships, the
+	// deploy succeeds, and the fault surfaces as a missing texture or a corrupt
+	// binary much later and somewhere else.
+	//
+	// git-lfs is installed in the runtime image, so this should never fire. It
+	// exists because the failure it guards is silent, and the cost of being
+	// wrong about that is a green build that produced the wrong artifact.
+	if usesLFS(workDir) && !haveGitLFS() {
+		fail("This repository uses Git LFS and git-lfs is not installed in the build image. " +
+			"Large files would be built as pointer files, producing an image that looks fine and is not. " +
+			"Add git-lfs to the Dockerfile (apk add git-lfs && git lfs install --system).")
+		return
+	}
+
 	// Step 2: Docker build
 	imageTag := fmt.Sprintf("registry.fandoster.com/%s:latest", project.ImageName)
 
@@ -529,4 +546,26 @@ func newCmd(ctx context.Context, sink *logSink, name string, args ...string) *ex
 	}
 	cmd.WaitDelay = 5 * time.Second
 	return cmd
+}
+
+// usesLFS reports whether the checkout declares Git LFS filters.
+//
+// Reads .gitattributes rather than asking git-lfs, because the case this exists
+// for is git-lfs being absent — a check that needs the missing tool to notice
+// the tool is missing would never fire. Only the root file is read: that is
+// where every real repository declares it, and a deeper one would already have
+// been handled by the smudge filter when git-lfs is present, which is the only
+// case where missing it matters.
+func usesLFS(workDir string) bool {
+	b, err := os.ReadFile(filepath.Join(workDir, ".gitattributes"))
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(b, []byte("filter=lfs"))
+}
+
+// haveGitLFS reports whether git can run the lfs subcommand.
+func haveGitLFS() bool {
+	_, err := exec.LookPath("git-lfs")
+	return err == nil
 }

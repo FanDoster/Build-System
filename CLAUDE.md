@@ -49,7 +49,7 @@ BUILDS_DB=/tmp/builds.db BUILDS_ADDR=:8899 go run ./cmd/builds
 | `BUILDS_BASE_PATH` | `""` | e.g. `/builds` when behind a path-stripping proxy |
 | `BUILDS_BUILD_TIMEOUT` | `30m` | Go duration |
 | `BUILDS_PASSWORD` / `BUILDS_PASSWORD_HASH` | unset | Unset **disables auth entirely** (the server logs a loud warning). Hash (bcrypt) wins when both are set. |
-| `BUILDS_AGENT_TOKEN` | unset | Credential for build agents, separate from the operator password so a build machine never holds it. Requests bearing it are refused by the project-management endpoints. |
+| `BUILDS_AGENT_TOKEN` | unset | Credential for build agents, separate from the operator password so a build machine never holds it. Requests bearing it are refused by everything that manages projects or decides what builds — see `requireOperator`. |
 | `BUILDS_NOTIFY_EMAIL` | unset | Recipient of build-completion mail. Unset disables it. |
 | `BUILDS_PUBLIC_URL` | `""` | e.g. `https://fandoster.com/builds`. Only used for the link in that mail — the server never sees its own external URL. |
 | `BUILDS_SMTP_ADDR` | `172.17.0.1:25` | The host's Postfix over the Docker bridge. Override is for tests. |
@@ -254,6 +254,22 @@ added, or was removed without updating the comment.)
 
 **Do not pass `--progress` to `docker build`.** The production Docker is legacy
 (non-BuildKit) and exits 125 on it.
+
+**Git LFS support is the Dockerfile and the guard together, and neither is optional.**
+A repository that uses LFS clones perfectly well without `git-lfs` installed — and lands
+every large file as a ~130-byte text pointer, which Docker bakes into an image that is
+wrong and that nothing reports. The build goes green, the deploy succeeds, and the fault
+surfaces much later as a missing asset. So the runtime image installs `git-lfs` **and**
+runs `git lfs install --system` (a filter git cannot invoke is the same as no filter),
+and `runBuild` refuses a checkout that declares LFS filters when the tool is absent.
+`usesLFS` deliberately reads `.gitattributes` rather than asking git-lfs: the case it
+exists for is git-lfs being missing, and a check that needs the missing tool to notice
+the tool is missing would never fire.
+
+The agent hit the loud version of the same problem — see the LFS note in
+`build-agent-mac/CLAUDE.md`. There the credential is stripped from the remote, so LFS
+fails the checkout outright; here the credential stays in the clone URL, so it succeeds
+and lies instead. Same class, opposite symptom.
 
 **Templates and static assets are `go:embed`ed.** Editing HTML/CSS/JS requires a server
 restart, not just a refresh.
