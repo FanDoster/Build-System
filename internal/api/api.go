@@ -301,6 +301,8 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 		PollEnabled       *bool   `json:"poll_enabled"`
 		PollIntervalSecs  *int    `json:"poll_interval_secs"`
 		Executor          *string `json:"executor"`
+		BuildCommand      *string `json:"build_command"`
+		UploadScript      *string `json:"upload_script"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
 		writeError(w, 400, "invalid JSON: "+err.Error())
@@ -377,6 +379,8 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 	// switch nobody owns them, and they would sit pending until the next
 	// server restart happened to re-queue them.
 	adopt := models.Remote(existing.Executor) == false && models.Remote(before.Executor)
+	setIf(&existing.BuildCommand, updates.BuildCommand)
+	setIf(&existing.UploadScript, updates.UploadScript)
 
 	if err := s.DB.UpdateProject(existing); err != nil {
 		writeError(w, 500, err.Error())

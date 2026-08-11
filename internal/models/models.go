@@ -50,7 +50,9 @@ type Project struct {
 	// Executor decides who runs this project's builds: ExecutorLocal (the
 	// Docker runner in this process) or the name of a queue an agent serves,
 	// e.g. "mac".
-	Executor string `json:"executor"`
+	Executor     string `json:"executor"`
+	BuildCommand string `json:"build_command,omitempty"`
+	UploadScript string `json:"upload_script,omitempty"`
 
 	// Polling: an alternative to GitHub Actions / webhooks. When enabled the
 	// server asks the remote for the branch tip every PollIntervalSecs and

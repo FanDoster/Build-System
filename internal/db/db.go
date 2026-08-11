@@ -68,6 +68,8 @@ func (d *DB) migrate() error {
 			last_polled_at DATETIME,
 			last_poll_error TEXT NOT NULL DEFAULT '',
 			executor TEXT NOT NULL DEFAULT 'local',
+			build_command TEXT NOT NULL DEFAULT '',
+			upload_script TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
 			updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
 		);
@@ -130,6 +132,8 @@ func (d *DB) migrate() error {
 		{"builds", "agent", "TEXT NOT NULL DEFAULT ''"},
 		{"builds", "last_heartbeat_at", "DATETIME"},
 		{"builds", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"},
+		{"projects", "build_command", "TEXT NOT NULL DEFAULT ''"},
+		{"projects", "upload_script", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := d.addColumnIfMissing(c.table, c.column, c.decl); err != nil {
 			return err
@@ -189,7 +193,7 @@ func (d *DB) SetSetting(key, value string) error {
 const projectCols = `id, name, repo_url, branch, dockerfile_path, image_name,
 	deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache,
 	poll_enabled, poll_interval_secs, last_polled_sha, last_polled_at, last_poll_error,
-	executor, created_at, updated_at`
+	executor, build_command, upload_script, created_at, updated_at`
 
 // scanner is satisfied by both *sql.Row and *sql.Rows.
 type scanner interface{ Scan(dest ...any) error }
@@ -199,7 +203,8 @@ func scanProject(s scanner) (*models.Project, error) {
 	err := s.Scan(&p.ID, &p.Name, &p.RepoURL, &p.Branch, &p.DockerfilePath, &p.ImageName,
 		&p.DeployComposePath, &p.DeployServiceName, &p.WebhookSecret, &p.CloneToken, &p.NoCache,
 		&p.PollEnabled, &p.PollIntervalSecs, &p.LastPolledSHA, &p.LastPolledAt, &p.LastPollError,
-		&p.Executor, &p.CreatedAt, &p.UpdatedAt)
+		&p.Executor, &p.BuildCommand, &p.UploadScript,
+		&p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -216,11 +221,12 @@ func (d *DB) CreateProject(p *models.Project) error {
 		p.Executor = models.ExecutorLocal
 	}
 	res, err := d.conn.Exec(
-		`INSERT INTO projects (name, repo_url, branch, dockerfile_path, image_name, deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache, poll_enabled, poll_interval_secs, executor, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO projects (name, repo_url, branch, dockerfile_path, image_name, deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache, poll_enabled, poll_interval_secs, executor, build_command, upload_script, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.Name, p.RepoURL, p.Branch, p.DockerfilePath, p.ImageName,
 		p.DeployComposePath, p.DeployServiceName, p.WebhookSecret, p.CloneToken, p.NoCache,
 		p.PollEnabled, p.PollIntervalSecs, p.Executor,
+		p.BuildCommand, p.UploadScript,
 		p.CreatedAt, p.UpdatedAt,
 	)
 	if err != nil {
@@ -272,11 +278,12 @@ func (d *DB) UpdateProject(p *models.Project) error {
 	_, err := d.conn.Exec(
 		`UPDATE projects SET name=?, repo_url=?, branch=?, dockerfile_path=?, image_name=?,
 		 deploy_compose_path=?, deploy_service_name=?, webhook_secret=?, clone_token=?, no_cache=?,
-		 poll_enabled=?, poll_interval_secs=?, executor=?, updated_at=?
+		 poll_enabled=?, poll_interval_secs=?, executor=?, build_command=?, upload_script=?, updated_at=?
 		 WHERE id=?`,
 		p.Name, p.RepoURL, p.Branch, p.DockerfilePath, p.ImageName,
 		p.DeployComposePath, p.DeployServiceName, p.WebhookSecret, p.CloneToken, p.NoCache,
 		p.PollEnabled, p.PollIntervalSecs, p.Executor,
+		p.BuildCommand, p.UploadScript,
 		p.UpdatedAt, p.ID,
 	)
 	return err

@@ -235,7 +235,7 @@ func (a *Auth) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !a.verifyPassword(body.Password) {
-		writeJSONError(w, http.StatusUnauthorized, "wrong password")
+		writeJSONError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 	a.resetAttempts()
