@@ -34,7 +34,7 @@ const livePingInterval = 25 * time.Second
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-08-11-project-build-numbers"
+const Version = "2026-08-11-server-project-build-config"
 
 // Agent long-poll defaults. The hold is deliberately under the 60s nginx
 // defaults with room to spare: a claim request that outlives proxy_read_timeout
@@ -308,6 +308,7 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 		PollIntervalSecs  *int    `json:"poll_interval_secs"`
 		Executor          *string `json:"executor"`
 		BuildCommand      *string `json:"build_command"`
+		BuildPath         *string `json:"build_path"`
 		UploadScript      *string `json:"upload_script"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
@@ -386,6 +387,7 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 	// server restart happened to re-queue them.
 	adopt := models.Remote(existing.Executor) == false && models.Remote(before.Executor)
 	setIf(&existing.BuildCommand, updates.BuildCommand)
+	setIf(&existing.BuildPath, updates.BuildPath)
 	setIf(&existing.UploadScript, updates.UploadScript)
 
 	if err := s.DB.UpdateProject(existing); err != nil {

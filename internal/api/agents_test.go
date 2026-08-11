@@ -41,6 +41,8 @@ func macProject(t *testing.T, s *Server) *models.Project {
 		Name: "game", RepoURL: "https://github.com/nmr/ship", Branch: "main",
 		DockerfilePath: "Dockerfile", ImageName: "game",
 		Executor: "mac", CloneToken: "ghp_secret",
+		BuildCommand: "BuildBuilder.CommandLineGameDebug",
+		BuildPath:    "/Users/build/Builds/Windows", UploadScript: "Steam/UPLOAD_MAC.sh",
 	})
 }
 
@@ -118,6 +120,11 @@ func TestAgentClaimReturnsBuildAndCredentials(t *testing.T) {
 	}
 	if got.Project.RepoURL != "https://github.com/nmr/ship" {
 		t.Errorf("repo_url = %q", got.Project.RepoURL)
+	}
+	if got.Project.BuildCommand != "BuildBuilder.CommandLineGameDebug" ||
+		got.Project.BuildPath != "/Users/build/Builds/Windows" ||
+		got.Project.UploadScript != "Steam/UPLOAD_MAC.sh" {
+		t.Errorf("agent build settings were not delivered: %+v", got.Project)
 	}
 }
 

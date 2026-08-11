@@ -46,7 +46,7 @@
     <div class="form-group">
       <label for="f-executor">Executor</label>
       <input id="f-executor" name="executor" value="{{.Project.Executor}}" spellcheck="false" style="max-width:220px">
-      <p class="form-hint"><span class="mono">local</span> builds a Docker image on this server. Any other name is a queue a build agent claims from — its builds wait here until an agent asking for that name picks one up, and the settings below do not apply to them.</p>
+      <p class="form-hint"><span class="mono">local</span> builds a Docker image on this server. Any other name is a queue a build agent claims from; remote Unity agents use the build command, path, and upload script below.</p>
     </div>
     <div class="form-group">
       <label for="f-image">Image name</label>
@@ -56,13 +56,20 @@
     <div class="form-row">
       <div class="form-group">
         <label for="f-build-command">Build command</label>
-        <input id="f-build-command" name="build_command" value="{{.Project.BuildCommand}}" spellcheck="false" placeholder="e.g. BuildBuilder.BuildGameDebug()">
-        <p class="form-hint">Unity build method or build script. Sent to the remote agent.</p>
+        <input id="f-build-command" name="build_command" value="{{.Project.BuildCommand}}" spellcheck="false" placeholder="e.g. BuildBuilder.CommandLineGameDebug">
+        <p class="form-hint">Public static Unity method sent to the remote agent.</p>
       </div>
+      <div class="form-group">
+        <label for="f-build-path">Build path</label>
+        <input id="f-build-path" name="build_path" value="{{.Project.BuildPath}}" spellcheck="false" placeholder="e.g. /Users/build/Builds/Windows">
+        <p class="form-hint">Player output directory passed to the Unity method.</p>
+      </div>
+    </div>
+    <div class="form-row">
       <div class="form-group">
         <label for="f-upload-script">Upload script</label>
         <input id="f-upload-script" name="upload_script" value="{{.Project.UploadScript}}" spellcheck="false" placeholder="e.g. UPLOAD_MAC.sh">
-        <p class="form-hint">Post-build upload script. Sent to the remote agent.</p>
+        <p class="form-hint">Repository-relative post-build script run by the remote agent. Empty skips upload.</p>
       </div>
     </div>
     <label class="form-check">

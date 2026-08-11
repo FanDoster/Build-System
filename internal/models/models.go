@@ -52,6 +52,7 @@ type Project struct {
 	// e.g. "mac".
 	Executor     string `json:"executor"`
 	BuildCommand string `json:"build_command,omitempty"`
+	BuildPath    string `json:"build_path,omitempty"`
 	UploadScript string `json:"upload_script,omitempty"`
 
 	// Polling: an alternative to GitHub Actions / webhooks. When enabled the

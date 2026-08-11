@@ -117,8 +117,9 @@ their current value, so you can send just the one you're changing.
 | `webhook_secret` | `""` | HMAC secret for GitHub push events. Write-only in the UI. |
 | `clone_token` | `""` | PAT for private repos. Write-only, scrubbed from logs. |
 | `executor` | `local` | `local` uses the Docker runner; any other value names a queue served by a remote build agent. |
-| `build_command` | `""` | Opaque build method or command sent to a remote agent when it claims the build. Ignored by the local runner. |
-| `upload_script` | `""` | Opaque post-build upload script sent to a remote agent when it claims the build. Ignored by the local runner. |
+| `build_command` | `""` | Public static Unity method sent to a remote agent. Ignored by the local runner. |
+| `build_path` | `""` | Player output directory passed to the Unity method. Relative paths start at the checkout. |
+| `upload_script` | `""` | Executable repository-relative post-build script. Empty means build without uploading. |
 | `poll_enabled` | `false` | Git polling as an alternative to webhooks. |
 | `poll_interval_secs` | `60` | Floored at **30**; anything lower is rejected with a 400. |
 
@@ -134,16 +135,19 @@ for example `mac`. Executor names are lowercase letters, digits, `-` and `_`, up
 characters. A remote build remains pending in the database until an agent serving that
 queue claims it; it is never sent to the local Docker runner.
 
-`build_command` and `upload_script` are optional, agent-defined configuration. The
-server does not execute or interpret them. It returns both as part of the full project
-object in the successful claim response, and the agent decides what each string means.
+The server returns `build_command`, `build_path`, and `upload_script` as part of the
+full project object in the successful claim response. The Mac agent requires the first
+two for Unity builds and never chooses a game or Steam product from repository YAML.
+The upload script is optional; when present it must be executable and relative to the
+repository root.
 For example:
 
 ```json
 {
   "executor": "mac",
-  "build_command": "BuildBuilder.BuildGameRelease()",
-  "upload_script": "UPLOAD_MAC.sh"
+  "build_command": "BuildBuilder.CommandLineGameRelease",
+  "build_path": "/Users/build/Builds/Windows",
+  "upload_script": "Steam/UPLOAD_MAC.sh"
 }
 ```
 

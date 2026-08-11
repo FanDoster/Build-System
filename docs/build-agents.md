@@ -117,8 +117,9 @@ response in the API that does not strip secrets; treat it accordingly.
 {"build": {"id": 412, "number": 17, "commit_sha": "1bfe15b9", "status": "running", ...},
  "project": {"repo_url": "https://github.com/nmr/ship", "branch": "main",
              "clone_token": "ghp_...", "executor": "mac",
-             "build_command": "BuildBuilder.BuildGameRelease()",
-             "upload_script": "UPLOAD_MAC.sh", ...},
+             "build_command": "BuildBuilder.CommandLineGameRelease",
+             "build_path": "/Users/build/Builds/Windows",
+             "upload_script": "Steam/UPLOAD_MAC.sh", ...},
  "log_offset": 0}
 ```
 
@@ -127,11 +128,12 @@ finish URL. `build.number` is the human-facing sequence within this project. Use
 project-local number in logs, notifications, artifact names, and other operator-facing
 text. Older servers omit `number`, so an agent may fall back to `id` during rollout.
 
-`build_command` and `upload_script` are optional opaque strings configured per project.
-The server stores and transports them but never executes or interprets them; their exact
-grammar belongs to the agent serving that executor. Empty or absent means the operator
-did not configure that phase. An agent must not invent a default that can publish an
-artifact when `upload_script` is empty.
+These values are configured per project. The server stores and transports them but never
+executes them. The Mac agent treats `build_command` as a public static Unity method,
+passes `build_path` to it as `-output`, and runs `upload_script` from its containing
+directory after a successful build. The script must be an executable path relative to
+the checkout. An empty upload script means build only; the agent must not invent an
+upload target.
 
 The returned project is read at claim time, not snapshotted when the build is queued.
 An operator can therefore correct either value for a pending build before an agent
@@ -299,15 +301,15 @@ Do not run it that way anywhere reachable.
 ssh -i ~/.ssh/hermes-linode root@172.239.117.248 'docker exec builds sh -c "curl -s -X PUT \
   -H \"Authorization: Bearer \$BUILDS_PASSWORD\" -H \"X-Builds-Csrf: 1\" \
   -H \"Content-Type: application/json\" \
-  -d \"{\\\"executor\\\":\\\"mac\\\",\\\"build_command\\\":\\\"BuildBuilder.BuildGameRelease()\\\",\\\"upload_script\\\":\\\"UPLOAD_MAC.sh\\\"}\" \
+  -d \"{\\\"executor\\\":\\\"mac\\\",\\\"build_command\\\":\\\"BuildBuilder.CommandLineGameRelease\\\",\\\"build_path\\\":\\\"/Users/build/Builds/Windows\\\",\\\"upload_script\\\":\\\"Steam/UPLOAD_MAC.sh\\\"}\" \
   http://127.0.0.1:8080/api/projects/7"'
 ```
 
-Or set **Executor**, **Build command**, and **Upload script** on the project's settings
+Or set **Executor**, **Build command**, **Build path**, and **Upload script** on the project's settings
 page. Executor names are lowercase letters, digits, `-` and `_`, up to 32 characters.
-The two command fields are optional and may be cleared independently. Changing the
+The three agent fields may be cleared independently. Changing the
 executor back to `local` (or clearing it) returns the project to the Docker runner,
-which ignores both agent-only fields.
+which ignores all agent-only fields.
 
 ## Checking it by hand
 

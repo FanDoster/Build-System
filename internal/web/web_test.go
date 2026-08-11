@@ -127,7 +127,7 @@ func TestSettingsPageRendersWithoutSecretValues(t *testing.T) {
 	p := &models.Project{
 		Name: "app", RepoURL: "https://github.com/u/app", Branch: "main",
 		DockerfilePath: "Dockerfile", ImageName: "app", NoCache: true,
-		BuildCommand: "Build.Release", UploadScript: "upload.sh",
+		BuildCommand: "Build.Release", BuildPath: "/builds/release", UploadScript: "upload.sh",
 		WebhookSecret: "super-webhook-secret", CloneToken: "super-clone-token",
 	}
 	if err := database.CreateProject(p); err != nil {
@@ -143,7 +143,8 @@ func TestSettingsPageRendersWithoutSecretValues(t *testing.T) {
 		`name="name"`, `name="repo_url"`, `name="branch"`, `name="dockerfile_path"`,
 		`name="image_name"`, `name="no_cache"`, `name="deploy_compose_path"`,
 		`name="deploy_service_name"`, `name="webhook_secret"`, `name="clone_token"`,
-		`name="build_command" value="Build.Release"`, `name="upload_script" value="upload.sh"`,
+		`name="build_command" value="Build.Release"`, `name="build_path" value="/builds/release"`,
+		`name="upload_script" value="upload.sh"`,
 		"Danger zone", "clear-webhook", "clear-token",
 	} {
 		if !strings.Contains(body, want) {
@@ -174,6 +175,7 @@ func TestSettingsScriptSavesAgentProjectConfig(t *testing.T) {
 	}
 	for _, want := range []string{
 		"build_command: f.build_command.value.trim()",
+		"build_path: f.build_path.value.trim()",
 		"upload_script: f.upload_script.value.trim()",
 	} {
 		if !strings.Contains(w.Body.String(), want) {

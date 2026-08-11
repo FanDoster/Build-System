@@ -514,6 +514,7 @@
         deploy_compose_path: f.deploy_compose_path.value.trim(),
         deploy_service_name: f.deploy_service_name.value.trim(),
         build_command: f.build_command.value.trim(),
+        build_path: f.build_path.value.trim(),
         upload_script: f.upload_script.value.trim(),
         no_cache: f.no_cache.checked,
         poll_enabled: f.poll_enabled.checked,
