@@ -1160,6 +1160,66 @@ func TestAgentControlsRefuseAnAgentToken(t *testing.T) {
 	}
 }
 
+// The other half of the same line: an agent claims the work it is handed, it
+// does not choose the work. A build machine's token lives in a plaintext config
+// file on that machine, so a token that can start a build of any project can
+// reach every project's clone token through the claim it would then be answered
+// with — and can cancel anyone's build.
+func TestBuildControlsRefuseAnAgentToken(t *testing.T) {
+	s, mux := newAgentServer(t)
+	p := macProject(t, s)
+	b := pending(t, s, p.ID)
+
+	a, err := auth.New(s.DB, "operator-pw", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.SetAgentToken("agent-tok")
+	h := a.Middleware(mux)
+
+	call := func(path, bearer string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", path, nil)
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		req.Header.Set("X-Builds-Csrf", "1")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
+
+	paths := []string{
+		fmt.Sprintf("/api/projects/%d/build", p.ID),
+		buildPath(b.ID, "cancel"),
+		buildPath(b.ID, "rerun"),
+	}
+	for _, path := range paths {
+		if w := call(path, "agent-tok"); w.Code != 403 {
+			t.Errorf("POST %s with an agent token: %d (%s), want 403",
+				path, w.Code, strings.TrimSpace(w.Body.String()))
+		}
+	}
+
+	// A refused request must also have done nothing: no build created, and the
+	// one that was already waiting still waiting.
+	builds, err := s.DB.ListBuildsByProject(p.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(builds) != 1 {
+		t.Errorf("%d builds after three refused requests, want the 1 that was already there", len(builds))
+	}
+	if row, _ := s.DB.GetBuild(b.ID); row.Status != models.StatusPending {
+		t.Errorf("build status = %q, want it left pending", row.Status)
+	}
+
+	// And the operator still gets through all three.
+	for _, path := range paths {
+		if w := call(path, "operator-pw"); w.Code == 403 {
+			t.Errorf("POST %s with the operator password: 403 (%s), want it allowed",
+				path, strings.TrimSpace(w.Body.String()))
+		}
+	}
+}
+
 // An agent named "claim" must not shadow POST /api/agents/claim.
 func TestAnAgentNamedClaimCannotShadowTheClaimEndpoint(t *testing.T) {
 	s, mux := newAgentServer(t)

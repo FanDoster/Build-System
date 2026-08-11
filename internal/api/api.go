@@ -34,7 +34,7 @@ const livePingInterval = 25 * time.Second
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-07-29-agent-health"
+const Version = "2026-07-29-operator-only-builds"
 
 // Agent long-poll defaults. The hold is deliberately under the 60s nginx
 // defaults with room to spare: a claim request that outlives proxy_read_timeout
@@ -153,12 +153,18 @@ func requireCsrf(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// requireOperator refuses agent credentials. An agent token lives in a file on
-// a build machine so that machine can run builds; it must not also be able to
-// change which repositories get built, or point a project at a different one.
+// requireOperator refuses agent credentials. An agent token lives in a plaintext
+// file on a build machine so that machine can run builds; it must not also be
+// able to change which repositories get built, point a project at a different
+// one, or decide what gets built and when.
+//
+// The line is between doing the work and choosing the work. An agent claims what
+// it is handed and reports on it — those endpoints (claim, status, and the
+// log/heartbeat/finish trio) must accept the token, and a 403 from the last
+// three would abandon a build mid-upload. Everything else here is the operator's.
 func requireOperator(w http.ResponseWriter, r *http.Request) bool {
 	if auth.IsAgent(r.Context()) {
-		writeError(w, 403, "agent credentials cannot manage projects")
+		writeError(w, 403, "agent credentials cannot manage projects or builds")
 		return false
 	}
 	return true
@@ -431,6 +437,13 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTriggerBuild(w http.ResponseWriter, r *http.Request) {
 	if !requireCsrf(w, r) {
+		return
+	}
+	// Operator only. An agent is told what to build by the claim it is answered
+	// with; starting a build of any project on the server — including one whose
+	// clone token it would then be handed — is not part of running the work it
+	// was given.
+	if !requireOperator(w, r) {
 		return
 	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
@@ -898,6 +911,12 @@ func (s *Server) handleCancelBuild(w http.ResponseWriter, r *http.Request) {
 	if !requireCsrf(w, r) {
 		return
 	}
+	// Operator only, and safe to gate: an agent never calls this. It hears about
+	// a cancel of its own build in the response to its next heartbeat or log
+	// append, which is why cancelling an agent build here only sets a flag.
+	if !requireOperator(w, r) {
+		return
+	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		writeError(w, 400, "invalid id")
@@ -964,6 +983,11 @@ func (s *Server) handleCancelBuild(w http.ResponseWriter, r *http.Request) {
 // handleRerunBuild creates a fresh build for the same project and ref.
 func (s *Server) handleRerunBuild(w http.ResponseWriter, r *http.Request) {
 	if !requireCsrf(w, r) {
+		return
+	}
+	// Operator only: this creates a build, so an agent token holder could reach
+	// any project through it exactly as it could through the trigger endpoint.
+	if !requireOperator(w, r) {
 		return
 	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)

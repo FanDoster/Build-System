@@ -252,8 +252,16 @@ agent is responsible for not sending its tokens.
 
 Agents authenticate with `BUILDS_AGENT_TOKEN`, a credential separate from
 `BUILDS_PASSWORD` so a build machine never holds the password that signs into the UI. It
-can be rotated on its own, and requests bearing it are refused by the project-management
-endpoints outright.
+can be rotated on its own, and requests bearing it are refused outright by everything
+that manages projects or decides what builds — creating, editing and deleting projects,
+triggering a build, cancelling one, re-running one, and the whole of the `/agents` page's
+operator controls.
+
+The line is between **doing** the work and **choosing** it. The endpoints an agent calls
+— claim, status, and the log/heartbeat/finish trio — accept the token by design; a 403
+from the last three would abandon a build that may already be uploading. Everything else
+answers 403 to an agent token (`requireOperator` in `internal/api/api.go`), and
+`TestBuildControlsRefuseAnAgentToken` pins it.
 
 Generate one and put it in the server's compose environment:
 
