@@ -513,6 +513,8 @@
         image_name: f.image_name.value.trim(),
         deploy_compose_path: f.deploy_compose_path.value.trim(),
         deploy_service_name: f.deploy_service_name.value.trim(),
+        build_command: f.build_command.value.trim(),
+        upload_script: f.upload_script.value.trim(),
         no_cache: f.no_cache.checked,
         poll_enabled: f.poll_enabled.checked,
         poll_interval_secs: parseInt(f.poll_interval_secs.value, 10),

@@ -115,6 +115,7 @@ func TestCreateProjectValidation(t *testing.T) {
 
 	w = doJSON(t, mux, "POST", "/api/projects", map[string]string{
 		"name": "app", "repo_url": "https://github.com/u/app", "image_name": "app",
+		"build_command": "Build.Release", "upload_script": "upload.sh",
 	})
 	if w.Code != 201 {
 		t.Fatalf("create: got %d, want 201: %s", w.Code, w.Body)
@@ -123,6 +124,9 @@ func TestCreateProjectValidation(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &created)
 	if created.Branch != "main" || created.DockerfilePath != "Dockerfile" {
 		t.Errorf("defaults not applied: %+v", created)
+	}
+	if created.BuildCommand != "Build.Release" || created.UploadScript != "upload.sh" {
+		t.Errorf("agent project config not created: %+v", created)
 	}
 
 	// Duplicate name
@@ -159,6 +163,7 @@ func TestUpdateProjectPartialAndClear(t *testing.T) {
 		Name: "app", RepoURL: "https://github.com/u/app", Branch: "main",
 		DockerfilePath: "Dockerfile", ImageName: "app",
 		DeployComposePath: "/srv/compose.yml", DeployServiceName: "web",
+		BuildCommand: "Build.Debug", UploadScript: "upload-debug.sh",
 		WebhookSecret: "whsec", CloneToken: "tok",
 	})
 	path := fmt.Sprintf("/api/projects/%d", p.ID)
@@ -179,6 +184,7 @@ func TestUpdateProjectPartialAndClear(t *testing.T) {
 	// Explicit empty strings clear the deploy config.
 	w = doJSON(t, mux, "PUT", path, map[string]string{
 		"deploy_compose_path": "", "deploy_service_name": "",
+		"build_command": "Build.Release", "upload_script": "upload-release.sh",
 	})
 	if w.Code != 200 {
 		t.Fatalf("clear: got %d: %s", w.Code, w.Body)
@@ -186,6 +192,9 @@ func TestUpdateProjectPartialAndClear(t *testing.T) {
 	got, _ = s.DB.GetProject(p.ID)
 	if got.DeployComposePath != "" || got.DeployServiceName != "" {
 		t.Errorf("deploy config not cleared: %+v", got)
+	}
+	if got.BuildCommand != "Build.Release" || got.UploadScript != "upload-release.sh" {
+		t.Errorf("agent project config not updated: %+v", got)
 	}
 
 	// Required fields cannot be cleared.

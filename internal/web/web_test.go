@@ -87,6 +87,7 @@ func TestSettingsPageRendersWithoutSecretValues(t *testing.T) {
 	p := &models.Project{
 		Name: "app", RepoURL: "https://github.com/u/app", Branch: "main",
 		DockerfilePath: "Dockerfile", ImageName: "app", NoCache: true,
+		BuildCommand: "Build.Release", UploadScript: "upload.sh",
 		WebhookSecret: "super-webhook-secret", CloneToken: "super-clone-token",
 	}
 	if err := database.CreateProject(p); err != nil {
@@ -102,6 +103,7 @@ func TestSettingsPageRendersWithoutSecretValues(t *testing.T) {
 		`name="name"`, `name="repo_url"`, `name="branch"`, `name="dockerfile_path"`,
 		`name="image_name"`, `name="no_cache"`, `name="deploy_compose_path"`,
 		`name="deploy_service_name"`, `name="webhook_secret"`, `name="clone_token"`,
+		`name="build_command" value="Build.Release"`, `name="upload_script" value="upload.sh"`,
 		"Danger zone", "clear-webhook", "clear-token",
 	} {
 		if !strings.Contains(body, want) {
@@ -118,6 +120,25 @@ func TestSettingsPageRendersWithoutSecretValues(t *testing.T) {
 	}
 	if w := get(t, mux, "/projects/999/settings"); w.Code != 404 {
 		t.Errorf("missing project settings: got %d, want 404", w.Code)
+	}
+}
+
+// The settings form is submitted by JavaScript rather than as a native form.
+// Rendering an input is therefore not enough: every field must also be copied
+// into the JSON payload sent to the project API.
+func TestSettingsScriptSavesAgentProjectConfig(t *testing.T) {
+	_, mux := setup(t)
+	w := get(t, mux, "/static/js/app.js")
+	if w.Code != 200 {
+		t.Fatalf("settings script: got %d", w.Code)
+	}
+	for _, want := range []string{
+		"build_command: f.build_command.value.trim()",
+		"upload_script: f.upload_script.value.trim()",
+	} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Errorf("settings script does not save %q", want)
+		}
 	}
 }
 
