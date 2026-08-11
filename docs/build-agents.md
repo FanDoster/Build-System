@@ -116,9 +116,22 @@ response in the API that does not strip secrets; treat it accordingly.
 ```json
 {"build": {"id": 412, "commit_sha": "1bfe15b9", "status": "running", ...},
  "project": {"repo_url": "https://github.com/nmr/ship", "branch": "main",
-             "clone_token": "ghp_...", "executor": "mac", ...},
+             "clone_token": "ghp_...", "executor": "mac",
+             "build_command": "BuildBuilder.BuildGameRelease()",
+             "upload_script": "UPLOAD_MAC.sh", ...},
  "log_offset": 0}
 ```
+
+`build_command` and `upload_script` are optional opaque strings configured per project.
+The server stores and transports them but never executes or interprets them; their exact
+grammar belongs to the agent serving that executor. Empty or absent means the operator
+did not configure that phase. An agent must not invent a default that can publish an
+artifact when `upload_script` is empty.
+
+The returned project is read at claim time, not snapshotted when the build is queued.
+An operator can therefore correct either value for a pending build before an agent
+claims it. Once the response has been handed to an agent, later project edits do not
+alter that running build's local copy.
 
 **Start logging at `log_offset`, not at 0.** It is almost always 0, but a build
 can arrive carrying an earlier attempt's output — it was requeued while its project
@@ -280,13 +293,16 @@ Do not run it that way anywhere reachable.
 ```bash
 ssh -i ~/.ssh/hermes-linode root@172.239.117.248 'docker exec builds sh -c "curl -s -X PUT \
   -H \"Authorization: Bearer \$BUILDS_PASSWORD\" -H \"X-Builds-Csrf: 1\" \
-  -H \"Content-Type: application/json\" -d \"{\\\"executor\\\":\\\"mac\\\"}\" \
+  -H \"Content-Type: application/json\" \
+  -d \"{\\\"executor\\\":\\\"mac\\\",\\\"build_command\\\":\\\"BuildBuilder.BuildGameRelease()\\\",\\\"upload_script\\\":\\\"UPLOAD_MAC.sh\\\"}\" \
   http://127.0.0.1:8080/api/projects/7"'
 ```
 
-Or set **Executor** on the project's settings page. Executor names are lowercase letters,
-digits, `-` and `_`, up to 32 characters. Changing it back to `local` (or clearing it)
-returns the project to the Docker runner.
+Or set **Executor**, **Build command**, and **Upload script** on the project's settings
+page. Executor names are lowercase letters, digits, `-` and `_`, up to 32 characters.
+The two command fields are optional and may be cleared independently. Changing the
+executor back to `local` (or clearing it) returns the project to the Docker runner,
+which ignores both agent-only fields.
 
 ## Checking it by hand
 

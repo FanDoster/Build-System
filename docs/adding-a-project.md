@@ -112,6 +112,9 @@ their current value, so you can send just the one you're changing.
 | `no_cache` | `false` | Passes `--no-cache` to `docker build`. Turn on if you hit stale layers. |
 | `webhook_secret` | `""` | HMAC secret for GitHub push events. Write-only in the UI. |
 | `clone_token` | `""` | PAT for private repos. Write-only, scrubbed from logs. |
+| `executor` | `local` | `local` uses the Docker runner; any other value names a queue served by a remote build agent. |
+| `build_command` | `""` | Opaque build method or command sent to a remote agent when it claims the build. Ignored by the local runner. |
+| `upload_script` | `""` | Opaque post-build upload script sent to a remote agent when it claims the build. Ignored by the local runner. |
 | `poll_enabled` | `false` | Git polling as an alternative to webhooks. |
 | `poll_interval_secs` | `60` | Floored at **30**; anything lower is rejected with a 400. |
 
@@ -119,6 +122,31 @@ Secrets are write-only: `GET`/list responses never return `webhook_secret` or
 `clone_token`, and the settings page only tells you whether one is set. To clear one,
 send an explicit empty string (the UI has a "clear" checkbox); omitting the field keeps
 the current value.
+
+### Remote-agent projects
+
+Set `executor` to the queue name advertised by the machine that should run the build,
+for example `mac`. Executor names are lowercase letters, digits, `-` and `_`, up to 32
+characters. A remote build remains pending in the database until an agent serving that
+queue claims it; it is never sent to the local Docker runner.
+
+`build_command` and `upload_script` are optional, agent-defined configuration. The
+server does not execute or interpret them. It returns both as part of the full project
+object in the successful claim response, and the agent decides what each string means.
+For example:
+
+```json
+{
+  "executor": "mac",
+  "build_command": "BuildBuilder.BuildGameRelease()",
+  "upload_script": "UPLOAD_MAC.sh"
+}
+```
+
+The project is read when the build is claimed, rather than copied into the build row.
+Consequently, edits affect pending builds that have not yet been claimed; they do not
+change configuration already handed to a running agent. See
+[build-agents.md](build-agents.md) for the claim protocol and failure semantics.
 
 ---
 

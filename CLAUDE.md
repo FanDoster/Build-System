@@ -77,6 +77,12 @@ all three gate on `models.Remote(executor)`; miss one and a Unity build gets han
 the Docker runner. The protocol, timings and the janitor rules that follow from it are
 in [docs/build-agents.md](docs/build-agents.md).
 
+`projects.build_command` and `projects.upload_script` are opaque remote-agent
+configuration. They deliberately live on the project, not the build: a successful claim
+reads the current full project row and hands both values to the agent. The server and
+local runner must not interpret them. This means an edit applies to work still pending,
+while a running agent keeps the values it already received.
+
 Two consequences worth holding on to here:
 
 - **The janitor cannot use "not mine" to mean "dead" for agent rows.** They are stale
