@@ -114,13 +114,18 @@ agent has to authenticate the same private clone the local runner would. This is
 response in the API that does not strip secrets; treat it accordingly.
 
 ```json
-{"build": {"id": 412, "commit_sha": "1bfe15b9", "status": "running", ...},
+{"build": {"id": 412, "number": 17, "commit_sha": "1bfe15b9", "status": "running", ...},
  "project": {"repo_url": "https://github.com/nmr/ship", "branch": "main",
              "clone_token": "ghp_...", "executor": "mac",
              "build_command": "BuildBuilder.BuildGameRelease()",
              "upload_script": "UPLOAD_MAC.sh", ...},
  "log_offset": 0}
 ```
+
+`build.id` is the server-wide database key. Use it in every log, heartbeat, and
+finish URL. `build.number` is the human-facing sequence within this project. Use the
+project-local number in logs, notifications, artifact names, and other operator-facing
+text. Older servers omit `number`, so an agent may fall back to `id` during rollout.
 
 `build_command` and `upload_script` are optional opaque strings configured per project.
 The server stores and transports them but never executes or interprets them; their exact

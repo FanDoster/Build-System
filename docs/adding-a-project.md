@@ -73,6 +73,10 @@ Two rules that will otherwise cost you an afternoon:
 
 `/api/health` needs no auth and is the quickest liveness check.
 
+Build responses contain two identifiers. `id` is the server-wide key used in API and
+page URLs. `number` starts at 1 for each project and is the number shown to operators.
+Existing histories are numbered from oldest to newest during the database migration.
+
 ---
 
 ## Step 1: create the project
@@ -504,6 +508,8 @@ inside the container). `†` = requires `X-Builds-Csrf: 1`.
 | `POST` | `/api/builds/{id}/cancel` † | Cancel queued or running. |
 | `POST` | `/api/builds/{id}/rerun` † | New build, same commit. |
 | `POST` | `/api/webhook/github` | GitHub push events. No auth (HMAC instead). |
+
+The `{id}` path parameter is always the global `id`, not the project-local `number`.
 
 ---
 

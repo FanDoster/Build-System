@@ -34,7 +34,7 @@ const livePingInterval = 25 * time.Second
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-08-11-agent-project-config"
+const Version = "2026-08-11-project-build-numbers"
 
 // Agent long-poll defaults. The hold is deliberately under the 60s nginx
 // defaults with room to spare: a claim request that outlives proxy_read_timeout
@@ -695,7 +695,7 @@ func (s *Server) handleBuildLog(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Build-Status", string(build.Status))
 	if r.URL.Query().Get("download") == "1" {
 		w.Header().Set("Content-Disposition",
-			fmt.Sprintf(`attachment; filename="%s-build-%d.log"`, asciiFilename(build.ProjectName), build.ID))
+			fmt.Sprintf(`attachment; filename="%s-build-%d.log"`, asciiFilename(build.ProjectName), build.Number))
 	}
 	w.WriteHeader(200)
 	w.Write(body)
@@ -1010,7 +1010,7 @@ func (s *Server) handleRerunBuild(w http.ResponseWriter, r *http.Request) {
 		ProjectID:     src.ProjectID,
 		Status:        models.StatusPending,
 		CommitSHA:     src.CommitSHA,
-		CommitMessage: truncate(fmt.Sprintf("Re-run of #%d: %s", src.ID, src.CommitMessage), 100),
+		CommitMessage: truncate(fmt.Sprintf("Re-run of #%d: %s", src.Number, src.CommitMessage), 100),
 	}
 	if err := s.DB.CreateBuild(build); err != nil {
 		writeError(w, 500, err.Error())

@@ -103,7 +103,10 @@ func (p *Project) Sanitize() {
 const MaxBuildRequeues = 2
 
 type Build struct {
-	ID            int64       `json:"id"`
+	ID int64 `json:"id"`
+	// Number is the human-facing sequence within this project. ID remains the
+	// global database key used by URLs and the agent protocol.
+	Number        int64       `json:"number"`
 	ProjectID     int64       `json:"project_id"`
 	ProjectName   string      `json:"project_name,omitempty"`
 	Status        BuildStatus `json:"status"`

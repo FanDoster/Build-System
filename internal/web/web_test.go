@@ -71,6 +71,46 @@ func TestPagesRenderWithFinishedBuild(t *testing.T) {
 	}
 }
 
+func TestBuildPagesShowProjectLocalNumber(t *testing.T) {
+	database, mux := setup(t)
+	makeProject := func(name string) *models.Project {
+		p := &models.Project{
+			Name: name, RepoURL: "https://github.com/u/" + name, Branch: "main",
+			DockerfilePath: "Dockerfile", ImageName: name,
+		}
+		if err := database.CreateProject(p); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	firstProject := makeProject("first")
+	project := makeProject("other")
+	if err := database.CreateBuild(&models.Build{ProjectID: firstProject.ID, Status: models.StatusPending}); err != nil {
+		t.Fatal(err)
+	}
+	build := &models.Build{ProjectID: project.ID, Status: models.StatusPending}
+	if err := database.CreateBuild(build); err != nil {
+		t.Fatal(err)
+	}
+	if build.ID == build.Number {
+		t.Fatal("test needs different global and project-local identifiers")
+	}
+
+	page := get(t, mux, fmt.Sprintf("/builds/%d", build.ID)).Body.String()
+	if !strings.Contains(page, "Build #1") || strings.Contains(page, fmt.Sprintf("Build #%d", build.ID)) {
+		t.Errorf("build page did not use project-local number:\n%s", page)
+	}
+	projectPage := get(t, mux, fmt.Sprintf("/projects/%d", project.ID)).Body.String()
+	wantLink := fmt.Sprintf(`/builds/%d">1</a>`, build.ID)
+	if !strings.Contains(projectPage, wantLink) {
+		t.Errorf("project history missing local-number link %q", wantLink)
+	}
+	dashboard := get(t, mux, "/").Body.String()
+	if !strings.Contains(dashboard, "other #1") {
+		t.Error("dashboard did not show the project-local build number")
+	}
+}
+
 func TestNotFoundAndBadIDs(t *testing.T) {
 	_, mux := setup(t)
 	if w := get(t, mux, "/projects/999"); w.Code != 404 {
@@ -138,6 +178,23 @@ func TestSettingsScriptSavesAgentProjectConfig(t *testing.T) {
 	} {
 		if !strings.Contains(w.Body.String(), want) {
 			t.Errorf("settings script does not save %q", want)
+		}
+	}
+}
+
+func TestLiveViewsShowProjectBuildNumber(t *testing.T) {
+	_, mux := setup(t)
+	w := get(t, mux, "/static/js/app.js")
+	if w.Code != 200 {
+		t.Fatalf("app script: got %d", w.Code)
+	}
+	for _, want := range []string{
+		"' #' + b.number",
+		"String(b.number)",
+		"'#' + a.current.number",
+	} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Errorf("live view does not display project build number via %q", want)
 		}
 	}
 }

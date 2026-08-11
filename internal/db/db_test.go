@@ -79,6 +79,9 @@ func TestBuildLifecycle(t *testing.T) {
 	if err := d.CreateBuild(b); err != nil {
 		t.Fatalf("create build: %v", err)
 	}
+	if b.Number != 1 {
+		t.Fatalf("first project build number = %d, want 1", b.Number)
+	}
 
 	if err := d.UpdateBuildStatus(b.ID, models.StatusRunning, "started\n"); err != nil {
 		t.Fatalf("running: %v", err)
@@ -105,6 +108,67 @@ func TestBuildLifecycle(t *testing.T) {
 	}
 	if got.ProjectName != "app" {
 		t.Errorf("project name not joined: %q", got.ProjectName)
+	}
+}
+
+func TestBuildNumbersArePerProjectAndHistoricalRowsAreBackfilled(t *testing.T) {
+	d := openTestDB(t)
+	p1 := newProject(t, d)
+	p2 := &models.Project{
+		Name: "other", RepoURL: "https://github.com/u/other", Branch: "main",
+		DockerfilePath: "Dockerfile", ImageName: "other",
+	}
+	if err := d.CreateProject(p2); err != nil {
+		t.Fatal(err)
+	}
+
+	first := &models.Build{ProjectID: p1.ID, Status: models.StatusPending}
+	other := &models.Build{ProjectID: p2.ID, Status: models.StatusPending}
+	second := &models.Build{ProjectID: p1.ID, Status: models.StatusPending}
+	for _, b := range []*models.Build{first, other, second} {
+		if err := d.CreateBuild(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if first.Number != 1 || other.Number != 1 || second.Number != 2 {
+		t.Fatalf("new build numbers = %d, %d, %d; want 1, 1, 2",
+			first.Number, other.Number, second.Number)
+	}
+
+	// Simulate a database from before project-local numbers existed. Migration
+	// must number the complete history deterministically, not start new builds
+	// at one while leaving old rows unnamed.
+	if _, err := d.conn.Exec(`DROP INDEX idx_builds_project_number`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.conn.Exec(`ALTER TABLE builds DROP COLUMN project_build_number`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.migrate(); err != nil { // idempotent on every server restart
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		id, want int64
+	}{{first.ID, 1}, {other.ID, 1}, {second.ID, 2}} {
+		got, err := d.GetBuild(tc.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Number != tc.want {
+			t.Errorf("historical build id %d number = %d, want %d", tc.id, got.Number, tc.want)
+		}
+	}
+
+	next := &models.Build{ProjectID: p1.ID, Status: models.StatusPending}
+	if err := d.CreateBuild(next); err != nil {
+		t.Fatal(err)
+	}
+	if next.Number != 3 {
+		t.Errorf("first build after backfill = #%d, want #3", next.Number)
 	}
 }
 

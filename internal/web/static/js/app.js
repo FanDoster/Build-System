@@ -153,7 +153,7 @@
       if (a.current) {
         var cur = el('div', 'agent-current');
         cur.appendChild(document.createTextNode('building '));
-        var link = el('a', null, '#' + a.current.id);
+        var link = el('a', null, '#' + a.current.number);
         link.href = base + '/builds/' + a.current.id;
         cur.appendChild(link);
         cur.appendChild(document.createTextNode(' ' + (a.current.project || '')));
@@ -270,7 +270,7 @@
         var rec = el('div', 'agent-recent');
         for (var j = 0; j < a.recent.length; j++) {
           var b = a.recent[j];
-          var chip = el('a', 'chip chip-' + b.status, '#' + b.id);
+          var chip = el('a', 'chip chip-' + b.status, '#' + b.number);
           chip.href = base + '/builds/' + b.id;
           chip.title = (b.project || '') + ' — ' + b.status + (b.duration ? ' in ' + b.duration : '');
           rec.appendChild(chip);
@@ -658,7 +658,7 @@
       var card = el('div', 'card');
       var header = el('div', 'card-header');
       var left = el('div');
-      left.appendChild(buildLink(b, 'card-title', (b.project_name || 'build') + ' #' + b.id));
+      left.appendChild(buildLink(b, 'card-title', (b.project_name || 'build') + ' #' + b.number));
       left.appendChild(el('div', 'meta', b.commit_message || ''));
       header.appendChild(left);
       header.appendChild(el('span', 'badge badge-' + b.status, b.status));
@@ -673,7 +673,7 @@
     function buildRow(b) {
       var tr = el('tr');
       var idCell = el('td');
-      idCell.appendChild(buildLink(b, null, String(b.id)));
+      idCell.appendChild(buildLink(b, null, String(b.number)));
       tr.appendChild(idCell);
       tr.appendChild(el('td', 'meta', b.commit_sha || ''));
       tr.appendChild(el('td', null, b.commit_message || ''));

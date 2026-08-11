@@ -530,7 +530,7 @@ func TestBuildLogEndpoint(t *testing.T) {
 	}
 	// Download disposition.
 	w = doJSON(t, mux, "GET", fmt.Sprintf("/api/builds/%d/log?download=1", b.ID), nil)
-	if cd := w.Header().Get("Content-Disposition"); !strings.Contains(cd, "attachment") || !strings.Contains(cd, fmt.Sprintf("build-%d.log", b.ID)) {
+	if cd := w.Header().Get("Content-Disposition"); !strings.Contains(cd, "attachment") || !strings.Contains(cd, fmt.Sprintf("build-%d.log", b.Number)) {
 		t.Errorf("disposition = %q", cd)
 	}
 
@@ -640,7 +640,7 @@ func TestRerunEndpoint(t *testing.T) {
 	if nb.ID == src.ID || nb.CommitSHA != src.CommitSHA || nb.Status != models.StatusPending {
 		t.Errorf("new build wrong: %+v", nb)
 	}
-	if !strings.Contains(nb.CommitMessage, fmt.Sprintf("Re-run of #%d", src.ID)) {
+	if !strings.Contains(nb.CommitMessage, fmt.Sprintf("Re-run of #%d", src.Number)) {
 		t.Errorf("commit message = %q", nb.CommitMessage)
 	}
 	select {

@@ -71,7 +71,7 @@
 
           {{if .Current}}
             <div class="agent-current">
-              building <a href="{{$.BasePath}}/builds/{{.Current.ID}}">#{{.Current.ID}}</a>
+              building <a href="{{$.BasePath}}/builds/{{.Current.ID}}">#{{.Current.Number}}</a>
               {{.Current.Project}}
               {{if .Current.Step}}· step <span class="mono">{{.Current.Step}}</span>{{end}}
               {{if .Current.StepDetail}}<span class="agent-step-detail">{{.Current.StepDetail}}</span>{{end}}
@@ -142,7 +142,7 @@
 
           {{if .Recent}}
             <div class="agent-recent">
-              {{range .Recent}}<a class="chip chip-{{.Status}}" href="{{$.BasePath}}/builds/{{.ID}}" title="{{.Project}} — {{.Status}}{{if .Duration}} in {{.Duration}}{{end}}">#{{.ID}}</a>{{end}}
+              {{range .Recent}}<a class="chip chip-{{.Status}}" href="{{$.BasePath}}/builds/{{.ID}}" title="{{.Project}} — {{.Status}}{{if .Duration}} in {{.Duration}}{{end}}">#{{.Number}}</a>{{end}}
             </div>
           {{end}}
 

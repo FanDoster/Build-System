@@ -34,7 +34,7 @@
   <tbody data-live-list data-live-kind="row" data-live-project="{{.Project.ID}}" data-live-limit="20">
     {{range .Builds}}
     <tr data-live-build="{{.ID}}" data-status="{{.Status}}">
-      <td><a href="{{$.BasePath}}/builds/{{.ID}}">{{.ID}}</a></td>
+      <td><a href="{{$.BasePath}}/builds/{{.ID}}">{{.Number}}</a></td>
       <td class="meta">{{.CommitSHA}}</td>
       <td>{{.CommitMessage}}</td>
       <td><span class="badge badge-{{.Status}}">{{.Status}}</span></td>

@@ -83,6 +83,12 @@ reads the current full project row and hands both values to the agent. The serve
 local runner must not interpret them. This means an edit applies to work still pending,
 while a running agent keeps the values it already received.
 
+Builds have two identities. `builds.id` is the global database key and remains the key
+for routes, agent callbacks, the log bus and internal maps. `builds.project_build_number`
+is immutable and starts at 1 inside each project; it is the only number operator-facing
+text should display. Migration backfills it by `(created_at, id)` and a unique index on
+`(project_id, project_build_number)` guards both the history and future inserts.
+
 Two consequences worth holding on to here:
 
 - **The janitor cannot use "not mine" to mean "dead" for agent rows.** They are stale

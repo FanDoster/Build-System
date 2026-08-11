@@ -30,7 +30,7 @@
       <div class="card" data-live-build="{{.ID}}" data-status="{{.Status}}">
         <div class="card-header">
           <div>
-            <a href="{{$.BasePath}}/builds/{{.ID}}" class="card-title">{{.ProjectName}} #{{.ID}}</a>
+            <a href="{{$.BasePath}}/builds/{{.ID}}" class="card-title">{{.ProjectName}} #{{.Number}}</a>
             <div class="meta">{{.CommitMessage}}</div>
           </div>
           <span class="badge badge-{{.Status}}">{{.Status}}</span>

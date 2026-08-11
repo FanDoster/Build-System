@@ -35,6 +35,7 @@ var stepRE = regexp.MustCompile(`##\[step:([a-z]+)\] ?(.*)`)
 // CurrentBuild is what an agent is doing now.
 type CurrentBuild struct {
 	ID        int64  `json:"id"`
+	Number    int64  `json:"number"`
 	Project   string `json:"project"`
 	CommitSHA string `json:"commit_sha"`
 	Step      string `json:"step,omitempty"`
@@ -49,6 +50,7 @@ type CurrentBuild struct {
 // RecentBuild is one line of history.
 type RecentBuild struct {
 	ID       int64  `json:"id"`
+	Number   int64  `json:"number"`
 	Project  string `json:"project"`
 	Status   string `json:"status"`
 	Duration string `json:"duration,omitempty"`
@@ -492,6 +494,7 @@ func fill(src Source, a *Agent) error {
 	if running != nil {
 		cur := &CurrentBuild{
 			ID:          running.ID,
+			Number:      running.Number,
 			Project:     running.ProjectName,
 			CommitSHA:   running.CommitSHA,
 			StartedAt:   running.StartedAt,
@@ -532,7 +535,7 @@ func fill(src Source, a *Agent) error {
 	counting := true
 	for _, b := range recent {
 		a.Recent = append(a.Recent, RecentBuild{
-			ID: b.ID, Project: b.ProjectName, Status: string(b.Status), Duration: b.Duration(),
+			ID: b.ID, Number: b.Number, Project: b.ProjectName, Status: string(b.Status), Duration: b.Duration(),
 		})
 		if !counting {
 			continue

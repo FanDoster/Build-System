@@ -2,11 +2,11 @@
 <nav class="crumbs">
   <a href="{{$.BasePath}}/projects/{{.Build.ProjectID}}">{{.Build.ProjectName}}</a>
   <span class="crumbs-sep">/</span>
-  <span class="crumbs-cur">Build #{{.Build.ID}}</span>
+  <span class="crumbs-cur">Build #{{.Build.Number}}</span>
 </nav>
 
 <div class="title-row">
-  <h1 class="build-title" id="build-title">Build #{{.Build.ID}}</h1>
+  <h1 class="build-title" id="build-title">Build #{{.Build.Number}}</h1>
   <span id="status-chip" class="status-chip status-chip--{{.Build.Status}}"><span class="status-chip-icon"></span>{{.Build.Status}}</span>
   <div class="actions">
     <button id="btn-cancel" class="btn btn-danger" {{if not (or (eq .Build.Status "pending") (eq .Build.Status "running"))}}hidden{{end}}>Cancel</button>

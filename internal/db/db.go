@@ -77,6 +77,7 @@ func (d *DB) migrate() error {
 		CREATE TABLE IF NOT EXISTS builds (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+			project_build_number INTEGER NOT NULL DEFAULT 0,
 			status TEXT NOT NULL DEFAULT 'pending',
 			commit_sha TEXT NOT NULL DEFAULT '',
 			commit_message TEXT NOT NULL DEFAULT '',
@@ -134,12 +135,35 @@ func (d *DB) migrate() error {
 		{"builds", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"},
 		{"projects", "build_command", "TEXT NOT NULL DEFAULT ''"},
 		{"projects", "upload_script", "TEXT NOT NULL DEFAULT ''"},
+		{"builds", "project_build_number", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := d.addColumnIfMissing(c.table, c.column, c.decl); err != nil {
 			return err
 		}
 	}
-	return nil
+
+	// Builds were historically identified to operators by their global row ID.
+	// Number every existing project's history from oldest to newest. The ID is
+	// the deterministic tie-breaker because created_at has only second precision.
+	// Restricting the UPDATE to zero makes this idempotent and leaves numbers
+	// immutable after their first assignment.
+	_, err = d.conn.Exec(`
+		WITH numbered AS (
+			SELECT id, ROW_NUMBER() OVER (
+				PARTITION BY project_id ORDER BY created_at ASC, id ASC
+			) AS number
+			FROM builds
+		)
+		UPDATE builds
+		SET project_build_number = (
+			SELECT number FROM numbered WHERE numbered.id = builds.id
+		)
+		WHERE project_build_number = 0;
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_builds_project_number
+		ON builds(project_id, project_build_number);
+	`)
+	return err
 }
 
 // addColumnIfMissing runs ALTER TABLE ADD COLUMN only when the column is
@@ -354,25 +378,28 @@ func (d *DB) DeleteProject(id int64) error {
 
 func (d *DB) CreateBuild(b *models.Build) error {
 	res, err := d.conn.Exec(
-		`INSERT INTO builds (project_id, status, commit_sha, commit_message, created_at)
-		 VALUES (?, ?, ?, ?, datetime('now'))`,
-		b.ProjectID, b.Status, b.CommitSHA, b.CommitMessage,
+		`INSERT INTO builds (project_id, project_build_number, status, commit_sha, commit_message, created_at)
+		 VALUES (?, (SELECT COALESCE(MAX(project_build_number), 0) + 1 FROM builds WHERE project_id = ?),
+		         ?, ?, ?, datetime('now'))`,
+		b.ProjectID, b.ProjectID, b.Status, b.CommitSHA, b.CommitMessage,
 	)
 	if err != nil {
 		return err
 	}
 	b.ID, _ = res.LastInsertId()
-	return nil
+	return d.conn.QueryRow(
+		`SELECT project_build_number FROM builds WHERE id = ?`, b.ID,
+	).Scan(&b.Number)
 }
 
 // buildCols is the full read column list; scanBuild consumes it in order.
-const buildCols = `b.id, b.project_id, p.name, b.status, b.commit_sha, b.commit_message,
+const buildCols = `b.id, b.project_build_number, b.project_id, p.name, b.status, b.commit_sha, b.commit_message,
 	b.log, b.requeues, b.started_at, b.finished_at, b.created_at,
 	p.executor, b.agent, b.last_heartbeat_at, b.cancel_requested`
 
 func scanBuild(s scanner) (*models.Build, error) {
 	b := &models.Build{}
-	err := s.Scan(&b.ID, &b.ProjectID, &b.ProjectName, &b.Status, &b.CommitSHA, &b.CommitMessage,
+	err := s.Scan(&b.ID, &b.Number, &b.ProjectID, &b.ProjectName, &b.Status, &b.CommitSHA, &b.CommitMessage,
 		&b.Log, &b.Requeues, &b.StartedAt, &b.FinishedAt, &b.CreatedAt,
 		&b.Executor, &b.Agent, &b.LastHeartbeatAt, &b.CancelRequested)
 	if err != nil {
@@ -443,13 +470,13 @@ func (d *DB) ListRecentBuilds(limit int) ([]models.Build, error) {
 // consumes it in order. The live dashboard feed re-reads the recent builds
 // every second; pulling every row's full log along with them would make that
 // cost proportional to log size for data no list view ever renders.
-const buildSummaryCols = `b.id, b.project_id, p.name, b.status, b.commit_sha, b.commit_message,
+const buildSummaryCols = `b.id, b.project_build_number, b.project_id, p.name, b.status, b.commit_sha, b.commit_message,
 	b.requeues, b.started_at, b.finished_at, b.created_at,
 	p.executor, b.agent, b.last_heartbeat_at, b.cancel_requested`
 
 func scanBuildSummary(s scanner) (*models.Build, error) {
 	b := &models.Build{}
-	err := s.Scan(&b.ID, &b.ProjectID, &b.ProjectName, &b.Status, &b.CommitSHA, &b.CommitMessage,
+	err := s.Scan(&b.ID, &b.Number, &b.ProjectID, &b.ProjectName, &b.Status, &b.CommitSHA, &b.CommitMessage,
 		&b.Requeues, &b.StartedAt, &b.FinishedAt, &b.CreatedAt,
 		&b.Executor, &b.Agent, &b.LastHeartbeatAt, &b.CancelRequested)
 	if err != nil {

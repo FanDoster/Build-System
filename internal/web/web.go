@@ -200,7 +200,7 @@ func (h *Handler) handleBuild(w http.ResponseWriter, r *http.Request) {
 		queuePos, _ = h.DB.QueuePosition(build.ID)
 	}
 	h.render(w, r, "build", map[string]interface{}{
-		"Title":    build.ProjectName + " #" + strconv.FormatInt(build.ID, 10),
+		"Title":    build.ProjectName + " #" + strconv.FormatInt(build.Number, 10),
 		"Build":    build,
 		"Project":  project,
 		"QueuePos": queuePos,
