@@ -526,9 +526,14 @@ func scrubSecret(s, secret string) string {
 	return s
 }
 
+// GitSSHCommand uses only the read-only, repo-scoped deploy key and a pinned
+// host-key file. A missing mount fails closed instead of trusting a new key.
+// The poller uses this same command so clone and ls-remote agree.
+const GitSSHCommand = "ssh -i /run/builds-ssh/townhall_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/run/builds-ssh/known_hosts -o GlobalKnownHostsFile=/dev/null"
+
 func newCmd(ctx context.Context, sink *logSink, name string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=no")
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND="+GitSSHCommand)
 	// Identical writer for both streams: os/exec then serializes Writes on a
 	// single pipe, preserving interleaving.
 	cmd.Stdout = sink

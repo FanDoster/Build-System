@@ -248,7 +248,7 @@ func gitLsRemote(ctx context.Context, repoURL, branch string) (string, error) {
 	// "--" separates the URL from the ref pattern so neither can be read as an
 	// option, whatever the project settings contain.
 	cmd := exec.CommandContext(ctx, "git", "ls-remote", "--heads", "--", repoURL, "refs/heads/"+branch)
-	cmd.Env = append(cmd.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=no -o BatchMode=yes")
+	cmd.Env = append(cmd.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND="+runner.GitSSHCommand)
 	var out, stderr bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr

@@ -16,8 +16,11 @@ FROM alpine:3.20
 # supporting LFS at all, which is why the tool and `git lfs install` belong
 # together and neither is optional. The build agent hit the loud version of this
 # on 2026-07-30; this is the quiet one.
-RUN apk add --no-cache git git-lfs docker-cli docker-cli-compose ca-certificates curl \
- && git lfs install --system
+RUN apk add --no-cache git git-lfs openssh-client docker-cli docker-cli-compose ca-certificates curl \
+ && git lfs install --system \
+ && mkdir -p /run/builds-ssh \
+ && addgroup -S -g 10001 builds \
+ && adduser -S -D -H -u 10001 -G builds -h /tmp -s /sbin/nologin builds
 
 COPY --from=builder /builds /usr/local/bin/builds
 
