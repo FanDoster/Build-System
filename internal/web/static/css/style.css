@@ -127,7 +127,7 @@ h2 { font-size: 20px; margin-bottom: 16px; }
   font-size: 14px;
   font-family: inherit;
 }
-.form-group input:focus { border-color: var(--accent); outline: none; }
+.form-group input:focus, .form-group textarea:focus, .form-group select:focus { border-color: var(--accent); outline: none; }
 
 /* Log output — see "Build page" section below for the full component */
 

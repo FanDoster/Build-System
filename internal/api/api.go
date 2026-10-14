@@ -34,7 +34,7 @@ const livePingInterval = 25 * time.Second
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-08-11-server-project-build-config"
+const Version = "2026-10-14-unity-windows-shared-queue"
 
 // Agent long-poll defaults. The hold is deliberately under the 60s nginx
 // defaults with room to spare: a claim request that outlives proxy_read_timeout
@@ -217,10 +217,22 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	if !requireOperator(w, r) {
 		return
 	}
-	var p models.Project
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+	var input struct {
+		models.Project
+		ExecutorProfiles json.RawMessage `json:"executor_profiles"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		writeError(w, 400, "invalid JSON: "+err.Error())
 		return
+	}
+	p := input.Project
+	if input.ExecutorProfiles != nil {
+		profiles, err := parseExecutorProfiles(input.ExecutorProfiles)
+		if err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		p.ExecutorProfiles = profiles
 	}
 	if p.Name == "" || p.RepoURL == "" || p.ImageName == "" {
 		writeError(w, 400, "name, repo_url, image_name are required")
@@ -240,6 +252,10 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := validExecutor(p.Executor); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	if err := validExecutorProfiles(&p); err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
@@ -294,22 +310,23 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 	// Pointer fields distinguish "not provided" (nil, keep current value)
 	// from "provided as empty" (clear the value where that is allowed).
 	var updates struct {
-		Name              *string `json:"name"`
-		RepoURL           *string `json:"repo_url"`
-		Branch            *string `json:"branch"`
-		DockerfilePath    *string `json:"dockerfile_path"`
-		ImageName         *string `json:"image_name"`
-		DeployComposePath *string `json:"deploy_compose_path"`
-		DeployServiceName *string `json:"deploy_service_name"`
-		WebhookSecret     *string `json:"webhook_secret"`
-		CloneToken        *string `json:"clone_token"`
-		NoCache           *bool   `json:"no_cache"`
-		PollEnabled       *bool   `json:"poll_enabled"`
-		PollIntervalSecs  *int    `json:"poll_interval_secs"`
-		Executor          *string `json:"executor"`
-		BuildCommand      *string `json:"build_command"`
-		BuildPath         *string `json:"build_path"`
-		UploadScript      *string `json:"upload_script"`
+		Name              *string         `json:"name"`
+		RepoURL           *string         `json:"repo_url"`
+		Branch            *string         `json:"branch"`
+		DockerfilePath    *string         `json:"dockerfile_path"`
+		ImageName         *string         `json:"image_name"`
+		DeployComposePath *string         `json:"deploy_compose_path"`
+		DeployServiceName *string         `json:"deploy_service_name"`
+		WebhookSecret     *string         `json:"webhook_secret"`
+		CloneToken        *string         `json:"clone_token"`
+		NoCache           *bool           `json:"no_cache"`
+		PollEnabled       *bool           `json:"poll_enabled"`
+		PollIntervalSecs  *int            `json:"poll_interval_secs"`
+		Executor          *string         `json:"executor"`
+		BuildCommand      *string         `json:"build_command"`
+		BuildPath         *string         `json:"build_path"`
+		UploadScript      *string         `json:"upload_script"`
+		ExecutorProfiles  json.RawMessage `json:"executor_profiles"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
 		writeError(w, 400, "invalid JSON: "+err.Error())
@@ -389,6 +406,18 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 	setIf(&existing.BuildCommand, updates.BuildCommand)
 	setIf(&existing.BuildPath, updates.BuildPath)
 	setIf(&existing.UploadScript, updates.UploadScript)
+	if updates.ExecutorProfiles != nil {
+		profiles, err := parseExecutorProfiles(updates.ExecutorProfiles)
+		if err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		existing.ExecutorProfiles = profiles
+	}
+	if err := validExecutorProfiles(existing); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
 
 	if err := s.DB.UpdateProject(existing); err != nil {
 		writeError(w, 500, err.Error())

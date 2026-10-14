@@ -9,7 +9,11 @@
           <a href="{{$.BasePath}}/projects/{{.ID}}" class="card-title">{{.Name}}</a>
           <div class="meta">{{.RepoURL}} · {{.Branch}}</div>
         </div>
+        {{if remote .Executor}}
+        <span class="meta">Queue: {{.Executor}}{{if .ExecutorProfiles}} · shared{{end}}</span>
+        {{else}}
         <span class="meta">→ registry.fandoster.com/{{.ImageName}}:latest</span>
+        {{end}}
       </div>
     </div>
     {{else}}

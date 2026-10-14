@@ -9,6 +9,9 @@
       <span>·</span>
       <span>{{.Project.ImageName}}</span>
     </div>
+    {{if remote .Project.Executor}}
+    <div class="meta" style="margin-top:4px">Queue: <span class="mono">{{.Project.Executor}}</span>{{if .Project.ExecutorProfiles}} · shared by {{range $i, $e := .Project.EligibleExecutors}}{{if $i}}, {{end}}{{$e}}{{end}}{{end}}</div>
+    {{end}}
     {{if .Project.DeployComposePath}}
     <div class="meta" style="margin-top:4px">Deploy: docker compose -f {{.Project.DeployComposePath}} up -d {{.Project.DeployServiceName}}</div>
     {{end}}

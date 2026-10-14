@@ -44,9 +44,17 @@
   <section class="settings-card">
     <h2 class="settings-heading">Build</h2>
     <div class="form-group">
-      <label for="f-executor">Executor</label>
-      <input id="f-executor" name="executor" value="{{.Project.Executor}}" spellcheck="false" style="max-width:220px">
-      <p class="form-hint"><span class="mono">local</span> builds a Docker image on this server. Any other name is a queue a build agent claims from; remote Unity agents use the build command, path, and upload script below.</p>
+      <label for="f-executor">Build queue</label>
+      <select id="f-executor" name="executor" style="max-width:280px">
+        {{range .Queues}}<option value="{{.}}" {{if eq . $.Project.Executor}}selected{{end}}>{{.}}</option>{{end}}
+        <option value=":new:">New queue…</option>
+      </select>
+      <div id="new-queue-field" hidden style="margin-top:8px">
+        <label for="f-new-queue">New queue name</label>
+        <input id="f-new-queue" name="new_queue" spellcheck="false" maxlength="32" pattern="[a-z0-9_\-]+" placeholder="e.g. unity-windows" style="max-width:280px" disabled>
+        <p class="form-hint">Lowercase letters, digits, - or _. Saved queues become available to other projects.</p>
+      </div>
+      <p class="form-hint"><span class="mono">local</span> builds Docker images here. A remote queue such as <span class="mono">unity-windows</span> can be shared by Mac and Linux agents with profiles below.</p>
     </div>
     <div class="form-group">
       <label for="f-image">Image name</label>
@@ -57,7 +65,7 @@
       <div class="form-group">
         <label for="f-build-command">Build command</label>
         <input id="f-build-command" name="build_command" value="{{.Project.BuildCommand}}" spellcheck="false" placeholder="e.g. BuildBuilder.CommandLineGameDebug">
-        <p class="form-hint">Public static Unity method sent to the remote agent.</p>
+        <p class="form-hint">Public static Unity method. Base settings apply only when profiles are empty.</p>
       </div>
       <div class="form-group">
         <label for="f-build-path">Build path</label>
@@ -71,6 +79,26 @@
         <input id="f-upload-script" name="upload_script" value="{{.Project.UploadScript}}" spellcheck="false" placeholder="e.g. UPLOAD_MAC.sh">
         <p class="form-hint">Repository-relative post-build script run by the remote agent. Empty skips upload.</p>
       </div>
+    </div>
+    <div class="form-group">
+      <label for="f-executor-profiles">Agent profiles (JSON)</label>
+      <textarea id="f-executor-profiles" name="executor_profiles" rows="12" spellcheck="false" class="mono" aria-describedby="profiles-help">{{profilesJSON .Project.ExecutorProfiles}}</textarea>
+      <p class="form-hint" id="profiles-help">Use existing agent executor names, such as <span class="mono">mac</span> and <span class="mono">linux</span>. Each profile needs <span class="mono">build_command</span> and <span class="mono">build_path</span>; an empty <span class="mono">upload_script</span> skips upload. With profiles, only listed executors can claim this queue; base settings are ignored. Use <span class="mono">{}</span> to restore the single-executor setup. Not available for <span class="mono">local</span>.</p>
+      <details>
+        <summary class="form-hint">Shared queue example</summary>
+        <pre class="meta">{
+  "mac": {
+    "build_command": "Build.Windows",
+    "build_path": "/Users/build/Builds/Windows",
+    "upload_script": "Steam/UPLOAD_MAC.sh"
+  },
+  "linux": {
+    "build_command": "Build.Windows",
+    "build_path": "/home/build/Builds/Windows",
+    "upload_script": ""
+  }
+}</pre>
+      </details>
     </div>
     <label class="form-check">
       <input type="checkbox" name="no_cache" {{if .Project.NoCache}}checked{{end}}>

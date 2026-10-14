@@ -206,6 +206,20 @@ func (s *Server) handleAgentClaim(w http.ResponseWriter, r *http.Request) {
 				writeError(w, 500, err.Error())
 				return
 			}
+			// The project can be edited between the atomic claim and this read.
+			// Fail closed if eligibility changed; never send a machine another
+			// machine's paths or fall back to the legacy base configuration.
+			if !prepareClaimProject(project, req.Executors) {
+				if err := s.DB.FinishBuild(build.ID, models.StatusFailed); err != nil {
+					writeError(w, 500, err.Error())
+					return
+				}
+				finishedAt := time.Now().UTC()
+				s.Bus.PublishStatus(build.ID, models.StatusFailed, build.StartedAt, &finishedAt)
+				log.Printf("Agent %s claim for build %d refused: project eligibility changed", req.Agent, build.ID)
+				writeError(w, 409, "project eligibility changed during claim; build failed without running")
+				return
+			}
 			// Where the agent's first log append belongs. Usually 0, but a
 			// build can arrive carrying an earlier attempt's output — it was
 			// requeued while its project still built locally, and the project

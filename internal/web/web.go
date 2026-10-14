@@ -2,9 +2,11 @@ package web
 
 import (
 	"embed"
+	"encoding/json"
 	"html/template"
 	"io/fs"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -21,6 +23,14 @@ import (
 // so this is the only way the client's CR-collapsing renderer can see the
 // real \r bytes in server-rendered log text.
 var tmplFuncs = template.FuncMap{
+	"profilesJSON": func(profiles map[string]models.ExecutorProfile) string {
+		if len(profiles) == 0 {
+			return "{}"
+		}
+		data, _ := json.MarshalIndent(profiles, "", "  ")
+		return string(data)
+	},
+	"remote": models.Remote,
 	"logText": func(s string) template.HTML {
 		return template.HTML(strings.ReplaceAll(template.HTMLEscapeString(s), "\r", "&#13;"))
 	},
@@ -173,12 +183,33 @@ func (h *Handler) handleProjectSettings(w http.ResponseWriter, r *http.Request) 
 	if project.PollIntervalSecs == 0 {
 		project.PollIntervalSecs = models.DefaultPollIntervalSecs
 	}
+	projects, err := h.DB.ListProjects()
+	if err != nil {
+		http.Error(w, "failed to load build queues: "+err.Error(), 500)
+		return
+	}
+	queueSet := map[string]bool{models.ExecutorLocal: true}
+	for _, p := range projects {
+		if models.Remote(p.Executor) {
+			queueSet[p.Executor] = true
+		}
+	}
+	if project.Executor == "" {
+		project.Executor = models.ExecutorLocal
+	}
+	queueSet[project.Executor] = true
+	queues := make([]string, 0, len(queueSet))
+	for queue := range queueSet {
+		queues = append(queues, queue)
+	}
+	sort.Strings(queues)
 	h.render(w, r, "settings", map[string]interface{}{
 		"Title":               project.Name + " · Settings",
 		"Project":             project,
 		"HasWebhookSecret":    hasWebhookSecret,
 		"HasCloneToken":       hasCloneToken,
 		"MinPollIntervalSecs": models.MinPollIntervalSecs,
+		"Queues":              queues,
 	})
 }
 

@@ -11,14 +11,14 @@
      it. Everything below this is detail by comparison. -->
 <section class="settings-card" id="coverage-card">
   <h3 class="settings-heading">Queues</h3>
-  <p class="form-hint">A project's <span class="mono">Executor</span> names the queue its builds wait on. A queue no agent asks for is a build that waits forever.</p>
+  <p class="form-hint">A project's build queue can be served by its executor or by the allowed agent profiles. A project with no matching agent waits until one connects.</p>
   <div id="coverage">
     {{if .Fleet.Executors}}
       {{range .Fleet.Executors}}
         <div class="coverage-row {{if not .Served}}coverage-unserved{{end}}">
           <span class="mono coverage-name">{{.Name}}</span>
           {{if not .Served}}
-            <span class="badge badge-failed">no agent serving this</span>
+            {{if and .Agents .UnservedProjects}}<span class="badge badge-failed">no agent for {{range $i, $p := .UnservedProjects}}{{if $i}}, {{end}}{{$p}}{{end}}</span>{{else}}<span class="badge badge-failed">no agent serving this</span>{{end}}
           {{else if .AllPaused}}
             <!-- Said differently from "no agent serving this" on purpose. That
                  one means a name nothing answers to and needs a config change;

@@ -21,7 +21,8 @@ A project's **executor** decides who runs its builds:
 | `executor` | Who builds it |
 | --- | --- |
 | `local` (default, and empty means this) | The in-process Docker runner. Unchanged behaviour. |
-| anything else, e.g. `mac` | An agent that asks for that name. |
+| remote name, e.g. `mac`, with no profiles | An agent that asks for that exact name. |
+| logical queue, e.g. `unity-windows`, with profiles | An agent that asks for a profile key, e.g. `mac` or `linux`. |
 
 Triggers do not change. A manual button, a webhook push and a poll all create the same
 `pending` build row. The only difference is what happens next: a local build is pushed
@@ -35,6 +36,97 @@ with a `status` column, and claiming is an `UPDATE ... WHERE status='pending'`.
    trigger ──► builds row (pending) ──┬── executor=local  ──► channel ──► Docker runner
                                       └── executor=mac    ──► waits ──► agent claims it
 ```
+
+## Shared remote queues
+
+A project can use one logical queue, **`unity-windows`**, while existing Mac and Linux
+agents keep polling their current executor names. This is appropriate only when both
+machines produce the same intended output (here, Unity Windows builds).
+
+In project **Settings → Build queue**, choose an existing queue from the dropdown.
+The list comes from current project executors plus `local`; there is no separate queue
+registration. **New queue…** lets you create a name for a different workload. Below it,
+**Agent profiles (JSON)** contains one complete recipe per eligible executor:
+
+```json
+{
+  "mac": {
+    "build_command": "BuildBuilder.CommandLineGameRelease",
+    "build_path": "/Users/build/Builds/Windows",
+    "upload_script": "Steam/UPLOAD_MAC.sh"
+  },
+  "linux": {
+    "build_command": "BuildBuilder.CommandLineGameRelease",
+    "build_path": "/home/build/Builds/Windows",
+    "upload_script": ""
+  }
+}
+```
+
+Only the map's keys may claim the project. An agent requesting `unity-windows` alone
+cannot claim this example. Matching uses the order of the agent's advertised executors.
+The first matching key selects the **whole** recipe. Base project fields are ignored;
+an empty upload script means **build-only**, not inheritance from a Mac profile or base
+upload setting. Each successful claim still consumes one build, never a separate build
+per platform. The existing per-project serialization and agent ownership rules remain.
+
+`POST /api/projects` and `PUT /api/projects/{id}` accept the same map as
+`executor_profiles`. For example, a partial update can set both the queue and map:
+
+```json
+{
+  "executor": "unity-windows",
+  "executor_profiles": {
+    "mac": {
+      "build_command": "BuildBuilder.CommandLineGameRelease",
+      "build_path": "/Users/build/Builds/Windows",
+      "upload_script": "Steam/UPLOAD_MAC.sh"
+    },
+    "linux": {
+      "build_command": "BuildBuilder.CommandLineGameRelease",
+      "build_path": "/home/build/Builds/Windows",
+      "upload_script": ""
+    }
+  }
+}
+```
+
+Validation:
+
+- At most 16 profiles. Keys are 1–32 lowercase letters, digits, `-` or `_`.
+  Empty names and `local` are reserved and rejected.
+- Each recipe needs a nonblank `build_command` (at most 1024 bytes) and `build_path`
+  (at most 4096 bytes). `upload_script` is optional and at most 4096 bytes.
+- Unknown recipe fields, invalid JSON types and `null` maps are rejected.
+- Nonempty profiles are rejected on local projects. To switch back to the local
+  Docker runner, clear profiles in the same update: `{"executor":"local","executor_profiles":{}}`.
+
+### Migration and compatibility
+
+The server adds a JSON column to existing SQLite projects automatically on startup.
+Existing projects have no profiles and keep their exact single-executor behavior.
+No existing project is silently moved to a shared queue.
+
+To migrate, verify that both machines really build the intended Windows target. Keep
+agent configurations unchanged. Update the project's logical queue and complete
+profiles together through settings or the API. **No agent restart or update is
+required** for this server-side routing change. Only agents listed in the map can
+claim it, including agents connected before the edit.
+
+Claims return the selected command, path and upload script in the existing base
+project fields. Other-machine profiles are never sent in `executor_profiles`.
+The build's executor remains the logical queue name for history and fleet coverage.
+A project edit affects pending work, not the recipe an already-running agent holds.
+If eligibility changes between the atomic claim and project read, the server fails
+the build and returns `409` rather than sending an unsafe fallback recipe.
+
+Omitting `executor_profiles` in a partial API update preserves the map, even when old
+clients edit only base fields. Sending `{}` explicitly clears it and restores legacy
+matching against the project's primary executor. Clearing profiles on `unity-windows`
+therefore requires an agent that advertises `unity-windows`; set `executor` back to
+`mac` or `linux` in the same update to restore one of those existing agents instead.
+The fleet page groups work under the logical queue and checks coverage against each
+project's eligible profiles, not just the logical queue name.
 
 ## Direction of travel
 

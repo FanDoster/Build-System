@@ -70,7 +70,12 @@ One process, three long-lived goroutine groups sharing a `chan *models.Build`:
 ### Two executors
 
 `projects.executor` decides who runs a build: `local` (the Docker runner above) or the
-name of a queue a **remote build agent** claims from over HTTP. A remote build is never
+name of a logical queue a **remote build agent** claims from over HTTP. With no
+`projects.executor_profiles`, only agents advertising that executor can claim it.
+With a nonempty profile map, only its keys are eligible: `unity-windows` can be shared
+by existing agents advertising `mac` and `linux`, without restarting or updating them.
+The API validates complete recipes (command, path, optional upload script), reserves
+`local`, and rejects nonempty profiles on local projects. A remote build is never
 put on the channel — its `pending` row *is* the queue. Everything that creates a build
 goes through `api.Server.dispatch`, `poller.pollProject` or `recoverOrphanedBuilds`, and
 all three gate on `models.Remote(executor)`; miss one and a Unity build gets handed to
@@ -78,10 +83,24 @@ the Docker runner. The protocol, timings and the janitor rules that follow from 
 in [docs/build-agents.md](docs/build-agents.md).
 
 `projects.build_command`, `projects.build_path`, and `projects.upload_script` are
-remote-agent configuration. They deliberately live on the project, not the build: a
-successful claim reads the current full project row and hands all three values to the
-agent. The server and local runner must not interpret them. This means an edit applies
-to work still pending, while a running agent keeps the values it already received.
+legacy remote-agent configuration. `projects.executor_profiles` stores complete
+per-executor recipes as JSON in an additive SQLite migration. Existing projects keep
+legacy matching until explicitly migrated. Recipes deliberately live on the project,
+not the build: a successful claim reads the current row, selects the first matching
+profile in the agent's executor order, and copies all three values into the existing
+base response fields. Never send other-machine profiles in the claim response. An
+empty profile upload script means build-only, not inheritance. Nonempty profiles
+must never fall back to the primary executor or base recipe. Reject local claims even
+if malformed data contains profiles. The API fails a build closed if an edit changes
+eligibility between claim and project read. The server and local runner must not
+execute these values. Edits apply to work still pending; running agents keep their
+received recipe. Partial updates that omit profiles preserve them; `{}` clears them.
+
+Settings lists known project queues plus `local` in a dropdown; **New queue…** allows
+new names. Queue names are not a hardcoded platform list. The JSON profile editor
+uses safely escaped text and validates parsing before saving. Dashboard/project/fleet
+views show the logical queue and coverage through each project's eligible profiles.
+See [docs/build-agents.md](docs/build-agents.md#shared-remote-queues) for migration.
 
 Builds have two identities. `builds.id` is the global database key and remains the key
 for routes, agent callbacks, the log bus and internal maps. `builds.project_build_number`

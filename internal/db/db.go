@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -71,6 +72,7 @@ func (d *DB) migrate() error {
 			build_command TEXT NOT NULL DEFAULT '',
 			build_path TEXT NOT NULL DEFAULT '',
 			upload_script TEXT NOT NULL DEFAULT '',
+			executor_profiles TEXT NOT NULL DEFAULT '{}',
 			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
 			updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
 		);
@@ -137,6 +139,7 @@ func (d *DB) migrate() error {
 		{"projects", "build_command", "TEXT NOT NULL DEFAULT ''"},
 		{"projects", "build_path", "TEXT NOT NULL DEFAULT ''"},
 		{"projects", "upload_script", "TEXT NOT NULL DEFAULT ''"},
+		{"projects", "executor_profiles", "TEXT NOT NULL DEFAULT '{}'"},
 		{"builds", "project_build_number", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := d.addColumnIfMissing(c.table, c.column, c.decl); err != nil {
@@ -219,25 +222,42 @@ func (d *DB) SetSetting(key, value string) error {
 const projectCols = `id, name, repo_url, branch, dockerfile_path, image_name,
 	deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache,
 	poll_enabled, poll_interval_secs, last_polled_sha, last_polled_at, last_poll_error,
-	executor, build_command, build_path, upload_script, created_at, updated_at`
+	executor, build_command, build_path, upload_script, executor_profiles, created_at, updated_at`
 
 // scanner is satisfied by both *sql.Row and *sql.Rows.
 type scanner interface{ Scan(dest ...any) error }
 
 func scanProject(s scanner) (*models.Project, error) {
 	p := &models.Project{}
+	var profiles string
 	err := s.Scan(&p.ID, &p.Name, &p.RepoURL, &p.Branch, &p.DockerfilePath, &p.ImageName,
 		&p.DeployComposePath, &p.DeployServiceName, &p.WebhookSecret, &p.CloneToken, &p.NoCache,
 		&p.PollEnabled, &p.PollIntervalSecs, &p.LastPolledSHA, &p.LastPolledAt, &p.LastPollError,
-		&p.Executor, &p.BuildCommand, &p.BuildPath, &p.UploadScript,
+		&p.Executor, &p.BuildCommand, &p.BuildPath, &p.UploadScript, &profiles,
 		&p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
+	if err := json.Unmarshal([]byte(profiles), &p.ExecutorProfiles); err != nil {
+		return nil, fmt.Errorf("decode project %d executor profiles: %w", p.ID, err)
+	}
 	return p, nil
 }
 
+// encodeProfiles stores absent profiles as an empty object, not JSON null.
+func encodeProfiles(profiles map[string]models.ExecutorProfile) (string, error) {
+	if len(profiles) == 0 {
+		return "{}", nil
+	}
+	data, err := json.Marshal(profiles)
+	return string(data), err
+}
+
 func (d *DB) CreateProject(p *models.Project) error {
+	profiles, err := encodeProfiles(p.ExecutorProfiles)
+	if err != nil {
+		return err
+	}
 	p.CreatedAt = time.Now().UTC()
 	p.UpdatedAt = p.CreatedAt
 	if p.PollIntervalSecs == 0 {
@@ -247,12 +267,12 @@ func (d *DB) CreateProject(p *models.Project) error {
 		p.Executor = models.ExecutorLocal
 	}
 	res, err := d.conn.Exec(
-		`INSERT INTO projects (name, repo_url, branch, dockerfile_path, image_name, deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache, poll_enabled, poll_interval_secs, executor, build_command, build_path, upload_script, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO projects (name, repo_url, branch, dockerfile_path, image_name, deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache, poll_enabled, poll_interval_secs, executor, build_command, build_path, upload_script, executor_profiles, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.Name, p.RepoURL, p.Branch, p.DockerfilePath, p.ImageName,
 		p.DeployComposePath, p.DeployServiceName, p.WebhookSecret, p.CloneToken, p.NoCache,
 		p.PollEnabled, p.PollIntervalSecs, p.Executor,
-		p.BuildCommand, p.BuildPath, p.UploadScript,
+		p.BuildCommand, p.BuildPath, p.UploadScript, profiles,
 		p.CreatedAt, p.UpdatedAt,
 	)
 	if err != nil {
@@ -297,19 +317,23 @@ func (d *DB) ListProjects() ([]models.Project, error) {
 // (last_polled_*) is deliberately NOT written here: a settings save must not
 // clobber state the poller owns, and the poller uses UpdatePollState.
 func (d *DB) UpdateProject(p *models.Project) error {
+	profiles, err := encodeProfiles(p.ExecutorProfiles)
+	if err != nil {
+		return err
+	}
 	p.UpdatedAt = time.Now().UTC()
 	if p.Executor == "" {
 		p.Executor = models.ExecutorLocal
 	}
-	_, err := d.conn.Exec(
+	_, err = d.conn.Exec(
 		`UPDATE projects SET name=?, repo_url=?, branch=?, dockerfile_path=?, image_name=?,
 		 deploy_compose_path=?, deploy_service_name=?, webhook_secret=?, clone_token=?, no_cache=?,
-		 poll_enabled=?, poll_interval_secs=?, executor=?, build_command=?, build_path=?, upload_script=?, updated_at=?
+		 poll_enabled=?, poll_interval_secs=?, executor=?, build_command=?, build_path=?, upload_script=?, executor_profiles=?, updated_at=?
 		 WHERE id=?`,
 		p.Name, p.RepoURL, p.Branch, p.DockerfilePath, p.ImageName,
 		p.DeployComposePath, p.DeployServiceName, p.WebhookSecret, p.CloneToken, p.NoCache,
 		p.PollEnabled, p.PollIntervalSecs, p.Executor,
-		p.BuildCommand, p.BuildPath, p.UploadScript,
+		p.BuildCommand, p.BuildPath, p.UploadScript, profiles,
 		p.UpdatedAt, p.ID,
 	)
 	return err
@@ -560,9 +584,10 @@ func (d *DB) ClaimBuild(id int64) (bool, error) {
 	return n == 1, err
 }
 
-// ClaimBuildForAgent atomically claims the oldest pending build belonging to a
-// project whose executor is one of executors, marking it running and owned by
-// agent. Returns (nil, nil) when there is nothing to claim.
+// ClaimBuildForAgent atomically claims the oldest eligible pending remote
+// build. A nonempty profile map is the executor allowlist; only projects with
+// no profiles may match their primary executor. Local projects never qualify.
+// Returns (nil, nil) when there is nothing to claim.
 //
 // One statement, so two agents polling at once cannot claim the same build:
 // the sub-select picks a candidate and the outer WHERE re-checks that it is
@@ -572,12 +597,23 @@ func (d *DB) ClaimBuildForAgent(agent string, executors []string) (*models.Build
 	if agent == "" || len(executors) == 0 {
 		return nil, nil
 	}
-	args := []any{time.Now().UTC(), agent, time.Now().UTC()}
-	placeholders := make([]string, len(executors))
-	for i, e := range executors {
-		placeholders[i] = "?"
-		args = append(args, e)
+	now := time.Now().UTC()
+	args := []any{now, agent, now}
+	var placeholders []string
+	var eligible []any
+	for _, executor := range executors {
+		if !models.Remote(executor) {
+			continue
+		}
+		placeholders = append(placeholders, "?")
+		eligible = append(eligible, executor)
 	}
+	if len(eligible) == 0 {
+		return nil, nil
+	}
+	args = append(args, eligible...)
+	args = append(args, eligible...)
+	in := strings.Join(placeholders, ",")
 
 	var id int64
 	err := d.conn.QueryRow(
@@ -585,8 +621,14 @@ func (d *DB) ClaimBuildForAgent(agent string, executors []string) (*models.Build
 		 SET status='running', started_at=?, agent=?, last_heartbeat_at=?, cancel_requested=0
 		 WHERE id = (
 		     SELECT b.id FROM builds b JOIN projects p ON p.id = b.project_id
-		     WHERE b.status='pending' AND p.executor IN (`+strings.Join(placeholders, ",")+`)
-		     ORDER BY b.id LIMIT 1
+		     WHERE b.status='pending' AND p.executor NOT IN ('', 'local')
+		       AND (
+		         (NOT EXISTS (SELECT 1 FROM json_each(p.executor_profiles))
+		           AND p.executor IN (`+in+`))
+		         OR EXISTS (SELECT 1 FROM json_each(p.executor_profiles) profile
+		           WHERE profile.key IN (`+in+`))
+		       )
+		     ORDER BY b.created_at ASC, b.id ASC LIMIT 1
 		 ) AND status='pending'
 		 RETURNING id`, args...).Scan(&id)
 	if err == sql.ErrNoRows {

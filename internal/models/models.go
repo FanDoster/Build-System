@@ -35,6 +35,15 @@ func Remote(executor string) bool {
 	return executor != "" && executor != ExecutorLocal
 }
 
+// ExecutorProfile is a complete recipe for one remote executor. Empty fields
+// remain empty: in particular an empty UploadScript means build-only, not an
+// instruction to inherit the project's upload script.
+type ExecutorProfile struct {
+	BuildCommand string `json:"build_command"`
+	BuildPath    string `json:"build_path"`
+	UploadScript string `json:"upload_script"`
+}
+
 type Project struct {
 	ID                int64  `json:"id"`
 	Name              string `json:"name"`
@@ -54,6 +63,10 @@ type Project struct {
 	BuildCommand string `json:"build_command,omitempty"`
 	BuildPath    string `json:"build_path,omitempty"`
 	UploadScript string `json:"upload_script,omitempty"`
+	// ExecutorProfiles allows a logical queue to be served by different remote
+	// executors. A nonempty map is an allowlist: only its keys may claim work,
+	// and its recipes never inherit fields from the project's base recipe.
+	ExecutorProfiles map[string]ExecutorProfile `json:"executor_profiles,omitempty"`
 
 	// Polling: an alternative to GitHub Actions / webhooks. When enabled the
 	// server asks the remote for the branch tip every PollIntervalSecs and
@@ -69,6 +82,40 @@ type Project struct {
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// ProfileFor selects the first matching executor in the caller's order. A
+// nonempty profile map never falls back to the base recipe or logical queue.
+// Projects without profiles retain their original single-executor behavior.
+func (p Project) ProfileFor(executors []string) (ExecutorProfile, bool) {
+	for _, executor := range executors {
+		if len(p.ExecutorProfiles) > 0 {
+			if profile, ok := p.ExecutorProfiles[executor]; ok {
+				return profile, true
+			}
+		} else if executor == p.Executor {
+			return ExecutorProfile{
+				BuildCommand: p.BuildCommand,
+				BuildPath:    p.BuildPath,
+				UploadScript: p.UploadScript,
+			}, true
+		}
+	}
+	return ExecutorProfile{}, false
+}
+
+// EligibleExecutors returns the profile allowlist in stable order, or the
+// primary executor for a legacy project without profiles.
+func (p Project) EligibleExecutors() []string {
+	if len(p.ExecutorProfiles) == 0 {
+		return []string{p.Executor}
+	}
+	executors := make([]string, 0, len(p.ExecutorProfiles))
+	for executor := range p.ExecutorProfiles {
+		executors = append(executors, executor)
+	}
+	sort.Strings(executors)
+	return executors
 }
 
 // MinPollIntervalSecs floors the poll interval. Every poll is a network round

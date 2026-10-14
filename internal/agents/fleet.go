@@ -176,11 +176,13 @@ type Executor struct {
 	Agents        []string   `json:"agents,omitempty"`
 	Pending       int        `json:"pending"`
 	OldestPending *time.Time `json:"oldest_pending,omitempty"`
-	// Served is false when no live agent is asking for this executor. With
-	// pending builds, that is the loudest thing on the page: it is what a
-	// one-character typo in a project's executor looks like, and today it
-	// produces a green agent, a build stuck forever, and no error anywhere.
+	// Served requires an eligible non-offline agent for every project on the
+	// logical queue. A shared queue can be partly covered: one mac-only
+	// project does not make a linux-only project on the same queue served.
 	Served bool `json:"served"`
+	// UnservedProjects names the uncovered projects, even when other projects
+	// on the same logical queue have eligible agents.
+	UnservedProjects []string `json:"unserved_projects,omitempty"`
 
 	// AllPaused means the queue has agents but every one of them is paused, so
 	// nothing will be claimed from it.
@@ -292,9 +294,14 @@ func Build(src Source, reg *Registry, now time.Time) (*Fleet, error) {
 		at(name)
 	}
 
+	execs, err := src.RemoteExecutors()
+	if err != nil {
+		return nil, err
+	}
+
 	// Fill each agent in, then decide its state.
 	for _, a := range order {
-		if err := fill(src, a); err != nil {
+		if err := fill(src, a, execs); err != nil {
 			return nil, err
 		}
 		a.State = stateOf(a, reg.StartedAt(), now)
@@ -312,30 +319,51 @@ func Build(src Source, reg *Registry, now time.Time) (*Fleet, error) {
 		f.Agents = append(f.Agents, *a)
 	}
 
-	execs, err := src.RemoteExecutors()
-	if err != nil {
-		return nil, err
-	}
 	for _, e := range execs {
 		out := Executor{Name: e.Name, Projects: e.Projects, Pending: e.Pending}
 		if !e.OldestPending.IsZero() {
 			t := e.OldestPending
 			out.OldestPending = &t
 		}
+		// Preserve legacy sources that have no per-project metadata. Real DB
+		// rows include one allowed-profile list for every project.
+		projects := e.Projects
+		if len(projects) == 0 {
+			projects = []string{""}
+		}
+		covered := make(map[string]bool, len(projects))
 		live := 0
 		for _, a := range f.Agents {
 			if a.State == StateOffline {
 				continue
 			}
-			if !contains(a.Executors, e.Name) {
-				continue
+			eligible := false
+			for _, project := range projects {
+				profiles, ok := e.ProjectExecutors[project]
+				if !ok {
+					profiles = []string{e.Name}
+				}
+				if !coversProject(a, e.Name, project, profiles) {
+					continue
+				}
+				covered[project] = true
+				eligible = true
 			}
-			out.Agents = append(out.Agents, a.Name)
-			out.Served = true
-			if !a.Paused {
-				live++
+			if eligible {
+				// Append once per agent, not once per matching profile/project.
+				out.Agents = append(out.Agents, a.Name)
+				if !a.Paused {
+					live++
+				}
 			}
 		}
+		for _, project := range projects {
+			if !covered[project] && project != "" {
+				out.UnservedProjects = append(out.UnservedProjects, project)
+			}
+		}
+		out.Served = len(covered) == len(projects)
+
 		// Every agent on this queue is paused, so nothing will be claimed from
 		// it. Said separately from "no agent serving this", which means a name
 		// nothing answers to and needs a config change rather than a resume.
@@ -486,7 +514,7 @@ func shortDuration(d time.Duration) string {
 	}
 }
 
-func fill(src Source, a *Agent) error {
+func fill(src Source, a *Agent, execs []db.RemoteExecutor) error {
 	running, err := src.RunningBuildForAgent(a.Name)
 	if err != nil {
 		return err
@@ -514,7 +542,20 @@ func fill(src Source, a *Agent) error {
 		// calls a queue unserved while an agent is actively building from it,
 		// which is the loudest warning on the page firing at the one moment it
 		// is wrong. Seen in production the first time this shipped.
-		if models.Remote(running.Executor) && !contains(a.Executors, running.Executor) {
+		// A logical shared queue does not prove an advertised profile. Do not
+		// add its name as a capability: that could cover a legacy project on
+		// this queue which this agent cannot actually claim. coversProject
+		// instead uses the current build as proof for its own project only.
+		shared := false
+		for _, e := range execs {
+			if e.Name != running.Executor {
+				continue
+			}
+			if profiles, ok := e.ProjectExecutors[running.ProjectName]; ok {
+				shared = len(profiles) != 1 || profiles[0] != running.Executor
+			}
+		}
+		if !shared && models.Remote(running.Executor) && !contains(a.Executors, running.Executor) {
 			a.Executors = append(a.Executors, running.Executor)
 		}
 
@@ -553,6 +594,19 @@ func fill(src Source, a *Agent) error {
 		}
 	}
 	return nil
+}
+
+// coversProject checks profile names, not the logical queue name. A running
+// build also proves coverage of that one project, including after a restart
+// when no claim poll (and therefore no advertised profiles) has arrived yet.
+func coversProject(a Agent, queue, project string, profiles []string) bool {
+	for _, profile := range profiles {
+		if contains(a.Executors, profile) {
+			return true
+		}
+	}
+	return project != "" && a.Current != nil &&
+		a.Current.Project == project && a.Current.Executor == queue
 }
 
 func contains(list []string, want string) bool {

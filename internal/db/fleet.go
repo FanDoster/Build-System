@@ -1,6 +1,7 @@
 package db
 
 import (
+	"sort"
 	"time"
 
 	"github.com/FanDoster/Build-System/internal/models"
@@ -89,6 +90,9 @@ type RemoteExecutor struct {
 	Name string
 	// Projects using this executor.
 	Projects []string
+	// ProjectExecutors maps each project to the agent executor names allowed
+	// to claim it. The queue's logical name can differ from these profiles.
+	ProjectExecutors map[string][]string
 	// Pending is how many builds are waiting for an agent to claim them.
 	Pending int
 	// OldestPending is when the longest-waiting build was created. Zero when
@@ -103,34 +107,26 @@ type RemoteExecutor struct {
 // no agent has ever served is exactly the case worth showing, and it is
 // invisible if you start from the builds that ran.
 func (d *DB) RemoteExecutors() ([]RemoteExecutor, error) {
-	rows, err := d.conn.Query(
-		`SELECT executor, name FROM projects ORDER BY executor, name`)
+	projects, err := d.ListProjects()
 	if err != nil {
 		return nil, err
 	}
 	byName := map[string]*RemoteExecutor{}
 	var order []string
-	for rows.Next() {
-		var executor, project string
-		if err := rows.Scan(&executor, &project); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if !models.Remote(executor) {
+	for _, project := range projects {
+		if !models.Remote(project.Executor) {
 			continue
 		}
-		e, ok := byName[executor]
+		e, ok := byName[project.Executor]
 		if !ok {
-			e = &RemoteExecutor{Name: executor}
-			byName[executor] = e
-			order = append(order, executor)
+			e = &RemoteExecutor{Name: project.Executor, ProjectExecutors: map[string][]string{}}
+			byName[project.Executor] = e
+			order = append(order, project.Executor)
 		}
-		e.Projects = append(e.Projects, project)
+		e.Projects = append(e.Projects, project.Name)
+		e.ProjectExecutors[project.Name] = project.EligibleExecutors()
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
+	sort.Strings(order)
 
 	// Pending builds, folded in Go rather than aggregated in SQL so the
 	// timestamp keeps its type.

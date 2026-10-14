@@ -134,9 +134,21 @@ func TestLiveSocketPushesNewBuilds(t *testing.T) {
 	if ok, err := s.DB.ClaimBuild(b.ID); err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
-	msg = client.nextMessage(t)
-	if msg.Builds[0].Status != models.StatusRunning {
-		t.Fatalf("status = %q, want running", msg.Builds[0].Status)
+	// The sampler may have queued another pending snapshot before ClaimBuild
+	// completed. Under the race detector that frame can still be buffered here.
+	// Wait for the transition, not for a particular frame number.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		msg = client.nextMessage(t)
+		if len(msg.Builds) != 1 || msg.Builds[0].ID != b.ID {
+			t.Fatalf("transition frame = %+v, want build %d", msg.Builds, b.ID)
+		}
+		if msg.Builds[0].Status == models.StatusRunning {
+			break
+		}
+		if msg.Builds[0].Status != models.StatusPending || time.Now().After(deadline) {
+			t.Fatalf("status = %q, want running", msg.Builds[0].Status)
+		}
 	}
 	if msg.Builds[0].CurrentStep != "build" {
 		t.Errorf("current_step = %q, want the runner's step", msg.Builds[0].CurrentStep)

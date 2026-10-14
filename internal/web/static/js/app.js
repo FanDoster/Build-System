@@ -68,7 +68,8 @@
       // somebody made and can undo. Collapsing them sends an operator hunting
       // for a typo they never made.
       row.appendChild(!e.served
-        ? el('span', 'badge badge-failed', 'no agent serving this')
+        ? el('span', 'badge badge-failed', (e.agents || []).length && (e.unserved_projects || []).length
+            ? 'no agent for ' + join(e.unserved_projects) : 'no agent serving this')
         : e.all_paused
           ? el('span', 'badge badge-paused', 'paused \u2014 nothing will be claimed')
           : el('span', 'badge badge-success', 'served by ' + join(e.agents)));
@@ -494,6 +495,17 @@
     var banner = document.getElementById('settings-banner');
     var btnSave = document.getElementById('btn-save');
     var btnDelete = document.getElementById('btn-delete');
+    var queueSelect = form.elements.executor;
+    var newQueue = form.elements.new_queue;
+    var newQueueField = document.getElementById('new-queue-field');
+    function updateQueueField() {
+      var creating = queueSelect.value === ':new:';
+      newQueueField.hidden = !creating;
+      newQueue.disabled = !creating;
+      newQueue.required = creating;
+    }
+    queueSelect.addEventListener('change', updateQueueField);
+    updateQueueField();
 
     function showBanner(kind, msg) {
       banner.hidden = false;
@@ -519,8 +531,41 @@
         no_cache: f.no_cache.checked,
         poll_enabled: f.poll_enabled.checked,
         poll_interval_secs: parseInt(f.poll_interval_secs.value, 10),
-        executor: f.executor.value.trim(),
+        executor: f.executor.value === ':new:' ? f.new_queue.value.trim() : f.executor.value,
       };
+      try {
+        payload.executor_profiles = JSON.parse(f.executor_profiles.value);
+        if (!payload.executor_profiles || Array.isArray(payload.executor_profiles) ||
+            typeof payload.executor_profiles !== 'object') {
+          throw new Error('Use a JSON object, or {} to clear profiles.');
+        }
+        var names = Object.keys(payload.executor_profiles);
+        if (names.length > 16) throw new Error('Use at most 16 profiles.');
+        if (names.length && (!payload.executor || payload.executor === 'local')) {
+          throw new Error('Profiles require a remote build queue.');
+        }
+        names.forEach(function (name) {
+          if (!/^[a-z0-9_-]{1,32}$/.test(name) || name === 'local') {
+            throw new Error('Invalid executor name: ' + name);
+          }
+          var profile = payload.executor_profiles[name];
+          if (!profile || Array.isArray(profile) || typeof profile !== 'object' ||
+              typeof profile.build_command !== 'string' || !profile.build_command.trim() ||
+              typeof profile.build_path !== 'string' || !profile.build_path.trim() ||
+              (profile.upload_script !== undefined && typeof profile.upload_script !== 'string')) {
+            throw new Error('Profile ' + name + ' needs build_command and build_path strings; upload_script is optional.');
+          }
+          Object.keys(profile).forEach(function (key) {
+            if (['build_command', 'build_path', 'upload_script'].indexOf(key) === -1) {
+              throw new Error('Unknown field in profile ' + name + ': ' + key);
+            }
+          });
+        });
+      } catch (err) {
+        showBanner('err', 'Agent profiles: ' + err.message);
+        f.executor_profiles.focus();
+        return;
+      }
       if (!isFinite(payload.poll_interval_secs)) {
         showBanner('err', 'Poll interval must be a number.');
         return;
