@@ -40,6 +40,7 @@
           <span class="badge badge-{{.Status}}">{{.Status}}</span>
         </div>
         <div class="meta"><time data-abs datetime="{{if .StartedAt}}{{.StartedAt.Format "2006-01-02T15:04:05Z07:00"}}{{else}}{{.CreatedAt.Format "2006-01-02T15:04:05Z07:00"}}{{end}}">{{if .StartedAt}}{{.StartedAt.Format "Jan 02 15:04"}}{{else}}{{.CreatedAt.Format "Jan 02 15:04"}}{{end}}</time></div>
+        <div class="meta build-agent">Agent: <span class="build-agent-name">{{buildAgentLabel .Agent .Executor .Status}}</span></div>
         <div class="meta build-dur"></div>
       </div>
       {{else}}

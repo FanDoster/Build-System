@@ -202,6 +202,14 @@ already be uploading to Steam.
 | source | `internal/logbus` (per-build topics) | `internal/live` (one sampler) |
 | fallback | `GET .../log?offset=N` polling | `GET /api/live` polling (same payload) |
 
+Build ownership is shown on dashboard cards, project history, and each build's
+metadata. The recorded `builds.agent` is the source of truth, not the queue name.
+Pending remote builds show `Not assigned`; old remote rows without an owner show
+`Not recorded`; local builds show `Local runner`. SSE status events include `agent`
+and `executor`, so a page opened while queued updates on claim. The live-list feed
+and metadata polling fallback carry the same values. Read ownership via log-free
+build summaries rather than loading the full build log on every status event.
+
 They are not interchangeable. A log is an append-only byte stream where every byte
 matters and a reconnect must resume at an offset — SSE's `Last-Event-ID` does that for
 free. The dashboard needs the opposite: idempotent whole-state snapshots that a late or

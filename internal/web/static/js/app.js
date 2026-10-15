@@ -671,6 +671,13 @@
   //
   // Elapsed times and progress bars animate locally from the absolute
   // timestamps in the snapshot, so the server only speaks when state changes.
+  // Mirrors the server's buildAgentLabel template helper. The queue is not an owner.
+  function buildAgentLabel(b) {
+    if (b.agent) return b.agent;
+    if (!b.executor || b.executor === 'local') return 'Local runner';
+    return b.status === 'pending' ? 'Not assigned' : 'Not recorded';
+  }
+
   function initListLive() {
     var lists = Array.prototype.slice.call(document.querySelectorAll('[data-live-list]'));
     if (!lists.length) return;
@@ -712,6 +719,9 @@
       when.appendChild(timeCell(b));
       card.appendChild(header);
       card.appendChild(when);
+      var agent = el('div', 'meta build-agent', 'Agent: ');
+      agent.appendChild(el('span', 'build-agent-name', buildAgentLabel(b)));
+      card.appendChild(agent);
       card.appendChild(el('div', 'meta build-dur'));
       return card;
     }
@@ -726,6 +736,9 @@
       var statusCell = el('td');
       statusCell.appendChild(el('span', 'badge badge-' + b.status, b.status));
       tr.appendChild(statusCell);
+      var agentCell = el('td', 'meta build-agent');
+      agentCell.appendChild(el('span', 'build-agent-name', buildAgentLabel(b)));
+      tr.appendChild(agentCell);
       var whenCell = el('td', 'meta');
       whenCell.appendChild(timeCell(b));
       tr.appendChild(whenCell);
@@ -841,6 +854,8 @@
       }
       if (row.dataset.status !== b.status) setBadge(row, b.status);
       renderWhen(row, b);
+      var agent = row.querySelector('.build-agent-name');
+      if (agent) agent.textContent = buildAgentLabel(b);
       renderDuration(row, b);
     }
 
@@ -977,6 +992,7 @@
     var followPill = document.getElementById('follow-pill');
     var metaDuration = document.getElementById('meta-duration');
     var metaStarted = document.getElementById('meta-started');
+    var metaAgent = document.getElementById('meta-agent');
     var progressBar = document.getElementById('build-progress');
     var progressFill = document.getElementById('build-progress-fill');
     var queuePosEl = document.getElementById('queue-pos');
@@ -994,6 +1010,8 @@
 
     var state = {
       status: ds.status,
+      agent: ds.agent || '',
+      executor: ds.executor || '',
       startedAt: ds.startedAt ? new Date(ds.startedAt) : null,
       finishedAt: ds.finishedAt ? new Date(ds.finishedAt) : null,
       offset: parseInt(ds.logLen, 10) || 0, // server-side byte offset
@@ -1511,6 +1529,9 @@
       if (!d || !d.status) return;
       var prev = state.status;
       state.status = d.status;
+      if (Object.prototype.hasOwnProperty.call(d, 'agent')) state.agent = d.agent || '';
+      if (Object.prototype.hasOwnProperty.call(d, 'executor')) state.executor = d.executor || '';
+      if (metaAgent) metaAgent.textContent = buildAgentLabel(state);
       if (d.started_at) state.startedAt = new Date(d.started_at);
       if (d.finished_at) state.finishedAt = new Date(d.finished_at);
       root.dataset.status = d.status;
@@ -1638,7 +1659,7 @@
                 return fetch(ds.apiUrl + '?meta=1')
                   .then(function (r) { return r.json(); })
                   .then(function (meta) {
-                    applyStatus({ status: st, started_at: meta.started_at, finished_at: meta.finished_at });
+                    applyStatus(meta);
                   })
                   .catch(function () { applyStatus({ status: st }); });
               }
@@ -1672,7 +1693,7 @@
               if (queuePosEl) queuePosEl.hidden = !show;
               if (queuePosN && show) queuePosN.textContent = meta.queue_position;
             } else {
-              applyStatus({ status: meta.status, started_at: meta.started_at, finished_at: meta.finished_at });
+              applyStatus(meta);
             }
           })
           .catch(function () {});
@@ -1854,7 +1875,7 @@
                 .then(function (r) { return r.json(); })
                 .then(function (meta) {
                   if (isTerminal(meta.status)) {
-                    applyStatus({ status: meta.status, started_at: meta.started_at, finished_at: meta.finished_at });
+                    applyStatus(meta);
                   }
                 })
                 .catch(function () {});

@@ -239,6 +239,9 @@ h2 { font-size: 20px; margin-bottom: 16px; }
 }
 .meta-value { font-size: 14px; color: var(--text); }
 .meta-duration { font-variant-numeric: tabular-nums; }
+.build-agent-name { overflow-wrap: anywhere; }
+.meta-value.build-agent-name { font-family: var(--font-mono); font-size: 13px; }
+.meta-cell { min-width: 0; }
 .meta-value.mono { font-family: var(--font-mono); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Failure callout */

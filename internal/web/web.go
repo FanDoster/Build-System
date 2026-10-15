@@ -23,6 +23,18 @@ import (
 // so this is the only way the client's CR-collapsing renderer can see the
 // real \r bytes in server-rendered log text.
 var tmplFuncs = template.FuncMap{
+	"buildAgentLabel": func(agent, executor string, status models.BuildStatus) string {
+		if agent != "" {
+			return agent
+		}
+		if !models.Remote(executor) {
+			return "Local runner"
+		}
+		if status == models.StatusPending {
+			return "Not assigned"
+		}
+		return "Not recorded"
+	},
 	"profilesJSON": func(profiles map[string]models.ExecutorProfile) string {
 		if len(profiles) == 0 {
 			return "{}"

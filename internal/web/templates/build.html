@@ -44,6 +44,10 @@
     <div class="meta-value meta-duration" id="meta-duration">{{if .Build.Duration}}{{.Build.Duration}}{{else}}—{{end}}</div>
   </div>
   <div class="meta-cell">
+    <div class="meta-label">Agent</div>
+    <div class="meta-value build-agent-name" id="meta-agent">{{buildAgentLabel .Build.Agent .Build.Executor .Build.Status}}</div>
+  </div>
+  <div class="meta-cell">
     <div class="meta-label">Image</div>
     <div class="meta-value mono" title="{{if .Project}}{{.Project.ImageName}}{{end}}">{{if .Project}}{{.Project.ImageName}}{{else}}—{{end}}</div>
   </div>
@@ -60,6 +64,8 @@
 <section class="log-viewer" id="build-log"
   data-build-id="{{.Build.ID}}"
   data-status="{{.Build.Status}}"
+  data-agent="{{.Build.Agent}}"
+  data-executor="{{.Build.Executor}}"
   data-api-url="{{$.BasePath}}/api/builds/{{.Build.ID}}"
   data-events-url="{{$.BasePath}}/api/builds/{{.Build.ID}}/events"
   data-log-url="{{$.BasePath}}/api/builds/{{.Build.ID}}/log"
@@ -87,7 +93,7 @@
   <div id="log-empty" class="log-empty" {{if ne .Build.Status "pending"}}hidden{{end}}>
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.5"/><path d="M8 4.5V8l2.5 1.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
     <div class="log-empty-title">Queued</div>
-    <div class="log-empty-sub">Waiting for the runner — logs will stream automatically.</div>
+    <div class="log-empty-sub">Waiting for a build worker — logs will stream automatically.</div>
     <div class="log-empty-dots"><span></span><span></span><span></span></div>
     <div class="log-empty-pos" id="queue-pos" {{if lt .QueuePos 2}}hidden{{end}}>Position in queue: <span id="queue-pos-n">{{.QueuePos}}</span></div>
   </div>

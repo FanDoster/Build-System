@@ -34,7 +34,7 @@ const livePingInterval = 25 * time.Second
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-10-14-unity-windows-shared-queue"
+const Version = "2026-10-15-build-agent-visibility"
 
 // Agent long-poll defaults. The hold is deliberately under the 60s nginx
 // defaults with room to spare: a claim request that outlives proxy_read_timeout
@@ -770,11 +770,13 @@ func (s *Server) handleBuildEvents(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(200)
 	fmt.Fprint(w, "retry: 2000\n\n")
 
-	writeStatus := func(status models.BuildStatus, startedAt, finishedAt *time.Time) {
+	writeStatus := func(status models.BuildStatus, startedAt, finishedAt *time.Time, owner *models.Build) {
 		data, _ := json.Marshal(map[string]interface{}{
 			"status":      status,
 			"started_at":  startedAt,
 			"finished_at": finishedAt,
+			"agent":       owner.Agent,
+			"executor":    owner.Executor,
 		})
 		fmt.Fprintf(w, "event: status\ndata: %s\n\n", data)
 	}
@@ -798,7 +800,7 @@ func (s *Server) handleBuildEvents(w http.ResponseWriter, r *http.Request) {
 		if chunk != "" {
 			writeLog(chunk, offset)
 		}
-		writeStatus(b.Status, b.StartedAt, b.FinishedAt)
+		writeStatus(b.Status, b.StartedAt, b.FinishedAt, b)
 		flusher.Flush()
 	}
 
@@ -855,7 +857,7 @@ func (s *Server) handleBuildEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeStatus(build.Status, build.StartedAt, build.FinishedAt)
+	writeStatus(build.Status, build.StartedAt, build.FinishedAt, build)
 	if len(replay) > 0 {
 		writeLog(replay, total)
 	}
@@ -909,7 +911,13 @@ func (s *Server) handleBuildEvents(w http.ResponseWriter, r *http.Request) {
 						sent += len(tail)
 					}
 				}
-				writeStatus(ev.Status, ev.StartedAt, ev.FinishedAt)
+				// Ownership can change after the initial pending snapshot. Read
+				// only metadata, not the potentially huge log, and keep the bus
+				// event's status/timestamps even if the row has moved on again.
+				if owner, err := s.DB.GetBuildSummary(id); err == nil {
+					build = owner
+				}
+				writeStatus(ev.Status, ev.StartedAt, ev.FinishedAt, build)
 			}
 			flusher.Flush()
 			if ev.Kind == "status" && ev.Status.Terminal() {
