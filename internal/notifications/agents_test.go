@@ -314,8 +314,13 @@ func TestObserveAgentsDoesNotInferSiblingCapabilityFromOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || events[0].ProjectID != projects[0].ID {
-		t.Fatalf("ownership leaked to sibling: %+v", events)
+	if len(events) != 2 {
+		t.Fatalf("expected separate availability and health incidents: %+v", events)
+	}
+	for _, event := range events {
+		if event.ProjectID != projects[0].ID {
+			t.Fatalf("ownership leaked to sibling: %+v", events)
+		}
 	}
 }
 

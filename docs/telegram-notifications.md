@@ -44,6 +44,65 @@ The checkbox serializes both checked and unchecked states as JSON booleans.
 Agent credentials cannot create projects, change this setting or open project settings.
 Polling, queue profiles, project secrets and email retain their existing behavior.
 
+## Agent controls
+
+Open **Agents → Telegram** on a machine's card. Controls apply to the actual agent
+name across its projects. They do not pause the agent or need an agent update.
+
+- **Telegram notifications** is the master switch. Off mutes every Telegram category
+  for this agent, including future event types. Category choices are preserved.
+- **Online / offline** controls reachability changes only.
+- **Health warnings** controls pause/resume, disk, clock skew, duplicate names,
+  doctor findings, failure streaks, stale reports, unencrypted connections and
+  their recoveries.
+- **Build results** controls outcomes owned by this agent. Ownership is the captured
+  build's actual `agent`, not a shared queue name or an executor profile.
+
+All four switches default to on, including agents known only from the live registry
+or build history. Preferences persist by name across server restarts and check-ins.
+Renaming an agent creates a different identity; preferences do not follow it.
+Forgetting its fleet record does not clear the notification preference.
+
+A message must pass **both** the project control and the agent control. Muting one
+agent leaves other agents and the local runner unchanged. Email is unchanged.
+Availability and health have separate observations and messages: an online/offline
+message contains no health details, and a health message contains no reachability
+line. Muting one category cannot hide transitions in the other category.
+
+Changes atomically suppress matching pending, unsent outbox events. Observations
+still advance while muted; unmuting or restarting does not replay them. Existing
+legacy combined agent messages need both availability and health enabled; muting
+either suppresses that unsent combined message. On upgrade, existing legacy agent
+baselines seed the new categories silently to avoid repeating old incidents.
+Accepted relay receipts keep being tracked, even after a mute. A POST already in
+flight cannot be recalled. The worker rechecks current preferences immediately
+before submission; payloads and idempotency keys remain unchanged across retries.
+
+Operator API (send `X-Builds-Csrf: 1` on PUT; URL-encode the name):
+
+```http
+PUT /api/agents/mac-one/notifications
+Content-Type: application/json
+
+{"availability":false}
+```
+
+The update is partial. Omitted properties keep their current values. Only JSON
+booleans for `enabled`, `availability`, `health` and `builds` are accepted; `null`,
+strings, unknown keys and trailing JSON are rejected. `GET` on the same endpoint
+reads the current preferences. Both return:
+
+```json
+{"agent":"mac-one","telegram_notifications":{"enabled":true,"availability":false,"health":true,"builds":true}}
+```
+
+These migrations are additive, but an older server does not enforce agent mutes.
+Use a roll-forward fix, not an old binary rollback. Production append-only build
+logs also require the safeguards in [log-storage.md](log-storage.md).
+
+Both endpoints and the fleet page require operator access; agent tokens cannot read
+or change these settings. They expose no relay key or routing identifiers.
+
 ## Server setup
 
 1. The owner creates the intended Telegram group.

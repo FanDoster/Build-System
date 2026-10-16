@@ -58,7 +58,6 @@ func (w *Worker) observeAgents(now time.Time) error {
 		if a.State == agents.StateWaiting {
 			continue
 		}
-		fingerprint, unhealthy := agentFingerprint(a)
 		for _, p := range projects {
 			if !notificationAgentMatches(p, a) {
 				continue
@@ -71,9 +70,12 @@ func (w *Worker) observeAgents(now time.Time) error {
 				return err
 			}
 			safeProject, safeAgent := w.sanitizeAgent(*full, a)
-			if err := w.DB.ObserveNotificationAgent(p.ID, a.Name, fingerprint,
-				w.projectPayload(safeProject, agentText(safeProject, safeAgent)), unhealthy, now); err != nil {
-				return err
+			for _, kind := range []string{"availability", "health"} {
+				fingerprint, unhealthy := agentKindFingerprint(a, kind)
+				if err := w.DB.ObserveNotificationAgentKind(p.ID, a.Name, kind, fingerprint,
+					w.projectPayload(safeProject, agentKindText(safeProject, safeAgent, kind)), unhealthy, now); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -153,12 +155,31 @@ func agentFingerprint(a agents.Agent) (string, bool) {
 	return hex.EncodeToString(digest[:]), unhealthy
 }
 
-func agentText(p models.Project, a agents.Agent) string {
+func agentKindFingerprint(a agents.Agent, kind string) (string, bool) {
+	if kind == "availability" {
+		if a.State == agents.StateOffline {
+			return "offline", true
+		}
+		return "online", false
+	}
+	// Reachability belongs only to availability, not the health digest.
+	a.State = agents.StateOnline
+	return agentFingerprint(a)
+}
+
+func agentText(p models.Project, a agents.Agent) string { return agentKindText(p, a, "agent") }
+
+func agentKindText(p models.Project, a agents.Agent, kind string) string {
 	lines := []string{fmt.Sprintf("🤖 Agent %s · %s", cleanPlain(a.Name, 64), cleanPlain(p.Name, 120))}
-	if a.State == agents.StateOffline {
-		lines = append(lines, "Offline — no recent claim poll or build heartbeat. Check the agent process, machine power and network; restart the agent if needed.")
-	} else {
-		lines = append(lines, "Online — claim poll or build heartbeat is current.")
+	if kind != "health" {
+		if a.State == agents.StateOffline {
+			lines = append(lines, "Offline — no recent claim poll or build heartbeat. Check the agent process, machine power and network; restart the agent if needed.")
+		} else {
+			lines = append(lines, "Online — claim poll or build heartbeat is current.")
+		}
+	}
+	if kind == "availability" {
+		return strings.Join(lines, "\n")
 	}
 	if a.Paused {
 		line := "Paused — not taking new builds. Resume the agent or wait for the pause to expire."
@@ -187,7 +208,7 @@ func agentText(p models.Project, a agents.Agent) string {
 	if a.Scheme == "http" {
 		lines = append(lines, "Not encrypted — this agent's requests arrived unencrypted. Its token has crossed the network in clear and should be rotated. Use HTTPS.")
 	}
-	if _, unhealthy := agentFingerprint(a); !unhealthy {
+	if _, unhealthy := agentKindFingerprint(a, "health"); !unhealthy {
 		lines = append(lines, "Healthy — no current fleet warnings; any previous issue has cleared.")
 	}
 	// Keep every fleet warning and its remedy ahead of bounded doctor

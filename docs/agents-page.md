@@ -215,7 +215,7 @@ In priority order — everything below (5) goes behind a disclosure triangle:
 
 ### 5.3 Actions
 
-Four, and no more: **pause/resume** (mandatory expiry, optional note), **cancel
+Machine actions: **pause/resume** (mandatory expiry, optional note), **cancel
 the running build** (already implemented), **forget an agent row**, and **copy
 the enrolment command**.
 
@@ -226,6 +226,32 @@ polling, its last-seen would go stale and the page would flip it to offline,
 destroying the distinction pause exists to express. The expiry is not a nicety
 at one operator: the person who pauses to update Unity is the same person who
 will forget, and an unexpiring pause is a dead CI that looks healthy.
+
+---
+
+### 5.4 Per-machine Telegram controls
+
+Each machine has a **Telegram notifications** master checkbox and three
+categories: **Online/offline**, **Health warnings**, and **Build results**.
+All default to enabled. Master off mutes all Telegram for that machine,
+including future event types. Its category choices remain stored, but their
+controls are disabled until master is on again. Project notification settings
+still apply. Build results belong to the actual agent recorded on a build,
+not to its logical queue; the queue coverage panel has no notification controls.
+
+The operator-only `PUT /api/agents/{name}/notifications` accepts partial
+`enabled`, `availability`, `health`, and `builds` booleans. Each checkbox saves
+only its own field through the normal CSRF-protected, base-path-aware API.
+The response contains `agent` and `telegram_notifications`; fleet agents carry
+the same nested preferences. No relay key or recipient is exposed here.
+
+While saving, controls reject further changes and show **Saving…**. Success
+shows **Saved.**; a failure restores the previous choice and displays an error.
+Preferences, pending state and feedback live outside the five-second row redraw.
+The redraw restores keyboard focus and keeps machine details open. GETs started
+before or during a save cannot replace that save's preferences; out-of-order
+older fleet responses are discarded. A later fresh poll can still show changes
+made by another operator. These controls do not change pause/resume or forget.
 
 ---
 

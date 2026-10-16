@@ -42,7 +42,7 @@
   <div id="agent-list">
     {{if .Fleet.Agents}}
       {{range .Fleet.Agents}}
-        <div class="agent-row">
+        <div class="agent-row" data-agent="{{.Name}}">
           <div class="agent-head">
             <span class="badge badge-{{.State}}">{{.State}}</span>
             <span class="agent-name mono">{{.Name}}</span>
@@ -124,7 +124,7 @@
           </div>
 
           {{if or .Unity .Tools .Workspaces .Timeouts}}
-            <details class="agent-details">
+            <details class="agent-details" data-agent="{{.Name}}">
               <summary>Machine detail</summary>
               <div class="agent-detail-body">
                 {{if .Unity}}<div><span class="agent-detail-key">Unity</span> {{range $i, $v := .Unity}}{{if $i}}, {{end}}<span class="mono">{{$v}}</span>{{end}}</div>{{end}}
@@ -145,6 +145,18 @@
               {{range .Recent}}<a class="chip chip-{{.Status}}" href="{{$.BasePath}}/builds/{{.ID}}" title="{{.Project}} — {{.Status}}{{if .Duration}} in {{.Duration}}{{end}}">#{{.Number}}</a>{{end}}
             </div>
           {{end}}
+
+          <!-- Mirrors notificationPanel() in app.js. Category choices survive
+               master mute; the server enforces both agent and project settings. -->
+          <fieldset class="agent-notifications" data-agent="{{.Name}}" aria-busy="false">
+            <legend class="sr-only">Telegram notifications for {{.Name}}</legend>
+            <label class="agent-notification-option"><input type="checkbox" data-notification="enabled" aria-label="{{.Name}}: Telegram notifications"{{if .TelegramNotifications.Enabled}} checked{{end}}> Telegram notifications</label>
+            <label class="agent-notification-option"><input type="checkbox" data-notification="availability" aria-label="{{.Name}}: Online/offline"{{if .TelegramNotifications.Availability}} checked{{end}}{{if not .TelegramNotifications.Enabled}} disabled{{end}}> Online/offline</label>
+            <label class="agent-notification-option"><input type="checkbox" data-notification="health" aria-label="{{.Name}}: Health warnings"{{if .TelegramNotifications.Health}} checked{{end}}{{if not .TelegramNotifications.Enabled}} disabled{{end}}> Health warnings</label>
+            <label class="agent-notification-option"><input type="checkbox" data-notification="builds" aria-label="{{.Name}}: Build results"{{if .TelegramNotifications.Builds}} checked{{end}}{{if not .TelegramNotifications.Enabled}} disabled{{end}}> Build results</label>
+            <p class="form-hint">Master off mutes all Telegram for this machine. Build results follow this machine, not its queue. Project settings still apply.</p>
+            <p class="agent-notification-status" role="status" aria-live="polite"></p>
+          </fieldset>
 
           <!-- The name is carried in a data attribute and encoded into the URL
                by the JS, never interpolated into an href here. It is asserted

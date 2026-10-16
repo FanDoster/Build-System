@@ -45,6 +45,85 @@
     var openDetail = Object.create(null);
     var base = document.body.dataset.basePath || '';
     var timer = null;
+    var notifications = Object.create(null);
+    var refreshSerial = 0;
+    var renderedSerial = 0;
+    var notificationFields = ['enabled', 'availability', 'health', 'builds'];
+    var notificationLabels = ['Telegram notifications', 'Online/offline', 'Health warnings', 'Build results'];
+
+    // Keep drafts, pending writes and feedback outside the rows: polling
+    // rebuilds the DOM. A GET begun before a write finishes must not undo it.
+    function notificationState(name, values, serial) {
+      var state = notifications[name];
+      if (!state) {
+        state = notifications[name] = { values: values, pending: false, message: '', ignoreThrough: 0 };
+      } else if (serial > state.ignoreThrough && !state.pending) {
+        state.values = values;
+      }
+      return state;
+    }
+
+    function readNotificationValues(value) {
+      var values = {};
+      notificationFields.forEach(function (key) {
+        values[key] = !value || value[key] !== false;
+      });
+      return values;
+    }
+
+    function notificationPanel(a, serial) {
+      var state = notificationState(a.name, readNotificationValues(a.telegram_notifications), serial);
+      var panel = el('fieldset', 'agent-notifications');
+      panel.dataset.agent = a.name;
+      panel.appendChild(el('legend', 'sr-only', 'Telegram notifications for ' + a.name));
+      notificationFields.forEach(function (key, index) {
+        var label = el('label', 'agent-notification-option');
+        var input = el('input');
+        input.type = 'checkbox';
+        input.dataset.notification = key;
+        input.setAttribute('aria-label', a.name + ': ' + notificationLabels[index]);
+        label.appendChild(input);
+        label.appendChild(document.createTextNode(' ' + notificationLabels[index]));
+        panel.appendChild(label);
+      });
+      panel.appendChild(el('p', 'form-hint',
+        'Master off mutes all Telegram for this machine. Build results follow this machine, not its queue. Project settings still apply.'));
+      var status = el('p', 'agent-notification-status');
+      status.setAttribute('role', 'status');
+      status.setAttribute('aria-live', 'polite');
+      panel.appendChild(status);
+      updateNotificationPanel(panel, state);
+      return panel;
+    }
+
+    function updateNotificationPanel(panel, state) {
+      panel.setAttribute('aria-busy', String(state.pending));
+      panel.querySelectorAll('input[data-notification]').forEach(function (input) {
+        var key = input.dataset.notification;
+        input.checked = state.values[key];
+        input.disabled = key !== 'enabled' && !state.values.enabled;
+        // Keep the active checkbox focusable while saving, but refuse input.
+        input.setAttribute('aria-disabled', String(state.pending || input.disabled));
+      });
+      var status = panel.querySelector('[role="status"]');
+      status.textContent = state.message;
+      status.classList.toggle('agent-warn', !!state.error);
+    }
+
+    function updateNotifications(name) {
+      root.querySelectorAll('.agent-notifications').forEach(function (panel) {
+        if (panel.dataset.agent === name) updateNotificationPanel(panel, notifications[name]);
+      });
+    }
+
+    // The server-rendered controls work even if the first fleet GET fails.
+    root.querySelectorAll('.agent-notifications').forEach(function (panel) {
+      var values = {};
+      panel.querySelectorAll('input[data-notification]').forEach(function (input) {
+        values[input.dataset.notification] = input.checked;
+      });
+      notificationState(panel.dataset.agent, values, 0);
+    });
 
     function el(tag, cls, text) {
       var e = document.createElement(tag);
@@ -78,8 +157,9 @@
       return row;
     }
 
-    function agentRow(a) {
+    function agentRow(a, serial) {
       var row = el('div', 'agent-row');
+      row.dataset.agent = a.name;
 
       var head = el('div', 'agent-head');
       head.appendChild(el('span', 'badge badge-' + a.state, a.state));
@@ -279,6 +359,8 @@
         row.appendChild(rec);
       }
 
+      row.appendChild(notificationPanel(a, serial));
+
       var acts = el('div', 'agent-actions');
       acts.dataset.agent = a.name;   // never interpolated into a URL here
       acts.appendChild(actionBtn(a.paused ? 'resume' : 'pause', a.paused ? 'Resume' : 'Pause\u2026'));
@@ -309,7 +391,14 @@
       return b;
     }
 
-    function render(fleet) {
+    function render(fleet, serial) {
+      var active = document.activeElement;
+      var focusedRow = active && active.closest('.agent-row');
+      var focusName = focusedRow && focusedRow.dataset.agent;
+      var focusKey = active && active.dataset.notification;
+      var focusAction = active && active.dataset.act;
+      var focusSummary = active && active.tagName === 'SUMMARY';
+      var focusHref = active && active.tagName === 'A' ? active.getAttribute('href') : null;
       // The banner has two writers with different lifetimes: this one, which
       // runs every five seconds, and fail(), which reports a rejected action.
       // Without the flag the poll wipes the operator's error almost as soon as
@@ -333,17 +422,36 @@
       }
       root.textContent = '';
       if (fleet.agents && fleet.agents.length) {
-        for (var j = 0; j < fleet.agents.length; j++) root.appendChild(agentRow(fleet.agents[j]));
+        for (var j = 0; j < fleet.agents.length; j++) root.appendChild(agentRow(fleet.agents[j], serial));
       } else {
         root.appendChild(el('p', 'empty',
           "No agent has ever claimed a build here. Point one at this server and set a project's executor to a queue it serves."));
       }
+      if (focusName !== null && focusName !== undefined) {
+        root.querySelectorAll('.agent-row').forEach(function (row) {
+          if (row.dataset.agent !== focusName) return;
+          row.querySelectorAll('input[data-notification], button[data-act], summary, a').forEach(function (control) {
+            if ((focusKey && control.dataset.notification === focusKey) ||
+                (focusAction && control.dataset.act === focusAction) ||
+                (focusSummary && control.tagName === 'SUMMARY') ||
+                (focusHref && control.tagName === 'A' && control.getAttribute('href') === focusHref)) {
+              if (!control.disabled) control.focus({ preventScroll: true });
+            }
+          });
+        });
+      }
     }
 
     function refresh() {
+      var serial = ++refreshSerial;
       fetch(base + '/api/agents', { headers: { 'Accept': 'application/json' } })
         .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
-        .then(function (fleet) { render(fleet); setConn('live'); })
+        .then(function (fleet) {
+          if (serial < renderedSerial) return;
+          renderedSerial = serial;
+          render(fleet, serial);
+          setConn('live');
+        })
         .catch(function () { setConn('reconnecting'); });
     }
 
@@ -364,6 +472,12 @@
     }, true);   // capture: toggle does not bubble
 
     root.addEventListener('click', function (ev) {
+      var input = ev.target.closest('input[data-notification]');
+      if (input) {
+        var panel = input.closest('.agent-notifications');
+        if (notifications[panel.dataset.agent].pending) ev.preventDefault();
+        return;
+      }
       var btn = ev.target.closest('button[data-act]');
       if (!btn) return;
       var host = btn.closest('.agent-actions');
@@ -394,6 +508,53 @@
           'Its builds are kept, and it reappears if it is still polling.')) return;
         send(btn, 'DELETE', url, null);
       }
+    });
+
+    root.addEventListener('change', function (ev) {
+      var input = ev.target;
+      if (!input.matches('input[data-notification]')) return;
+      var panel = input.closest('.agent-notifications');
+      var name = panel.dataset.agent;
+      var state = notifications[name];
+      if (state.pending || input.disabled) { updateNotifications(name); return; }
+      var previous = state.values;
+      var draft = readNotificationValues(previous);
+      var key = input.dataset.notification;
+      draft[key] = input.checked;
+      var patch = {};
+      patch[key] = input.checked;
+      state.values = draft;
+      state.pending = true;
+      state.error = false;
+      state.message = 'Saving…';
+      state.ignoreThrough = refreshSerial;
+      updateNotifications(name);
+      fetch(base + '/api/agents/' + encodeURIComponent(name) + '/notifications', {
+        method: 'PUT',
+        headers: { 'X-Builds-Csrf': '1', 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch)
+      }).then(function (res) {
+        return res.json().catch(function () { throw new Error('HTTP ' + res.status); })
+          .then(function (data) {
+            if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+            if (data.agent !== name || !data.telegram_notifications ||
+                !notificationFields.every(function (field) {
+                  return typeof data.telegram_notifications[field] === 'boolean';
+                })) throw new Error('Invalid save response. Refresh and try again.');
+            state.values = readNotificationValues(data.telegram_notifications);
+            state.message = 'Saved.';
+          });
+      }).catch(function (err) {
+        state.values = previous;
+        state.error = true;
+        state.message = 'Not saved: ' + err.message;
+      }).then(function () {
+        state.pending = false;
+        // This includes GETs started while the PUT was in flight, not only
+        // ones started before it. Only a later read can replace saved values.
+        state.ignoreThrough = refreshSerial;
+        updateNotifications(name);
+      });
     });
 
     function fail(msg) {

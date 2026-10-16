@@ -58,9 +58,10 @@ type RecentBuild struct {
 
 // Agent is one machine as the page sees it.
 type Agent struct {
-	Name      string   `json:"name"`
-	State     State    `json:"state"`
-	Executors []string `json:"executors,omitempty"`
+	Name                  string                              `json:"name"`
+	TelegramNotifications models.AgentNotificationPreferences `json:"telegram_notifications"`
+	State                 State                               `json:"state"`
+	Executors             []string                            `json:"executors,omitempty"`
 	// Scheme is how its last request reached us. "http" means the agent token
 	// and any clone token it was handed crossed the network in clear. Empty
 	// means we do not know — which is NOT the same as plaintext, and must not
@@ -239,6 +240,18 @@ func BuildHealth(src HealthSource, reg *Registry, now time.Time) (*Fleet, error)
 // keeps UI-only derived history, steps and capability inference out of the result.
 type healthSource struct{ HealthSource }
 
+// Optional for older fleet fixtures; durable DB sources provide this surface.
+type notificationPreferencesSource interface {
+	ListAgentNotificationPreferences() (map[string]models.AgentNotificationPreferences, error)
+}
+
+func (s healthSource) ListAgentNotificationPreferences() (map[string]models.AgentNotificationPreferences, error) {
+	if source, ok := s.HealthSource.(notificationPreferencesSource); ok {
+		return source.ListAgentNotificationPreferences()
+	}
+	return nil, nil
+}
+
 func (s healthSource) RunningBuildForAgent(agent string) (*models.Build, error) {
 	return s.RunningBuildHealthForAgent(agent)
 }
@@ -270,13 +283,25 @@ func Build(src Source, reg *Registry, now time.Time) (*Fleet, error) {
 func build(src Source, reg *Registry, now time.Time, healthOnly bool) (*Fleet, error) {
 	f := &Fleet{ServerStarted: reg.StartedAt(), Now: now}
 
+	preferences := map[string]models.AgentNotificationPreferences{}
+	if source, ok := src.(notificationPreferencesSource); ok {
+		var err error
+		preferences, err = source.ListAgentNotificationPreferences()
+		if err != nil {
+			return nil, fmt.Errorf("agent notification preferences: %w", err)
+		}
+	}
 	var order []*Agent
 	byName := map[string]*Agent{}
 	at := func(name string) *Agent {
 		if a, ok := byName[name]; ok {
 			return a
 		}
-		a := &Agent{Name: name}
+		prefs, ok := preferences[name]
+		if !ok {
+			prefs = models.DefaultAgentNotificationPreferences()
+		}
+		a := &Agent{Name: name, TelegramNotifications: prefs}
 		byName[name] = a
 		order = append(order, a)
 		return a

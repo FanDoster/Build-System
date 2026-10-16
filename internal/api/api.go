@@ -33,7 +33,7 @@ const livePingInterval = 25 * time.Second
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-10-16-resource-optimizations"
+const Version = "2026-10-16-agent-notification-controls"
 
 // Agent long-poll defaults. The hold is deliberately under the 60s nginx
 // defaults with room to spare: a claim request that outlives proxy_read_timeout
@@ -139,6 +139,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/agents/{name}/pause", s.handlePauseAgent)
 	mux.HandleFunc("POST /api/agents/{name}/resume", s.handleResumeAgent)
 	mux.HandleFunc("DELETE /api/agents/{name}", s.handleForgetAgent)
+	mux.HandleFunc("GET /api/agents/{name}/notifications", s.handleAgentNotifications)
+	mux.HandleFunc("PUT /api/agents/{name}/notifications", s.handleAgentNotifications)
 	mux.HandleFunc("POST /api/builds/{id}/log", s.handleAgentLog)
 	mux.HandleFunc("POST /api/builds/{id}/heartbeat", s.handleAgentHeartbeat)
 	mux.HandleFunc("POST /api/builds/{id}/finish", s.handleAgentFinish)
