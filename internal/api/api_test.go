@@ -534,12 +534,12 @@ func TestBuildLogEndpoint(t *testing.T) {
 		t.Errorf("disposition = %q", cd)
 	}
 
-	// Live bus buffer is preferred over the (stale) DB row.
+	// Polling serves durable bytes even when the bus contains different data.
 	_, b2 := seedBuild(t, s, models.StatusRunning, "db-old")
 	s.Bus.Publish(b2.ID, []byte("bus-fresh-content"))
 	w = doJSON(t, mux, "GET", fmt.Sprintf("/api/builds/%d/log", b2.ID), nil)
-	if w.Body.String() != "bus-fresh-content" {
-		t.Errorf("live log = %q, want bus content", w.Body.String())
+	if w.Body.String() != "db-old" {
+		t.Errorf("live log = %q, want durable content", w.Body.String())
 	}
 }
 

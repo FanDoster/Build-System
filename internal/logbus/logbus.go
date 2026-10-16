@@ -1,15 +1,16 @@
 // Package logbus is an in-memory pub/sub hub for live build logs.
 //
-// Each active build has a topic holding the full scrubbed log produced since
-// the build was claimed, plus a set of subscribers. Subscribe atomically
+// Each topic retains a bounded tail of committed bytes at absolute byte
+// offsets, plus a set of subscribers. Older bytes replay from durable storage. Subscribe atomically
 // returns a snapshot and a live channel under one lock, so a reader can never
 // miss or duplicate bytes between replay and streaming. The DB row is the
-// durable copy; the topic buffer exactly mirrors the bytes appended to it.
+// durable copy; a topic retains only its newest committed bytes.
 package logbus
 
 import (
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/FanDoster/Build-System/internal/models"
 )
@@ -17,6 +18,10 @@ import (
 // RetainAfterClose is how long a finished build's buffer stays available for
 // late reconnects before the topic is dropped.
 const RetainAfterClose = 30 * time.Second
+
+// MaxRetainedBytes bounds each live topic's backing buffer. Subscriber event
+// queues are separately bounded by subBuffer. Offsets remain absolute bytes.
+const MaxRetainedBytes = 256 * 1024
 
 // subBuffer is the per-subscriber channel capacity. A subscriber that falls
 // this far behind is dropped (closed); clients resume via ?offset replay.
@@ -33,6 +38,7 @@ type Event struct {
 
 type topic struct {
 	buf    []byte
+	base   int // absolute byte offset of buf[0]
 	subs   map[chan Event]struct{}
 	closed bool
 }
@@ -59,7 +65,9 @@ func (b *Bus) topicLocked(id int64) *topic {
 // total offset, a live event channel, and an unsubscribe func. Safe to call
 // for builds with no topic yet (e.g. still pending): an empty topic is
 // created so no events are missed. If the topic is already closed the
-// returned channel is closed immediately after any snapshot.
+// returned channel is closed immediately after any snapshot. If from predates
+// retained history, snapshot is nil; replay durable bytes through cur before
+// handling queued absolute-offset events.
 func (b *Bus) Subscribe(id int64, from int) (snapshot []byte, cur int, ch <-chan Event, unsub func()) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -68,11 +76,15 @@ func (b *Bus) Subscribe(id int64, from int) (snapshot []byte, cur int, ch <-chan
 	if from < 0 {
 		from = 0
 	}
-	if from > len(t.buf) {
-		from = len(t.buf)
+	cur = t.base + len(t.buf)
+	if from > cur {
+		from = cur
 	}
-	snapshot = append([]byte(nil), t.buf[from:]...)
-	cur = len(t.buf)
+	// An old offset has no in-memory snapshot. The caller must replay durable
+	// storage through cur, then deduplicate queued events by absolute offset.
+	if from >= t.base {
+		snapshot = append([]byte(nil), t.buf[from-t.base:]...)
+	}
 
 	c := make(chan Event, subBuffer)
 	if t.closed {
@@ -106,15 +118,121 @@ func (b *Bus) Publish(id int64, chunk []byte) {
 	if t.closed {
 		return
 	}
-	t.buf = append(t.buf, chunk...)
-	ev := Event{Kind: "log", Chunk: string(chunk), Offset: len(t.buf)}
-	for c := range t.subs {
-		select {
-		case c <- ev:
-		default:
+	t.appendTail(chunk)
+	t.publishLog(chunk, t.base+len(t.buf))
+}
+
+// Length reads topic metadata only. It never copies log bytes.
+func (b *Bus) Length(id int64) (int, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t, ok := b.topics[id]
+	if !ok {
+		return 0, false
+	}
+	return t.base + len(t.buf), true
+}
+
+// PublishAt publishes committed bytes at their authoritative byte offset.
+// Duplicate or overlapping retries are trimmed. A gap drops subscribers so
+// they reconnect and replay durable storage, rather than accepting false offsets.
+func (b *Bus) PublishAt(id int64, start int, chunk []byte) {
+	if len(chunk) == 0 || start < 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t := b.topicLocked(id)
+	if t.closed {
+		return
+	}
+	total := t.base + len(t.buf)
+	if start > total {
+		// Storage has a prefix this topic never observed. Disconnect existing
+		// readers for durable replay, then retain the authoritative newest tail.
+		for c := range t.subs {
 			delete(t.subs, c)
 			close(c)
 		}
+		t.buf = t.buf[:0]
+		t.base = start
+	} else {
+		overlap := total - start
+		if overlap >= len(chunk) {
+			return
+		}
+		chunk = chunk[overlap:]
+	}
+	t.appendTail(chunk)
+	t.publishLog(chunk, t.base+len(t.buf))
+}
+
+// appendTail never allocates a backing array larger than the configured cap,
+// including a single huge append or seed. It may split UTF-8 only at the old
+// retention boundary; offsets and raw tails are bytes, never rune counts.
+func (t *topic) appendTail(chunk []byte) {
+	total := t.base + len(t.buf) + len(chunk)
+	need := len(t.buf) + len(chunk)
+	if need > MaxRetainedBytes {
+		need = MaxRetainedBytes
+	}
+	if cap(t.buf) < need {
+		capacity := cap(t.buf) * 2
+		if capacity < 4096 {
+			capacity = 4096
+		}
+		if capacity < need {
+			capacity = need
+		}
+		if capacity > MaxRetainedBytes {
+			capacity = MaxRetainedBytes
+		}
+		buf := make([]byte, len(t.buf), capacity)
+		copy(buf, t.buf)
+		t.buf = buf
+	}
+	if len(chunk) >= MaxRetainedBytes {
+		t.buf = t.buf[:MaxRetainedBytes]
+		copy(t.buf, chunk[len(chunk)-MaxRetainedBytes:])
+	} else {
+		drop := len(t.buf) + len(chunk) - MaxRetainedBytes
+		if drop > 0 {
+			copy(t.buf, t.buf[drop:])
+			t.buf = t.buf[:len(t.buf)-drop]
+		}
+		t.buf = append(t.buf, chunk...)
+	}
+	t.base = total - len(t.buf)
+}
+
+// Queued log events are independently bounded as well as topic retention.
+// Valid UTF-8 runes are never split across event payloads.
+const maxEventBytes = 64 * 1024
+
+func (t *topic) publishLog(chunk []byte, end int) {
+	offset := end - len(chunk)
+	for len(chunk) > 0 && len(t.subs) > 0 {
+		n := len(chunk)
+		if n > maxEventBytes {
+			n = maxEventBytes
+			for n > 0 && !utf8.RuneStart(chunk[n]) {
+				n--
+			}
+			if n == 0 {
+				n = maxEventBytes
+			}
+		}
+		offset += n
+		ev := Event{Kind: "log", Chunk: string(chunk[:n]), Offset: offset}
+		for c := range t.subs {
+			select {
+			case c <- ev:
+			default:
+				delete(t.subs, c)
+				close(c)
+			}
+		}
+		chunk = chunk[n:]
 	}
 }
 
@@ -152,49 +270,47 @@ func (b *Bus) PublishStatus(id int64, status models.BuildStatus, startedAt, fini
 	}
 }
 
-// Seed installs already-durable log bytes into a topic's buffer WITHOUT
-// publishing them, and only when the buffer is shorter than what it is given.
-//
-// It exists for one situation: a build that outlived the process streaming it.
-// A remote agent keeps building across a server restart, so the new process
-// meets a build whose stored log is long and whose topic is brand new and
-// empty — and appending to that gap would hand subscribers offsets that mean
-// nothing. Seeding restores the invariant that the buffer mirrors the DB.
-//
-// The silence is the point. Anyone who subscribed to the empty topic replayed
-// those same bytes from the stored log (Subscribe returning cur == 0 is
-// exactly the signal handleBuildEvents uses to fall back to it), so
-// publishing them would paint the log twice.
-func (b *Bus) Seed(id int64, data []byte) int {
+// Seed is a compatibility wrapper for a complete durable log. Only its
+// bounded suffix is retained. Prefer SeedAt to avoid reading all durable bytes.
+func (b *Bus) Seed(id int64, data []byte) int { return b.SeedAt(id, 0, data) }
+
+// SeedAt silently installs a durable suffix at its absolute byte offset. It
+// never moves the total offset backward and never publishes replay bytes.
+func (b *Bus) SeedAt(id int64, start int, data []byte) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
 	t := b.topicLocked(id)
-	if t.closed || len(t.buf) >= len(data) {
-		return len(t.buf)
+	total := t.base + len(t.buf)
+	if start < 0 || t.closed || start+len(data) <= total {
+		return total
 	}
-	t.buf = append(t.buf[:0], data...)
-	return len(t.buf)
+	t.buf = t.buf[:0]
+	t.base = start
+	t.appendTail(data)
+	return t.base + len(t.buf)
 }
 
-// LogTail returns buffered bytes from `from` without subscribing, plus the
-// current total offset. ok is false when the build has no live topic (serve
-// from the DB instead).
+// LogTail returns retained bytes from the absolute byte offset from. If from
+// predates the retention boundary, ok is false and cur is still the absolute
+// total; callers must replay durable storage rather than silently lose bytes.
 func (b *Bus) LogTail(id int64, from int) (tail []byte, cur int, ok bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
 	t, exists := b.topics[id]
 	if !exists {
 		return nil, 0, false
 	}
+	cur = t.base + len(t.buf)
 	if from < 0 {
 		from = 0
 	}
-	if from > len(t.buf) {
-		from = len(t.buf)
+	if from < t.base {
+		return nil, cur, false
 	}
-	return append([]byte(nil), t.buf[from:]...), len(t.buf), true
+	if from > cur {
+		from = cur
+	}
+	return append([]byte(nil), t.buf[from-t.base:]...), cur, true
 }
 
 // Live reports whether the build currently has an open topic.

@@ -122,7 +122,8 @@ Two consequences worth holding on to here:
   to Steam is not, and the server cannot know how far it got.
 
 `internal/logbus` is the in-memory pub/sub hub connecting the runner's output to SSE
-clients. The DB row is the durable copy; the topic buffer mirrors it byte-for-byte.
+clients. Append-only SQLite chunks are the durable copy; the topic retains only a bounded
+256 KiB suffix of committed bytes at absolute offsets.
 
 ### Knowing an agent is there
 
@@ -373,21 +374,28 @@ server that may be mid-build — so losing work on restart is a routine event he
 edge case. Two paths cover it: the runner requeues on a `context.Canceled` cause
 (graceful SIGTERM), and `recoverOrphanedBuilds` requeues rows left `running` by a hard
 kill. Both are bounded by `models.MaxBuildRequeues`, without which a build that crashes
-the server would be retried on every boot forever. The runner writes the `[restart]`
-seam **through the log sink**, never straight to the row — see the byte-mirror note
-below.
+the server would be retried on every boot forever. The runner flushes its sink before atomically committing the `[restart]` seam and
+requeue state, then publishes the committed offset — see the durable-log note below.
 
-**The DB log and the logbus buffer must stay byte-identical** for a live build. Anything
-appending to `builds.log` via SQL while subscribers exist has to mirror the same bytes
-onto the bus (`handleCancelBuild` does this for the cancel tombstone). This is why
-`db.RequeueBuild` does *not* write the log seam itself and `db.RequeueNote` is exported
-for callers to write at the right layer. The agent log endpoint holds
-`Server.agentLogMu` across read-length → publish → append for the same reason, and calls
-`logbus.Seed` first when the buffer is behind the row — which happens whenever a build
-outlives the process that was streaming it.
+**Durable log bytes precede live publication.** Every log-write path commits to
+`build_log_chunks` and `build_log_state` before publishing the returned byte offset
+with `logbus.PublishAt`. Failed writes must not reach subscribers. `Length` reads
+absolute-total metadata without copying bytes. `SeedAt` silently restores only a
+bounded durable suffix after restart or requeue. Older LogTail offsets require
+storage fallback; SSE always replays storage before offset-deduplicated events. SSE subscribes before DB replay, then trims overlapping queued
+events by their byte offsets. It always backfills storage before terminal status.
+
+`builds.log` is an immutable legacy prefix, not the authoritative whole log. Old
+rows gain byte-count state lazily on first append; migration never copies history.
+New builds have zero-prefix state. Chunks are at most 64 KiB BLOBs. Read logs through
+`GetBuild`, `BuildLogLen` and `BuildLogSlice`; raw SQL `builds.log` misses new bytes.
+`UpdateBuildStatus` retains explicit full-replacement compatibility and atomically
+resets legacy/chunks/state. Production streaming and queue-full paths never use it.
+Cancel, stale failure and restart seams commit their note and state together.
+See [docs/log-storage.md](docs/log-storage.md) for rollout and rollback constraints.
 
 **`length()` in SQLite counts characters, not bytes.** Log offsets are byte offsets, so
-`db.BuildLogLen` uses `length(CAST(log AS BLOB))`. The plain spelling agrees with Go's
+legacy `db.BuildLogLen` uses `length(CAST(log AS BLOB))`, and chunked rows use the explicit byte count. The plain spelling agrees with Go's
 `len` right up until a build prints a non-ASCII character, and Unity logs are full of
 them. The driver also stores `time.Time` in Go's own format while SQLite's `datetime()`
 defaults write another, so **never compare timestamps in a WHERE clause** — that is why
@@ -523,17 +531,15 @@ of a running agent build broadcasts a full snapshot to every open list page. Onl
 agent build runs, today. Do not make it permanent by putting an always-moving field for
 *idle* agents in the same snapshot; see [docs/agents-page.md](docs/agents-page.md) §7.
 
-An agent log append publishes to the bus before writing the row (the house ordering, so
-a subscriber's DB-fallback replay can never double up with a queued publish). If that DB
-write then fails — `SQLITE_BUSY` past the timeout, or a full disk — the agent retries
-from its old offset and the chunk lands in the buffer twice. The stored log stays
-correct and a reload after the topic expires shows the truth; only the live view of a
-build on an ailing server is affected. Fixing it properly needs a way to truncate a
-topic, which nothing else wants.
+Log appends are now durable-first. Agent append transactions recheck ownership,
+running status and byte length, and renew the heartbeat. Agent terminal writes are
+conditional, so a late finish cannot overwrite the janitor's decision. Sink commit
+failures retain the pending buffer, return errors on forced flush/Close and suppress
+terminal publication until the final bytes commit.
 
 Not bugs, just unbuilt: the registry host is hardcoded in `runner.go` (should be
 `BUILDS_REGISTRY`); images are tagged `:latest` only, so there is no rollback target;
 `/api/builds` and `/api/projects/{id}/builds` still serialize full logs per row
 (`ListRecentBuildSummaries` is the log-free query the live feed uses — the list
-endpoints could take the same treatment); and `AppendBuildLog`'s string concat in
-SQLite is O(n²) for very large logs.
+endpoints could take the same treatment); full log downloads and initial SSE replay still allocate the requested historical
+tail. Live topic retention is bounded to 256 KiB with durable replay for older bytes.

@@ -112,6 +112,9 @@ func TestSinkCRSegmentsAndPartialLine(t *testing.T) {
 	sink := newLogSink(buildID, "", database, bus)
 
 	sink.Write([]byte("Progress 10%\rProgress 20%\rdone\npartial"))
+	sink.mu.Lock()
+	sink.flushDBLocked()
+	sink.mu.Unlock()
 	tail, _, _ := bus.LogTail(buildID, 0)
 	if string(tail) != "Progress 10%\rProgress 20%\rdone\n" {
 		t.Errorf("emitted = %q, want CR/NL-terminated segments only", tail)
@@ -119,6 +122,9 @@ func TestSinkCRSegmentsAndPartialLine(t *testing.T) {
 
 	// The partial line is held until more input or Close.
 	sink.Write([]byte(" now finished\n"))
+	sink.mu.Lock()
+	sink.flushDBLocked()
+	sink.mu.Unlock()
 	tail, _, _ = bus.LogTail(buildID, 0)
 	if !strings.HasSuffix(string(tail), "partial now finished\n") {
 		t.Errorf("partial line not joined: %q", tail)

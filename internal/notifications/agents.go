@@ -16,8 +16,9 @@ import (
 	"github.com/FanDoster/Build-System/internal/models"
 )
 
-// Fleet assembly normally reads running logs to find step names. Notifications
-// need only health and ownership, never log content (which may contain secrets).
+// Legacy log-free adapter retained for existing fleet callers/tests. Production
+// notification observation below uses BuildHealth's narrower database surface;
+// suppressing only the log tail would still read full build summaries.
 type notificationAgentSource struct {
 	agents.Source
 	rows []db.AgentRow
@@ -41,8 +42,7 @@ func (w *Worker) observeAgents(now time.Time) error {
 	if now.Sub(w.Registry.StartedAt()) < models.AgentHeartbeatTTL {
 		return nil
 	}
-	src := &notificationAgentSource{Source: w.DB}
-	fleet, err := agents.Build(src, w.Registry, now)
+	fleet, err := agents.BuildHealth(w.DB, w.Registry, now)
 	if err != nil {
 		return err
 	}
@@ -54,23 +54,10 @@ func (w *Worker) observeAgents(now time.Time) error {
 		return err
 	}
 
-	// Fleet can infer a legacy queue from ownership for its coverage panel.
-	// That must not become a capability here: ownership proves eligibility
-	// only for that exact current project, not its neighbours on the queue.
-	advertised := make(map[string][]string)
-	for _, row := range src.rows {
-		advertised[row.Name] = row.Executors
-	}
-	for _, sighting := range w.Registry.Snapshot() {
-		if len(sighting.Executors) > 0 {
-			advertised[sighting.Name] = sighting.Executors
-		}
-	}
 	for _, a := range fleet.Agents {
 		if a.State == agents.StateWaiting {
 			continue
 		}
-		a.Executors = advertised[a.Name]
 		fingerprint, unhealthy := agentFingerprint(a)
 		for _, p := range projects {
 			if !notificationAgentMatches(p, a) {

@@ -234,7 +234,7 @@ func (p *Poller) pollProject(id int64) {
 	case p.BuildCh <- build:
 		log.Printf("Poller: %s: queued build %d for %s", project.Name, build.ID, sha)
 	default:
-		p.DB.UpdateBuildStatus(build.ID, models.StatusFailed, "Build not started: queue is full\n")
+		p.DB.FailPendingBuildWithNote(build.ID, "Build not started: queue is full\n")
 		log.Printf("Poller: %s: queue full, dropped build %d", project.Name, build.ID)
 	}
 }

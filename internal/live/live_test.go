@@ -171,8 +171,22 @@ func TestNewBuildIsBroadcastToIdlePage(t *testing.T) {
 	if ok, err := d.ClaimBuild(b.ID); err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
-	if msg := recv(t, ch); msg.Builds[0].Status != models.StatusRunning {
-		t.Fatalf("status after claim = %q, want running", msg.Builds[0].Status)
+	// A sampler may have captured another pending progress snapshot before
+	// ClaimBuild committed (especially under -race). Consume it, not the future.
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case raw := <-ch:
+			var snapshot Message
+			if err := json.Unmarshal(raw, &snapshot); err != nil {
+				t.Fatal(err)
+			}
+			if len(snapshot.Builds) == 1 && snapshot.Builds[0].Status == models.StatusRunning {
+				return
+			}
+		case <-deadline:
+			t.Fatal("running snapshot not received after claim")
+		}
 	}
 }
 

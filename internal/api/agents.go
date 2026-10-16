@@ -12,6 +12,7 @@ import (
 
 	"github.com/FanDoster/Build-System/internal/agents"
 	"github.com/FanDoster/Build-System/internal/db"
+	"github.com/FanDoster/Build-System/internal/logbus"
 	"github.com/FanDoster/Build-System/internal/models"
 )
 
@@ -572,23 +573,32 @@ func (s *Server) handleAgentLog(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if tail != "" {
-		s.seedBus(id, total)
-		// Bus before DB, exactly as the runner's sink does it: a subscriber
-		// that arrives between the two either sees the bytes in its snapshot
-		// or reads them from the DB, never both.
-		s.Bus.Publish(id, []byte(tail))
-		if err := s.DB.AppendBuildLog(id, tail); err != nil {
+		if err := s.seedBus(id, total); err != nil {
 			writeError(w, 500, err.Error())
 			return
 		}
-		total += len(tail)
+		start, err := s.DB.AppendAgentBuildLog(id, req.Agent, total, tail)
+		if err != nil {
+			if errors.Is(err, db.ErrLogConflict) {
+				writeJSON(w, 409, map[string]interface{}{"error": "build or log changed", "len": start})
+				return
+			}
+			writeError(w, 500, err.Error())
+			return
+		}
+		s.Bus.PublishAt(id, start, []byte(tail))
+		total = start + len(tail)
 	}
 
 	// The upload doubles as a heartbeat: a build that is talking is alive, and
 	// this is also where a pending cancel reaches a busy agent soonest.
-	_, cancel, err := s.DB.HeartbeatBuild(id, req.Agent)
+	ok, cancel, err := s.DB.HeartbeatBuild(id, req.Agent)
 	if err != nil {
 		writeError(w, 500, err.Error())
+		return
+	}
+	if !ok {
+		writeJSON(w, 409, map[string]interface{}{"error": "build is no longer yours", "len": total})
 		return
 	}
 	writeJSON(w, 200, map[string]interface{}{"len": total, "cancel": cancel})
@@ -604,18 +614,23 @@ func (s *Server) handleAgentLog(w http.ResponseWriter, r *http.Request) {
 // mirrors the DB. Silent by design — any subscriber attached in that window
 // replayed the same bytes from the DB already, so publishing them would show
 // the log twice.
-func (s *Server) seedBus(id int64, storedLen int) {
+func (s *Server) seedBus(id int64, storedLen int) error {
 	if storedLen == 0 {
-		return
+		return nil
 	}
-	if _, cur, ok := s.Bus.LogTail(id, 0); ok && cur >= storedLen {
-		return
+	if cur, ok := s.Bus.Length(id); ok && cur >= storedLen {
+		return nil
 	}
-	build, err := s.DB.GetBuild(id)
+	from := storedLen - logbus.MaxRetainedBytes
+	if from < 0 {
+		from = 0
+	}
+	data, err := s.DB.BuildLogSlice(id, from, storedLen-from)
 	if err != nil {
-		return
+		return err
 	}
-	s.Bus.Seed(id, []byte(build.Log))
+	s.Bus.SeedAt(id, from, data)
+	return nil
 }
 
 // handleAgentHeartbeat renews the lease on a claimed build and reports whether
@@ -707,8 +722,22 @@ func (s *Server) handleAgentFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.DB.FinishBuild(id, req.Status); err != nil {
+	won, err := s.DB.FinishAgentBuild(id, req.Agent, req.Status)
+	if err != nil {
 		writeError(w, 500, err.Error())
+		return
+	}
+	if !won {
+		current, err := s.DB.GetBuildSummary(id)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		if current.Status.Terminal() {
+			writeJSON(w, 200, map[string]interface{}{"id": id, "status": current.Status, "already": true})
+			return
+		}
+		writeJSON(w, 409, map[string]interface{}{"error": "build is no longer yours", "status": current.Status})
 		return
 	}
 	finishedAt := time.Now().UTC()

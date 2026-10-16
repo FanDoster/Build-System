@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"os/exec"
@@ -170,7 +171,7 @@ func (r *Runner) SweepStale() []int64 {
 	defer r.mu.Unlock()
 	swept, err := r.DB.FailStaleRunning(r.currentID, r.startedAt)
 	if err != nil {
-		return nil
+		log.Printf("stale sweep: %v", err)
 	}
 	ids := make([]int64, 0, len(swept))
 	for _, sb := range swept {
@@ -186,8 +187,10 @@ func (r *Runner) SweepStale() []int64 {
 		// the row while it exists — which would hide the whole build. An empty
 		// topic is the ordinary local-restart case, where the process that had
 		// the log is gone and the DB is rightly the only copy.
-		if _, cur, ok := r.Bus.LogTail(sb.ID, 0); ok && cur > 0 {
-			r.Bus.Publish(sb.ID, []byte(sb.Note))
+		if cur, ok := r.Bus.Length(sb.ID); ok && cur > 0 {
+			if total, err := r.DB.BuildLogLen(sb.ID); err == nil {
+				r.Bus.PublishAt(sb.ID, total-len(sb.Note), []byte(sb.Note))
+			}
 		}
 		// Close any open topic/subscribers; finished time is unknown.
 		r.Bus.PublishStatus(sb.ID, models.StatusFailed, nil, nil)
@@ -248,14 +251,17 @@ func (r *Runner) runBuild(ctx context.Context, build *models.Build, startedAt ti
 		msg := "\n[ERROR] Error loading project: " + err.Error() + "\n"
 		// Bus first, DB second — same order as the sink, so a subscriber's
 		// DB-fallback replay can never double up with a queued publish.
-		r.Bus.Publish(build.ID, []byte(msg))
-		r.DB.AppendBuildLog(build.ID, msg)
+		start, err := r.DB.AppendBuildLogAt(build.ID, msg)
+		if err != nil {
+			log.Printf("build %d: persist failure: %v", build.ID, err)
+			return
+		}
+		r.Bus.PublishAt(build.ID, start, []byte(msg))
 		r.finish(build.ID, models.StatusFailed, startedAt)
 		return
 	}
 
 	sink := newLogSink(build.ID, project.CloneToken, r.DB, r.Bus)
-	defer sink.Close()
 
 	logStep := func(msg string) {
 		fmt.Fprintf(sink, "[%s] %s\n", time.Now().UTC().Format("15:04:05"), msg)
@@ -272,30 +278,52 @@ func (r *Runner) runBuild(ctx context.Context, build *models.Build, startedAt ti
 		switch context.Cause(ctx) {
 		case ErrCanceledByUser:
 			logStep("Build canceled by user (partial artifacts may remain)")
-			sink.Close()
+			if err := sink.Close(); err != nil {
+				log.Printf("%v", err)
+				return
+			}
 			r.finish(build.ID, models.StatusCanceled, startedAt)
 			return
 		case context.Canceled:
-			// Claim the requeue before writing anything: the sink drops
-			// writes once closed, so the give-up path below needs the sink
-			// still open.
-			if ok, err := r.DB.RequeueBuild(build.ID, models.MaxBuildRequeues); err == nil && ok {
-				// Through the sink, not straight to the row — the DB log and
-				// the logbus buffer have to stay byte-identical.
-				fmt.Fprint(sink, db.RequeueNote)
-				sink.Close()
-				// Not terminal: startup recovery re-queues pending rows, and
-				// clients see it go back to pending rather than failed.
+			if err := sink.Close(); err != nil {
+				log.Printf("%v", err)
+				return
+			}
+			ok, start, err := r.DB.RequeueBuildWithNote(build.ID, models.MaxBuildRequeues)
+			if err != nil {
+				log.Printf("build %d: requeue persistence failed: %v", build.ID, err)
+				return
+			}
+			if ok {
+				if cur, exists := r.Bus.Length(build.ID); !exists || cur < start {
+					from := start - logbus.MaxRetainedBytes
+					if from < 0 {
+						from = 0
+					}
+					if prefix, err := r.DB.BuildLogSlice(build.ID, from, start-from); err == nil {
+						r.Bus.SeedAt(build.ID, from, prefix)
+					}
+				}
+				r.Bus.PublishAt(build.ID, start, []byte(db.RequeueNote))
 				r.Bus.PublishStatus(build.ID, models.StatusPending, nil, nil)
 				return
 			}
-			// Out of retries (or no longer running) — fall through and record
-			// a failure, so a build that takes the server down with it can't
-			// be retried forever.
-			msg += " (no re-queues left)"
+			// The sink is closed already; persist the give-up reason directly.
+			note := "\n[ERROR] " + msg + " (no re-queues left)\n"
+			start, err = r.DB.AppendBuildLogAt(build.ID, note)
+			if err != nil {
+				log.Printf("build %d: %v", build.ID, err)
+				return
+			}
+			r.Bus.PublishAt(build.ID, start, []byte(note))
+			r.finish(build.ID, models.StatusFailed, startedAt)
+			return
 		}
 		fmt.Fprintf(sink, "\n[ERROR] %s\n", msg)
-		sink.Close()
+		if err := sink.Close(); err != nil {
+			log.Printf("%v", err)
+			return
+		}
 		r.finish(build.ID, models.StatusFailed, startedAt)
 	}
 
@@ -420,7 +448,10 @@ func (r *Runner) runBuild(ctx context.Context, build *models.Build, startedAt ti
 
 	// Success!
 	logStep("BUILD SUCCESS")
-	sink.Close()
+	if err := sink.Close(); err != nil {
+		log.Printf("%v", err)
+		return
+	}
 	r.finish(build.ID, models.StatusSuccess, startedAt)
 }
 
@@ -432,7 +463,10 @@ func (r *Runner) runBuild(ctx context.Context, build *models.Build, startedAt ti
 // terminal — the build is coming back), and the janitor's stale sweep (the
 // build server was not running when that build died).
 func (r *Runner) finish(buildID int64, status models.BuildStatus, startedAt time.Time) {
-	r.DB.FinishBuild(buildID, status)
+	if err := r.DB.FinishBuild(buildID, status); err != nil {
+		log.Printf("build %d: terminal persistence failed: %v", buildID, err)
+		return
+	}
 	finishedAt := time.Now().UTC()
 	r.Bus.PublishStatus(buildID, status, &startedAt, &finishedAt)
 	// Fire and forget: mail must never delay the worker picking up the next

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"sort"
 	"time"
 
@@ -21,12 +22,66 @@ import (
 // type and the driver hands back a string, which will not Scan into a
 // *time.Time. Where a rollup is wanted, the rows are read and folded in Go.
 
+// These projections are intentionally narrower than buildSummaryCols. A summary
+// omits the log value but can still require visits to huge builds table records.
+// The health queries must be served by covering indexes instead.
+const agentNamesSQL = `SELECT agent, MAX(id) AS latest FROM builds
+ WHERE agent != '' GROUP BY agent ORDER BY latest DESC`
+
+const runningBuildHealthSQL = `SELECT b.id, b.project_id, p.name, p.executor, b.last_heartbeat_at
+ FROM builds b JOIN projects p ON p.id = b.project_id
+ WHERE b.agent = ? AND b.status = ? ORDER BY b.id DESC LIMIT 1`
+
+const recentBuildStatusesSQL = `SELECT b.status FROM builds b
+ JOIN projects p ON p.id = b.project_id
+ WHERE b.agent = ? ORDER BY b.id DESC LIMIT ?`
+
+// RunningBuildHealthForAgent returns only ownership and liveness evidence for
+// the newest running build. No log, commit, duration or display history is read.
+// A missing build is normal; real database errors must stop health observation,
+// rather than fabricate an offline/recovery transition.
+func (d *DB) RunningBuildHealthForAgent(agent string) (*models.Build, error) {
+	var b models.Build
+	err := d.conn.QueryRow(runningBuildHealthSQL, agent, models.StatusRunning).Scan(
+		&b.ID, &b.ProjectID, &b.ProjectName, &b.Executor, &b.LastHeartbeatAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	b.Status = models.StatusRunning
+	return &b, nil
+}
+
+// RecentBuildStatusesForAgent reads the same newest-N window as the UI history,
+// including in-flight rows. Filtering to terminal rows before LIMIT would change
+// the failure-run semantics. It uses idx_builds_agent_recent without visiting
+// the builds table or its potentially large overflow records.
+func (d *DB) RecentBuildStatusesForAgent(agent string, limit int) ([]models.BuildStatus, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := d.conn.Query(recentBuildStatusesSQL, agent, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.BuildStatus
+	for rows.Next() {
+		var status models.BuildStatus
+		if err := rows.Scan(&status); err != nil {
+			return nil, err
+		}
+		out = append(out, status)
+	}
+	return out, rows.Err()
+}
+
 // AgentNames lists every agent that has ever claimed a build, newest first.
 // The registry knows who is here now; this knows who has ever been.
 func (d *DB) AgentNames() ([]string, error) {
-	rows, err := d.conn.Query(
-		`SELECT agent, MAX(id) AS latest FROM builds
-		 WHERE agent != '' GROUP BY agent ORDER BY latest DESC`)
+	rows, err := d.conn.Query(agentNamesSQL)
 	if err != nil {
 		return nil, err
 	}

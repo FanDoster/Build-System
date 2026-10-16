@@ -19,6 +19,10 @@ import (
 // endpoint from the remote, and for a local one the objects are copied.
 func lfsRepo(t *testing.T) string {
 	t.Helper()
+	// Each test owns its Git filter setup. Do not inherit host/system filters,
+	// and do not write the operator's global Git config.
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "gitconfig"))
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -37,6 +41,7 @@ func lfsRepo(t *testing.T) string {
 		}
 	}
 	git("init", "-q", "-b", "main")
+	git("lfs", "install", "--skip-repo")
 	git("lfs", "install", "--local")
 	git("lfs", "track", "*.bin")
 	// Recognisable content, and big enough that a pointer file is obviously
@@ -187,6 +192,8 @@ func TestABuildIsRefusedWhenLFSIsNeededAndMissing(t *testing.T) {
 	// An empty HOME so this machine's own `git lfs install` cannot leak in and
 	// configure the filter the container would not have.
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
 
 	if _, err := exec.LookPath("git-lfs"); err == nil {
 		t.Fatal("git-lfs is still reachable; this test proves nothing")

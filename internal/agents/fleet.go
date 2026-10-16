@@ -218,6 +218,44 @@ type Source interface {
 	ListAgentRows() ([]db.AgentRow, error)
 }
 
+// HealthSource is the notification surface. It deliberately has no log, full
+// build summary, history metadata or pending-queue query methods.
+type HealthSource interface {
+	AgentNames() ([]string, error)
+	RunningBuildHealthForAgent(agent string) (*models.Build, error)
+	RecentBuildStatusesForAgent(agent string, limit int) ([]models.BuildStatus, error)
+	ListAgentRows() ([]db.AgentRow, error)
+}
+
+// BuildHealth shares the UI's liveness, pause, self-report, registry and failure
+// rules, but reads only ownership/heartbeat and the newest ten status values.
+// Executors stay advertised capabilities: current ownership proves only the
+// exact current project, never other projects on a logical shared queue.
+func BuildHealth(src HealthSource, reg *Registry, now time.Time) (*Fleet, error) {
+	return build(healthSource{src}, reg, now, true)
+}
+
+// Adapt the narrow health source to the common assembly logic. The health flag
+// keeps UI-only derived history, steps and capability inference out of the result.
+type healthSource struct{ HealthSource }
+
+func (s healthSource) RunningBuildForAgent(agent string) (*models.Build, error) {
+	return s.RunningBuildHealthForAgent(agent)
+}
+func (s healthSource) RecentBuildsForAgent(agent string, limit int) ([]models.Build, error) {
+	statuses, err := s.RecentBuildStatusesForAgent(agent, limit)
+	if err != nil {
+		return nil, err
+	}
+	builds := make([]models.Build, len(statuses))
+	for i, status := range statuses {
+		builds[i].Status = status
+	}
+	return builds, nil
+}
+func (healthSource) RemoteExecutors() ([]db.RemoteExecutor, error) { return nil, nil }
+func (healthSource) LogTailBytes(int64, int) ([]byte, error)       { return nil, nil }
+
 // Build assembles the page from the registry and the database.
 //
 // Three sources name agents and they overlap: the in-memory registry (here
@@ -226,6 +264,10 @@ type Source interface {
 // name — an agent that appears twice on this page reads as two machines, and
 // the whole point of the page is knowing how many there are.
 func Build(src Source, reg *Registry, now time.Time) (*Fleet, error) {
+	return build(src, reg, now, false)
+}
+
+func build(src Source, reg *Registry, now time.Time, healthOnly bool) (*Fleet, error) {
 	f := &Fleet{ServerStarted: reg.StartedAt(), Now: now}
 
 	var order []*Agent
@@ -301,7 +343,7 @@ func Build(src Source, reg *Registry, now time.Time) (*Fleet, error) {
 
 	// Fill each agent in, then decide its state.
 	for _, a := range order {
-		if err := fill(src, a, execs); err != nil {
+		if err := fill(src, a, execs, healthOnly); err != nil {
 			return nil, err
 		}
 		a.State = stateOf(a, reg.StartedAt(), now)
@@ -514,7 +556,7 @@ func shortDuration(d time.Duration) string {
 	}
 }
 
-func fill(src Source, a *Agent, execs []db.RemoteExecutor) error {
+func fill(src Source, a *Agent, execs []db.RemoteExecutor, healthOnly bool) error {
 	running, err := src.RunningBuildForAgent(a.Name)
 	if err != nil {
 		return err
@@ -528,7 +570,9 @@ func fill(src Source, a *Agent, execs []db.RemoteExecutor) error {
 			StartedAt:   running.StartedAt,
 			HeartbeatAt: running.LastHeartbeatAt,
 		}
-		cur.Step, cur.StepDetail = currentStep(src, running.ID)
+		if !healthOnly {
+			cur.Step, cur.StepDetail = currentStep(src, running.ID)
+		}
 		cur.Executor = running.Executor
 		a.Current = cur
 
@@ -546,17 +590,19 @@ func fill(src Source, a *Agent, execs []db.RemoteExecutor) error {
 		// add its name as a capability: that could cover a legacy project on
 		// this queue which this agent cannot actually claim. coversProject
 		// instead uses the current build as proof for its own project only.
-		shared := false
-		for _, e := range execs {
-			if e.Name != running.Executor {
-				continue
+		if !healthOnly {
+			shared := false
+			for _, e := range execs {
+				if e.Name != running.Executor {
+					continue
+				}
+				if profiles, ok := e.ProjectExecutors[running.ProjectName]; ok {
+					shared = len(profiles) != 1 || profiles[0] != running.Executor
+				}
 			}
-			if profiles, ok := e.ProjectExecutors[running.ProjectName]; ok {
-				shared = len(profiles) != 1 || profiles[0] != running.Executor
+			if !shared && models.Remote(running.Executor) && !contains(a.Executors, running.Executor) {
+				a.Executors = append(a.Executors, running.Executor)
 			}
-		}
-		if !shared && models.Remote(running.Executor) && !contains(a.Executors, running.Executor) {
-			a.Executors = append(a.Executors, running.Executor)
 		}
 
 		// A running build's heartbeat is evidence of life, and better evidence
@@ -575,9 +621,11 @@ func fill(src Source, a *Agent, execs []db.RemoteExecutor) error {
 	}
 	counting := true
 	for _, b := range recent {
-		a.Recent = append(a.Recent, RecentBuild{
-			ID: b.ID, Number: b.Number, Project: b.ProjectName, Status: string(b.Status), Duration: b.Duration(),
-		})
+		if !healthOnly {
+			a.Recent = append(a.Recent, RecentBuild{
+				ID: b.ID, Number: b.Number, Project: b.ProjectName, Status: string(b.Status), Duration: b.Duration(),
+			})
+		}
 		if !counting {
 			continue
 		}

@@ -142,7 +142,7 @@ func TestBuildNumbersArePerProjectAndHistoricalRowsAreBackfilled(t *testing.T) {
 	if _, err := d.conn.Exec(`DROP TRIGGER notification_build_insert; DROP TRIGGER notification_build_update`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.conn.Exec(`DROP INDEX idx_builds_project_number`); err != nil {
+	if _, err := d.conn.Exec(`DROP INDEX idx_builds_project_number; DROP INDEX idx_builds_recent_summary`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := d.conn.Exec(`ALTER TABLE builds DROP COLUMN project_build_number`); err != nil {

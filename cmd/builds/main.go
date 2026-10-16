@@ -222,7 +222,7 @@ func recoverOrphanedBuilds(database *db.DB, buildCh chan *models.Build) {
 		case buildCh <- b:
 			log.Printf("Recovery: re-queued pending build %d", b.ID)
 		default:
-			database.UpdateBuildStatus(b.ID, models.StatusFailed, b.Log+"\n[ERROR] Build not re-queued after restart: queue is full\n")
+			database.FailPendingBuildWithNote(b.ID, "\n[ERROR] Build not re-queued after restart: queue is full\n")
 			log.Printf("Recovery: queue full, marked pending build %d failed", b.ID)
 		}
 	}

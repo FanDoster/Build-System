@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -34,7 +33,7 @@ const livePingInterval = 25 * time.Second
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-10-16-telegram-build-agent-alerts"
+const Version = "2026-10-16-resource-optimizations"
 
 // Agent long-poll defaults. The hold is deliberately under the 60s nginx
 // defaults with room to spare: a claim request that outlives proxy_read_timeout
@@ -539,7 +538,7 @@ func (s *Server) enqueue(build *models.Build) bool {
 	case s.BuildCh <- build:
 		return true
 	default:
-		s.DB.UpdateBuildStatus(build.ID, models.StatusFailed, "Build not started: queue is full\n")
+		s.DB.FailPendingBuildWithNote(build.ID, "Build not started: queue is full\n")
 		return false
 	}
 }
@@ -579,18 +578,23 @@ func (s *Server) handleGetBuild(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid id")
 		return
 	}
-	build, err := s.DB.GetBuild(id)
+	var build *models.Build
+	if r.URL.Query().Get("meta") == "1" {
+		build, err = s.DB.GetBuildSummary(id)
+	} else {
+		build, err = s.DB.GetBuild(id)
+	}
 	if err != nil {
 		writeError(w, 404, "build not found")
 		return
 	}
 	if r.URL.Query().Get("meta") == "1" {
-		build.LogLen = int64(len(build.Log))
-		// The live bus buffer can be ahead of the batched DB writes.
-		if _, cur, ok := s.Bus.LogTail(id, math.MaxInt); ok && int64(cur) > build.LogLen {
-			build.LogLen = int64(cur)
+		n, err := s.DB.BuildLogLen(id)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
 		}
-		build.Log = ""
+		build.LogLen = int64(n)
 		s.decorateProgress(build)
 	}
 	writeJSON(w, 200, build)
@@ -705,12 +709,11 @@ func (s *Server) handleBuildLog(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid id")
 		return
 	}
-	build, err := s.DB.GetBuild(id)
+	build, err := s.DB.GetBuildSummary(id)
 	if err != nil {
 		writeError(w, 404, "build not found")
 		return
 	}
-
 	offset := 0
 	if v := r.URL.Query().Get("offset"); v != "" {
 		offset, err = strconv.Atoi(v)
@@ -719,19 +722,21 @@ func (s *Server) handleBuildLog(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	// Prefer the live bus buffer (ahead of batched DB writes); fall back to
-	// the stored row for finished or pre-streaming builds.
-	body, total, ok := s.Bus.LogTail(id, offset)
-	if !ok || total == 0 {
-		full := build.Log
-		total = len(full)
-		if offset > total {
-			offset = total
-		}
-		body = []byte(full[offset:])
+	// Storage is authoritative. A committed append may not have reached the
+	// live bus yet, including after a process restart.
+	total, err := s.DB.BuildLogLen(id)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
 	}
-
+	if offset > total {
+		offset = total
+	}
+	body, err := s.DB.BuildLogSlice(id, offset, total-offset)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-Log-Offset", strconv.Itoa(total))
 	w.Header().Set("X-Build-Status", string(build.Status))
@@ -743,16 +748,17 @@ func (s *Server) handleBuildLog(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
-// handleBuildEvents streams a build's log and status transitions over SSE.
-// Replay is race-free: Subscribe atomically returns the buffered bytes from
-// the resume offset plus a live channel.
+// handleBuildEvents streams durable log bytes and status transitions over SSE.
+// Subscribe before reading storage, then deduplicate queued log events by their
+// absolute byte offsets. A durable-first writer may publish while replay reads
+// the same bytes; a nonempty bus buffer is not proof it has the complete log.
 func (s *Server) handleBuildEvents(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		writeError(w, 400, "invalid id")
 		return
 	}
-	build, err := s.DB.GetBuild(id)
+	build, err := s.DB.GetBuildSummary(id)
 	if err != nil {
 		writeError(w, 404, "build not found")
 		return
@@ -762,8 +768,6 @@ func (s *Server) handleBuildEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "streaming unsupported")
 		return
 	}
-
-	// Resume offset: browser-set Last-Event-ID (auto-reconnect) wins over ?offset.
 	from := 0
 	if v := r.Header.Get("Last-Event-ID"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
@@ -780,151 +784,120 @@ func (s *Server) handleBuildEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(200)
 	fmt.Fprint(w, "retry: 2000\n\n")
+	var ch <-chan logbus.Event
+	// Terminal reads must not create topics that no future writer will close.
+	if !build.Status.Terminal() {
+		// Replay comes from storage, not a potentially huge bus snapshot.
+		_, _, events, unsub := s.Bus.Subscribe(id, int(^uint(0)>>1))
+		defer unsub()
+		ch = events
+		build, err = s.DB.GetBuildSummary(id)
+		if err != nil {
+			return
+		}
+	}
+	// Capture one bounded durable tail. Appends after this length read arrive
+	// on ch; appends included in replay are skipped there using sent.
+	total, err := s.DB.BuildLogLen(id)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if from > total {
+		from = total
+	}
+	replay, err := s.DB.BuildLogSlice(id, from, total-from)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
 
 	writeStatus := func(status models.BuildStatus, startedAt, finishedAt *time.Time, owner *models.Build) {
 		data, _ := json.Marshal(map[string]interface{}{
-			"status":      status,
-			"started_at":  startedAt,
-			"finished_at": finishedAt,
-			"agent":       owner.Agent,
-			"executor":    owner.Executor,
+			"status": status, "started_at": startedAt, "finished_at": finishedAt,
+			"agent": owner.Agent, "executor": owner.Executor,
 		})
 		fmt.Fprintf(w, "event: status\ndata: %s\n\n", data)
 	}
 	writeLog := func(chunk string, offset int) {
-		// JSON-wrapped so \r and \n inside the chunk survive SSE framing.
 		data, _ := json.Marshal(map[string]interface{}{"o": offset, "t": chunk})
 		fmt.Fprintf(w, "event: log\nid: %d\ndata: %s\n\n", offset, data)
 	}
-	// dbTail slices the stored log at the resume offset.
-	dbTail := func(b *models.Build) (string, int) {
-		f := from
-		if f > len(b.Log) {
-			f = len(b.Log)
+	sent := total
+	backfill := func() bool {
+		tail, err := s.storedTail(id, sent)
+		if err != nil {
+			// Do not emit terminal status on a failed durable read. Closing
+			// without it makes EventSource reconnect from its last log ID.
+			return false
 		}
-		return b.Log[f:], len(b.Log)
+		if tail != "" {
+			sent += len(tail)
+			writeLog(tail, sent)
+		}
+		return true
 	}
-	// Terminal ordering contract: log bytes are always written BEFORE the
-	// terminal status event — the client closes its EventSource on a
-	// terminal status and would drop anything after it.
-	writeTerminal := func(b *models.Build, chunk string, offset int) {
-		if chunk != "" {
-			writeLog(chunk, offset)
+	// The client closes on terminal status, so all durable bytes go first.
+	if build.Status.Terminal() {
+		if len(replay) > 0 {
+			writeLog(string(replay), sent)
 		}
-		writeStatus(b.Status, b.StartedAt, b.FinishedAt, b)
+		if !backfill() {
+			return
+		}
+		writeStatus(build.Status, build.StartedAt, build.FinishedAt, build)
 		flusher.Flush()
-	}
-
-	// Already-terminal builds are served straight from storage without
-	// subscribing — Subscribe would create a topic no terminal transition
-	// will ever clean up.
-	if build.Status.Terminal() {
-		chunk, total := "", 0
-		if tail, cur, ok := s.Bus.LogTail(id, from); ok && cur > 0 {
-			chunk, total = string(tail), cur
-		} else {
-			chunk, total = dbTail(build)
-		}
-		writeTerminal(build, chunk, total)
 		return
 	}
-
-	// Subscribe before re-reading state so no transition can slip between.
-	snapshot, cur, ch, unsub := s.Bus.Subscribe(id, from)
-	defer unsub()
-
-	build, err = s.DB.GetBuild(id)
-	if err != nil {
-		return
-	}
-
-	// Replay: bus buffer when it has data, else the stored log (finished or
-	// pre-streaming builds whose topic buffer is empty).
-	replay, total := string(snapshot), cur
-	if cur == 0 && len(build.Log) > 0 {
-		replay, total = dbTail(build)
-	}
-
-	if build.Status.Terminal() {
-		// The build finished between Subscribe and the re-read. Any final
-		// log chunks are already queued on ch (delivered before close) —
-		// drain them so the client doesn't lose the tail of the log.
-	drain:
-		for {
-			select {
-			case ev, open := <-ch:
-				if !open {
-					break drain
-				}
-				if ev.Kind == "log" {
-					replay += ev.Chunk
-					total = ev.Offset
-				}
-			default:
-				break drain
-			}
-		}
-		writeTerminal(build, replay, total)
-		return
-	}
-
 	writeStatus(build.Status, build.StartedAt, build.FinishedAt, build)
 	if len(replay) > 0 {
-		writeLog(replay, total)
+		writeLog(string(replay), sent)
 	}
 	flusher.Flush()
-	sent := total // last log offset delivered to this client
 
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
-
 	for {
 		select {
 		case <-r.Context().Done():
 			return
 		case <-heartbeat.C:
-			// A named event (not an SSE comment) so the client-side
-			// stall watchdog can observe it.
 			fmt.Fprint(w, "event: ping\ndata: {}\n\n")
 			flusher.Flush()
 		case ev, open := <-ch:
 			if !open {
-				// Dropped as a slow subscriber or topic closed. If the build
-				// is terminal, backfill any log bytes this client never got
-				// before the final status; otherwise the client reconnects
-				// with Last-Event-ID and resumes.
-				if b, err := s.DB.GetBuild(id); err == nil && b.Status.Terminal() {
-					chunk, offset := "", sent
-					if tail, cur, ok := s.Bus.LogTail(id, sent); ok && len(tail) > 0 {
-						chunk, offset = string(tail), cur
-					} else if len(b.Log) > sent {
-						chunk, offset = b.Log[sent:], len(b.Log)
+				// A full subscriber queue can drop even the terminal event.
+				// Backfill storage before reporting its recorded terminal state.
+				if b, err := s.DB.GetBuildSummary(id); err == nil && b.Status.Terminal() {
+					if !backfill() {
+						return
 					}
-					writeTerminal(b, chunk, offset)
+					writeStatus(b.Status, b.StartedAt, b.FinishedAt, b)
+					flusher.Flush()
 				}
 				return
 			}
 			switch ev.Kind {
 			case "log":
-				writeLog(ev.Chunk, ev.Offset)
-				sent = ev.Offset
-			case "status":
-				// Per-subscriber FIFO: all log chunks published through the
-				// bus before a terminal status are already delivered above.
-				// Bytes appended straight to the row are not — a sweep writes
-				// its reason in SQL, and can only mirror it onto a buffer that
-				// still holds the build's log, which after a restart it does
-				// not. Backfill from the row so the stream never ends on a
-				// bare "failed" with the explanation sitting in the database.
-				if ev.Status.Terminal() {
-					if tail := s.storedTail(id, sent); tail != "" {
-						writeLog(tail, sent+len(tail))
-						sent += len(tail)
+				if ev.Offset <= sent {
+					continue // included in replay or an earlier overlapping event
+				}
+				start := ev.Offset - len(ev.Chunk)
+				if start > sent {
+					// A restarted or lagging bus can skip a durable prefix.
+					if !backfill() {
+						return
 					}
 				}
-				// Ownership can change after the initial pending snapshot. Read
-				// only metadata, not the potentially huge log, and keep the bus
-				// event's status/timestamps even if the row has moved on again.
+				if start <= sent && ev.Offset > sent {
+					writeLog(ev.Chunk[sent-start:], ev.Offset)
+					sent = ev.Offset
+				}
+			case "status":
+				if ev.Status.Terminal() && !backfill() {
+					return
+				}
+				// Preserve FIFO event timestamps while refreshing only ownership.
 				if owner, err := s.DB.GetBuildSummary(id); err == nil {
 					build = owner
 				}
@@ -942,16 +915,16 @@ func (s *Server) handleBuildEvents(w http.ResponseWriter, r *http.Request) {
 // already been sent, or "" when it is up to date. Reads the length and only
 // the tail rather than the whole row: on an ordinary build this runs once per
 // stream and finds nothing, and the row can be tens of megabytes.
-func (s *Server) storedTail(id int64, sent int) string {
+func (s *Server) storedTail(id int64, sent int) (string, error) {
 	n, err := s.DB.BuildLogLen(id)
-	if err != nil || n <= sent {
-		return ""
+	if err != nil {
+		return "", err
+	}
+	if n <= sent {
+		return "", nil
 	}
 	tail, err := s.DB.BuildLogSlice(id, sent, n-sent)
-	if err != nil {
-		return ""
-	}
-	return string(tail)
+	return string(tail), err
 }
 
 // handleCancelBuild cancels a queued or running build. Race-safe against the
@@ -977,9 +950,12 @@ func (s *Server) handleCancelBuild(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	} else if ok {
-		// Mirror the tombstone the SQL appended to the DB log so the bus
-		// buffer and stored log stay byte-identical for live subscribers.
-		s.Bus.Publish(id, []byte("[canceled while queued]\n"))
+		// The tombstone is durable already. Publish its absolute offset so a
+		// restarted topic cannot mistake it for the complete log prefix.
+		const note = "[canceled while queued]\n"
+		if total, err := s.DB.BuildLogLen(id); err == nil {
+			s.Bus.PublishAt(id, total-len(note), []byte(note))
+		}
 		now := time.Now().UTC()
 		s.Bus.PublishStatus(id, models.StatusCanceled, nil, &now)
 		writeJSON(w, 200, map[string]interface{}{"id": id, "status": models.StatusCanceled})

@@ -173,6 +173,21 @@ func (d *DB) migrate() error {
 	if err != nil {
 		return err
 	}
+	if err := d.migrateBuildLogs(); err != nil {
+		return err
+	}
+	_, err = d.conn.Exec(`
+ CREATE INDEX IF NOT EXISTS idx_builds_recent_summary ON builds(
+  created_at DESC, id DESC, project_build_number, project_id, status,
+  commit_sha, commit_message, requeues, started_at, finished_at, agent,
+  last_heartbeat_at, cancel_requested
+ );
+ CREATE INDEX IF NOT EXISTS idx_builds_agent_recent ON builds(agent, id DESC, status, project_id);
+ CREATE INDEX IF NOT EXISTS idx_builds_agent_running_health ON builds(agent, status, id DESC, project_id, last_heartbeat_at);
+ `)
+	if err != nil {
+		return err
+	}
 	return d.migrateNotifications()
 }
 
@@ -408,7 +423,12 @@ func (d *DB) DeleteProject(id int64) error {
 // --- Builds ---
 
 func (d *DB) CreateBuild(b *models.Build) error {
-	res, err := d.conn.Exec(
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(
 		`INSERT INTO builds (project_id, project_build_number, status, commit_sha, commit_message, created_at)
 		 VALUES (?, (SELECT COALESCE(MAX(project_build_number), 0) + 1 FROM builds WHERE project_id = ?),
 		         ?, ?, ?, datetime('now'))`,
@@ -418,9 +438,15 @@ func (d *DB) CreateBuild(b *models.Build) error {
 		return err
 	}
 	b.ID, _ = res.LastInsertId()
-	return d.conn.QueryRow(
+	if _, err = tx.Exec(`INSERT INTO build_log_state(build_id,legacy_bytes,total_bytes) VALUES(?,0,0)`, b.ID); err != nil {
+		return err
+	}
+	if err = tx.QueryRow(
 		`SELECT project_build_number FROM builds WHERE id = ?`, b.ID,
-	).Scan(&b.Number)
+	).Scan(&b.Number); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // buildCols is the full read column list; scanBuild consumes it in order.
@@ -440,10 +466,20 @@ func scanBuild(s scanner) (*models.Build, error) {
 }
 
 func (d *DB) GetBuild(id int64) (*models.Build, error) {
-	return scanBuild(d.conn.QueryRow(
-		`SELECT `+buildCols+`
-		 FROM builds b JOIN projects p ON p.id = b.project_id
-		 WHERE b.id = ?`, id))
+	b, err := d.GetBuildSummary(id)
+	if err != nil {
+		return nil, err
+	}
+	n, err := d.BuildLogLen(id)
+	if err != nil {
+		return nil, err
+	}
+	data, err := d.BuildLogSlice(id, 0, n)
+	if err != nil {
+		return nil, err
+	}
+	b.Log = string(data)
+	return b, nil
 }
 
 func (d *DB) ListBuildsByProject(projectID int64, limit int) ([]models.Build, error) {
@@ -451,7 +487,7 @@ func (d *DB) ListBuildsByProject(projectID int64, limit int) ([]models.Build, er
 		limit = 20
 	}
 	rows, err := d.conn.Query(
-		`SELECT `+buildCols+`
+		`SELECT `+strings.Replace(buildCols, "b.log", "''", 1)+`
 		 FROM builds b JOIN projects p ON p.id = b.project_id
 		 WHERE b.project_id = ?
 		 ORDER BY b.created_at DESC, b.id DESC LIMIT ?`, projectID, limit,
@@ -469,7 +505,11 @@ func (d *DB) ListBuildsByProject(projectID int64, limit int) ([]models.Build, er
 		}
 		builds = append(builds, *b)
 	}
-	return builds, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	return d.hydrateBuildLogs(builds)
 }
 
 func (d *DB) ListRecentBuilds(limit int) ([]models.Build, error) {
@@ -477,7 +517,7 @@ func (d *DB) ListRecentBuilds(limit int) ([]models.Build, error) {
 		limit = 20
 	}
 	rows, err := d.conn.Query(
-		`SELECT `+buildCols+`
+		`SELECT `+strings.Replace(buildCols, "b.log", "''", 1)+`
 		 FROM builds b JOIN projects p ON p.id = b.project_id
 		 ORDER BY b.created_at DESC, b.id DESC LIMIT ?`, limit,
 	)
@@ -494,7 +534,11 @@ func (d *DB) ListRecentBuilds(limit int) ([]models.Build, error) {
 		}
 		builds = append(builds, *b)
 	}
-	return builds, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	return d.hydrateBuildLogs(builds)
 }
 
 // buildSummaryCols is buildCols without the log blob, and scanBuildSummary
@@ -554,7 +598,7 @@ func (d *DB) ListRecentBuildSummaries(limit int) ([]models.Build, error) {
 
 func (d *DB) ListBuildsByStatus(status models.BuildStatus) ([]models.Build, error) {
 	rows, err := d.conn.Query(
-		`SELECT `+buildCols+`
+		`SELECT `+strings.Replace(buildCols, "b.log", "''", 1)+`
 		 FROM builds b JOIN projects p ON p.id = b.project_id
 		 WHERE b.status = ?
 		 ORDER BY b.created_at ASC`, status,
@@ -572,7 +616,11 @@ func (d *DB) ListBuildsByStatus(status models.BuildStatus) ([]models.Build, erro
 		}
 		builds = append(builds, *b)
 	}
-	return builds, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	return d.hydrateBuildLogs(builds)
 }
 
 // ClaimBuild atomically transitions a pending build to running. Returns false
@@ -683,46 +731,27 @@ func (d *DB) RequestAgentCancel(id int64) (bool, error) {
 	return n == 1, err
 }
 
-// BuildLogLen returns the stored log's length in BYTES.
-//
-// The CAST is load-bearing: SQLite's length() counts CHARACTERS on a TEXT
-// value, so it drifts from the byte offsets the log protocol is written in the
-// moment a build prints a non-ASCII character — and Unity build logs are full
-// of them. length(CAST(log AS BLOB)) counts bytes, matching Go's len().
-func (d *DB) BuildLogLen(id int64) (int, error) {
-	var n int
-	err := d.conn.QueryRow(`SELECT length(CAST(log AS BLOB)) FROM builds WHERE id = ?`, id).Scan(&n)
-	return n, err
-}
-
-// BuildLogSlice returns n bytes of a build's log starting at byte offset.
-// Same CAST as BuildLogLen and for the same reason: substr() indexes
-// characters on a TEXT value, bytes on a BLOB.
-func (d *DB) BuildLogSlice(id int64, offset, n int) ([]byte, error) {
-	if n <= 0 {
-		return nil, nil
-	}
-	var out []byte
-	err := d.conn.QueryRow(
-		`SELECT substr(CAST(log AS BLOB), ?, ?) FROM builds WHERE id = ?`,
-		offset+1, n, id, // substr is 1-indexed
-	).Scan(&out)
-	return out, err
-}
-
 // CancelPendingBuild atomically cancels a build that has not started yet.
 // Returns false if the build was not pending.
 func (d *DB) CancelPendingBuild(id int64) (bool, error) {
-	res, err := d.conn.Exec(
-		`UPDATE builds SET status=?, finished_at=?, log = log || '[canceled while queued]' || char(10)
-		 WHERE id=? AND status=?`,
-		models.StatusCanceled, time.Now().UTC(), id, models.StatusPending,
-	)
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE builds SET status=?, finished_at=? WHERE id=? AND status=?`,
+		models.StatusCanceled, time.Now().UTC(), id, models.StatusPending)
 	if err != nil {
 		return false, err
 	}
 	n, err := res.RowsAffected()
-	return n == 1, err
+	if err != nil || n == 0 {
+		return false, err
+	}
+	if _, err = appendBuildLog(tx, id, []byte("[canceled while queued]\n")); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 // FinishBuild marks a build terminal without touching the log column (the log
@@ -772,7 +801,7 @@ type StaleBuild struct {
 
 func (d *DB) FailStaleRunning(exceptID int64, agentFloor time.Time) ([]StaleBuild, error) {
 	rows, err := d.conn.Query(
-		`SELECT id, agent, last_heartbeat_at FROM builds WHERE status=? AND id != ?`,
+		`SELECT id, agent, last_heartbeat_at FROM builds WHERE status=? AND id != ? ORDER BY id`,
 		models.StatusRunning, exceptID,
 	)
 	if err != nil {
@@ -806,16 +835,35 @@ func (d *DB) FailStaleRunning(exceptID int64, agentFloor time.Time) ([]StaleBuil
 
 	var failed []StaleBuild
 	for _, sb := range stale {
-		res, err := d.conn.Exec(
-			`UPDATE builds SET status=?, log = log || ? WHERE id=? AND status=?`,
-			models.StatusFailed, sb.Note, sb.ID, models.StatusRunning,
-		)
+		// Re-read the heartbeat while holding the database connection: a fresh
+		// heartbeat between the initial scan and this transaction wins the race.
+		tx, err := d.conn.Begin()
 		if err != nil {
+			return failed, err
+		}
+		var agent string
+		var beat *time.Time
+		err = tx.QueryRow(`SELECT agent,last_heartbeat_at FROM builds WHERE id=? AND status=?`, sb.ID, models.StatusRunning).Scan(&agent, &beat)
+		if err == sql.ErrNoRows || (err == nil && agent != "" && !models.AgentStale(beat, agentFloor, time.Now())) {
+			tx.Rollback()
 			continue
 		}
-		if n, _ := res.RowsAffected(); n == 1 {
-			failed = append(failed, sb)
+		if err != nil {
+			tx.Rollback()
+			return failed, err
 		}
+		_, err = tx.Exec(`UPDATE builds SET status=? WHERE id=? AND status=?`, models.StatusFailed, sb.ID, models.StatusRunning)
+		if err == nil {
+			_, err = appendBuildLog(tx, sb.ID, []byte(sb.Note))
+		}
+		if err != nil {
+			tx.Rollback()
+			return failed, err
+		}
+		if err = tx.Commit(); err != nil {
+			return failed, err
+		}
+		failed = append(failed, sb)
 	}
 	return failed, nil
 }
@@ -880,13 +928,33 @@ func (d *DB) RequeueStaleRunning(maxRequeues int) ([]int64, error) {
 
 	var requeued []int64
 	for _, id := range ids {
-		if ok, err := d.RequeueBuild(id, maxRequeues); err == nil && ok {
-			// Safe to write the seam straight to the row here: this runs at
-			// startup, before the runner or any subscriber exists, so there
-			// is no logbus buffer to keep in step with.
-			d.AppendBuildLog(id, RequeueNote)
-			requeued = append(requeued, id)
+		tx, err := d.conn.Begin()
+		if err != nil {
+			return requeued, err
 		}
+		res, err := tx.Exec(`UPDATE builds SET status=?, requeues=requeues+1, started_at=NULL, finished_at=NULL
+   WHERE id=? AND status=? AND requeues < ? AND agent=''`, models.StatusPending, id, models.StatusRunning, maxRequeues)
+		if err != nil {
+			tx.Rollback()
+			return requeued, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			tx.Rollback()
+			return requeued, err
+		}
+		if n == 0 {
+			tx.Rollback()
+			continue
+		}
+		if _, err = appendBuildLog(tx, id, []byte(RequeueNote)); err != nil {
+			tx.Rollback()
+			return requeued, err
+		}
+		if err = tx.Commit(); err != nil {
+			return requeued, err
+		}
+		requeued = append(requeued, id)
 	}
 	return requeued, nil
 }
@@ -895,16 +963,44 @@ func (d *DB) RequeueStaleRunning(maxRequeues int) ([]int64, error) {
 // finished_at with the restart time and produced absurd history durations.
 // Idempotent; new sweeps leave finished_at NULL from the start.
 func (d *DB) RepairInterruptedDurations() (int64, error) {
-	res, err := d.conn.Exec(
-		`UPDATE builds SET finished_at=NULL
-		 WHERE status=? AND finished_at IS NOT NULL
-		   AND log LIKE '%[ERROR] Build interrupted by server restart%'`,
-		models.StatusFailed,
-	)
+	rows, err := d.conn.Query(`SELECT id FROM builds WHERE status=? AND finished_at IS NOT NULL`, models.StatusFailed)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, err
+	}
+	var count int64
+	for _, id := range ids {
+		found, err := d.buildLogContains(id, "[ERROR] Build interrupted by server restart")
+		if err != nil {
+			return count, err
+		}
+		if !found {
+			continue
+		}
+		res, err := d.conn.Exec(`UPDATE builds SET finished_at=NULL WHERE id=? AND status=? AND finished_at IS NOT NULL`, id, models.StatusFailed)
+		if err != nil {
+			return count, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return count, err
+		}
+		count += n
+	}
+	return count, nil
 }
 
 // DeleteOrphanedBuilds removes build rows whose project no longer exists.
@@ -997,25 +1093,34 @@ func (d *DB) QueuePosition(id int64) (int, error) {
 	return 1 + ahead + running, nil
 }
 
+// UpdateBuildStatus preserves the historical full-log replacement API. Reset
+// the legacy prefix, chunk rows and byte state in the same transaction; ordinary
+// streaming writers must use AppendBuildLog instead.
 func (d *DB) UpdateBuildStatus(id int64, status models.BuildStatus, log string) error {
 	now := time.Now().UTC()
 	var started, finished *time.Time
-
 	switch status {
 	case models.StatusRunning:
 		started = &now
 	case models.StatusSuccess, models.StatusFailed, models.StatusCanceled:
 		finished = &now
 	}
-
-	_, err := d.conn.Exec(
-		`UPDATE builds SET status=?, log=?, started_at=COALESCE(?, started_at), finished_at=? WHERE id=?`,
-		status, log, started, finished, id,
-	)
-	return err
-}
-
-func (d *DB) AppendBuildLog(id int64, line string) error {
-	_, err := d.conn.Exec(`UPDATE builds SET log = log || ? WHERE id = ?`, line, id)
-	return err
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`DELETE FROM build_log_chunks WHERE build_id=?`, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM build_log_state WHERE build_id=?`, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE builds SET status=?, log='', started_at=COALESCE(?, started_at), finished_at=? WHERE id=?`, status, started, finished, id); err != nil {
+		return err
+	}
+	if _, err = appendBuildLog(tx, id, []byte(log)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
