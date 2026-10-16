@@ -50,8 +50,10 @@ BUILDS_DB=/tmp/builds.db BUILDS_ADDR=:8899 go run ./cmd/builds
 | `BUILDS_BUILD_TIMEOUT` | `30m` | Go duration |
 | `BUILDS_PASSWORD` / `BUILDS_PASSWORD_HASH` | unset | Unset **disables auth entirely** (the server logs a loud warning). Hash (bcrypt) wins when both are set. |
 | `BUILDS_AGENT_TOKEN` | unset | Credential for build agents, separate from the operator password so a build machine never holds it. Requests bearing it are refused by everything that manages projects or decides what builds — see `requireOperator`. |
-| `BUILDS_NOTIFY_EMAIL` | unset | Recipient of build-completion mail. Unset disables it. |
-| `BUILDS_PUBLIC_URL` | `""` | e.g. `https://fandoster.com/builds`. Only used for the link in that mail — the server never sees its own external URL. |
+| `BUILDS_NOTIFY_EMAIL` | unset | Recipient of build-completion mail. Unset disables email only. |
+| `BUILDS_TELEGRAM_KEY_FILE` | unset | Server-only file containing the dedicated group-routed notification key. Unset disables Telegram delivery. Mount read-only; never store the key in a project, agent config, browser, log or Git. |
+| `BUILDS_TELEGRAM_URL` | `https://notify.fandoster.com` | Notification relay base URL. The key's relay identity must route only to the configured Telegram group; never use a personal-chat fallback. |
+| `BUILDS_PUBLIC_URL` | `""` | e.g. `https://fandoster.com/builds`. Used for notification links — the server never sees its own external URL. |
 | `BUILDS_SMTP_ADDR` | `172.17.0.1:25` | The host's Postfix over the Docker bridge. Override is for tests. |
 
 ## Architecture
@@ -275,6 +277,45 @@ when that build died).
 This feature was lost once already: it was written directly on the server, never
 committed, and the next deploy's `git reset --hard origin/main` erased it silently.
 Nothing warns you about that — if you fix something on the box, commit it.
+
+### Telegram notifications
+
+The project **Telegram notifications** checkbox controls both build results and
+related agent issues for that project. It does not change email. API create defaults
+`telegram_notifications` to `true` when omitted; explicit `false` creates a muted
+project. Partial `PUT` omission preserves the value; explicit `false` mutes and `true`
+unmutes. Existing database projects migrate to enabled; direct Go model creation has
+normal zero-value (`false`) semantics. Preserve this distinction when changing create
+or update decoding. Muting atomically cancels pending, unsent outbox events so a quick
+mute/unmute cannot replay them; stale in-memory work must not revive them.
+Relay-accepted or in-flight requests cannot be recalled by this checkbox. First
+migration marks existing terminal build history observed, without notifying it.
+A missing key or an explicit unconfigured/wrong-scope/title-preserving relay route
+suppresses unsent intents, so connecting the group later does not replay a disabled
+setup backlog. Temporary network/429/5xx failures retain retryable intent for up to
+24 hours instead. Active builds can notify their future result when setup is ready.
+
+Telegram delivery needs server setup as well as the project checkbox. The owner must
+create the group and add the bot. The relay must give the server a dedicated,
+**group-only** routed identity; a missing group must never fall back to a personal
+chat. `BUILDS_TELEGRAM_KEY_FILE` points to its server-only key, and
+`BUILDS_TELEGRAM_URL` defaults to `https://notify.fandoster.com`. Enabling a checkbox
+without a configured key and verified route delivers nothing. Do not expose the key,
+its path, or recipient IDs through project JSON or the UI.
+
+`GET /api/notifications/telegram` returns only `{"configured":true|false}` to an
+operator. The settings page shows the same readiness and setup help. Both surfaces
+refuse agent credentials. Their optional `TelegramConfigured func() bool` callbacks
+must report a verified dedicated group route, not just the existence of a key file;
+nil means unconfigured. Status verifies relay routing configuration, not Telegram
+membership or delivery. Relay acceptance means saved in its queue; only a `sent`
+receipt confirms Telegram accepted the message, not that a person read it.
+
+Telegram has no custom font size: build-result headings use a **bold first line**,
+not unsupported big-font markup. Agent messages begin with 🤖 and use plain text to
+preserve doctor commands and remedies. See
+[docs/telegram-notifications.md](docs/telegram-notifications.md) for local relay CLI
+setup, safe mute behavior and delivery limits.
 
 ### Things that will bite you
 

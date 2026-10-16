@@ -45,17 +45,18 @@ type ExecutorProfile struct {
 }
 
 type Project struct {
-	ID                int64  `json:"id"`
-	Name              string `json:"name"`
-	RepoURL           string `json:"repo_url"`
-	Branch            string `json:"branch"`
-	DockerfilePath    string `json:"dockerfile_path"`
-	ImageName         string `json:"image_name"`
-	DeployComposePath string `json:"deploy_compose_path,omitempty"`
-	DeployServiceName string `json:"deploy_service_name,omitempty"`
-	WebhookSecret     string `json:"webhook_secret,omitempty"`
-	CloneToken        string `json:"clone_token,omitempty"`
-	NoCache           bool   `json:"no_cache"`
+	ID                    int64  `json:"id"`
+	Name                  string `json:"name"`
+	RepoURL               string `json:"repo_url"`
+	Branch                string `json:"branch"`
+	DockerfilePath        string `json:"dockerfile_path"`
+	ImageName             string `json:"image_name"`
+	DeployComposePath     string `json:"deploy_compose_path,omitempty"`
+	DeployServiceName     string `json:"deploy_service_name,omitempty"`
+	WebhookSecret         string `json:"webhook_secret,omitempty"`
+	CloneToken            string `json:"clone_token,omitempty"`
+	NoCache               bool   `json:"no_cache"`
+	TelegramNotifications bool   `json:"telegram_notifications"`
 	// Executor decides who runs this project's builds: ExecutorLocal (the
 	// Docker runner in this process) or the name of a queue an agent serves,
 	// e.g. "mac".

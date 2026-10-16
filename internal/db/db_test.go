@@ -138,6 +138,10 @@ func TestBuildNumbersArePerProjectAndHistoricalRowsAreBackfilled(t *testing.T) {
 	// Simulate a database from before project-local numbers existed. Migration
 	// must number the complete history deterministically, not start new builds
 	// at one while leaving old rows unnamed.
+	// The legacy schema predates notification triggers as well.
+	if _, err := d.conn.Exec(`DROP TRIGGER notification_build_insert; DROP TRIGGER notification_build_update`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := d.conn.Exec(`DROP INDEX idx_builds_project_number`); err != nil {
 		t.Fatal(err)
 	}

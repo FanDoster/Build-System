@@ -136,6 +136,26 @@
   </section>
 
   <section class="settings-card">
+    <h2 class="settings-heading">Notifications</h2>
+    <label class="form-check">
+      <input type="checkbox" name="telegram_notifications" {{if .Project.TelegramNotifications}}checked{{end}}>
+      <span>
+        <span class="form-check-title">Telegram notifications</span>
+        <span class="form-hint">Send build results and related agent issues to the configured Telegram group. Uncheck to mute this project. Email is unchanged.</span>
+      </span>
+    </label>
+    {{if .TelegramConfigured}}
+    <p class="form-hint">Telegram group connected.</p>
+    {{else}}
+    <p class="form-hint">Telegram group not connected. Enabling this option will not deliver messages until setup is complete.</p>
+    {{end}}
+    <details>
+      <summary class="form-hint">Telegram setup</summary>
+      <p class="form-hint">The owner must create a Telegram group and add the notification bot. Configure a dedicated group-only notification identity on the relay, then install its key on the server. There is no personal-chat fallback. Contact the server operator to complete or verify setup.</p>
+    </details>
+  </section>
+
+  <section class="settings-card">
     <h2 class="settings-heading">Deploy</h2>
     <p class="form-hint" style="margin-bottom:12px">Optional. After a successful push, run <span class="mono">docker compose -f &lt;file&gt; up -d &lt;service&gt;</span>. Leave both blank to let Watchtower (or nothing) handle deployment.</p>
     <div class="form-row">

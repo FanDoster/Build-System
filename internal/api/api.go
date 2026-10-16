@@ -34,7 +34,7 @@ const livePingInterval = 25 * time.Second
 // Version identifies the running build-server code. Bump it with any change
 // that ships; /api/health returns it so a self-deploy can be confirmed live
 // (the running container is only as new as the version it reports).
-const Version = "2026-10-15-build-agent-visibility"
+const Version = "2026-10-16-telegram-build-agent-alerts"
 
 // Agent long-poll defaults. The hold is deliberately under the 60s nginx
 // defaults with room to spare: a claim request that outlives proxy_read_timeout
@@ -70,6 +70,10 @@ type Server struct {
 	BasePath string // e.g. "/builds"
 	// Notifier mails the outcome of agent-finished builds. Optional.
 	Notifier Notifier
+	// TelegramConfigured reports whether the dedicated group route is verified.
+	// It must not return true just because a key file exists. Optional: nil is
+	// unconfigured. Neither credentials nor relay recipient details enter the API.
+	TelegramConfigured func() bool
 	// Agents remembers which agents have been in touch. An idle agent writes
 	// nothing to the database, so this is the only record that one exists.
 	// Optional; without it the agents page shows history only.
@@ -103,6 +107,7 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
+	mux.HandleFunc("GET /api/notifications/telegram", s.handleTelegramStatus)
 
 	mux.HandleFunc("GET /api/projects", s.handleListProjects)
 	mux.HandleFunc("POST /api/projects", s.handleCreateProject)
@@ -221,6 +226,8 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		models.Project
 		ExecutorProfiles json.RawMessage `json:"executor_profiles"`
 	}
+	// New projects opt in by default; decoding an explicit false overrides it.
+	input.Project.TelegramNotifications = true
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		writeError(w, 400, "invalid JSON: "+err.Error())
 		return
@@ -310,23 +317,24 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 	// Pointer fields distinguish "not provided" (nil, keep current value)
 	// from "provided as empty" (clear the value where that is allowed).
 	var updates struct {
-		Name              *string         `json:"name"`
-		RepoURL           *string         `json:"repo_url"`
-		Branch            *string         `json:"branch"`
-		DockerfilePath    *string         `json:"dockerfile_path"`
-		ImageName         *string         `json:"image_name"`
-		DeployComposePath *string         `json:"deploy_compose_path"`
-		DeployServiceName *string         `json:"deploy_service_name"`
-		WebhookSecret     *string         `json:"webhook_secret"`
-		CloneToken        *string         `json:"clone_token"`
-		NoCache           *bool           `json:"no_cache"`
-		PollEnabled       *bool           `json:"poll_enabled"`
-		PollIntervalSecs  *int            `json:"poll_interval_secs"`
-		Executor          *string         `json:"executor"`
-		BuildCommand      *string         `json:"build_command"`
-		BuildPath         *string         `json:"build_path"`
-		UploadScript      *string         `json:"upload_script"`
-		ExecutorProfiles  json.RawMessage `json:"executor_profiles"`
+		Name                  *string         `json:"name"`
+		RepoURL               *string         `json:"repo_url"`
+		Branch                *string         `json:"branch"`
+		DockerfilePath        *string         `json:"dockerfile_path"`
+		ImageName             *string         `json:"image_name"`
+		DeployComposePath     *string         `json:"deploy_compose_path"`
+		DeployServiceName     *string         `json:"deploy_service_name"`
+		WebhookSecret         *string         `json:"webhook_secret"`
+		CloneToken            *string         `json:"clone_token"`
+		NoCache               *bool           `json:"no_cache"`
+		PollEnabled           *bool           `json:"poll_enabled"`
+		TelegramNotifications *bool           `json:"telegram_notifications"`
+		PollIntervalSecs      *int            `json:"poll_interval_secs"`
+		Executor              *string         `json:"executor"`
+		BuildCommand          *string         `json:"build_command"`
+		BuildPath             *string         `json:"build_path"`
+		UploadScript          *string         `json:"upload_script"`
+		ExecutorProfiles      json.RawMessage `json:"executor_profiles"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
 		writeError(w, 400, "invalid JSON: "+err.Error())
@@ -386,6 +394,9 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	if updates.PollEnabled != nil {
 		existing.PollEnabled = *updates.PollEnabled
+	}
+	if updates.TelegramNotifications != nil {
+		existing.TelegramNotifications = *updates.TelegramNotifications
 	}
 	if updates.PollIntervalSecs != nil {
 		existing.PollIntervalSecs = *updates.PollIntervalSecs

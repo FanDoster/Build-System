@@ -17,6 +17,7 @@ import (
 	"github.com/FanDoster/Build-System/internal/live"
 	"github.com/FanDoster/Build-System/internal/logbus"
 	"github.com/FanDoster/Build-System/internal/models"
+	"github.com/FanDoster/Build-System/internal/notifications"
 	"github.com/FanDoster/Build-System/internal/poller"
 	"github.com/FanDoster/Build-System/internal/runner"
 	"github.com/FanDoster/Build-System/internal/web"
@@ -33,6 +34,8 @@ func main() {
 		log.Fatalf("Failed to open database: %v", err)
 	}
 	defer database.Close()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	log.Printf("Database opened: %s", dbPath)
 
 	// Build job queue (buffered channel)
@@ -86,12 +89,24 @@ func main() {
 	// than the worker's finish(), so the mail hook has to be reachable from
 	// there too.
 	registry := agents.NewRegistry()
-	apiServer := &api.Server{DB: database, BuildCh: buildCh, Bus: bus, Runner: r, Live: liveHub, BasePath: basePath, Notifier: r, Agents: registry}
+	telegram, notifyErr := notifications.FromEnv(database, registry)
+	var notificationsDone chan struct{}
+	if notifyErr != nil {
+		_ = database.SetTelegramCapture(false)
+		// A configuration problem disables Telegram, never CI or old email.
+		log.Printf("Telegram notifications disabled: %v", notifyErr)
+	} else {
+		notificationsDone = make(chan struct{})
+		go func() { defer close(notificationsDone); telegram.Run(ctx) }()
+	}
+
+	apiServer := &api.Server{DB: database, BuildCh: buildCh, Bus: bus, Runner: r, Live: liveHub, BasePath: basePath, Notifier: r, Agents: registry, TelegramConfigured: telegram.Configured}
 	apiServer.RegisterRoutes(mux)
 
 	// Web UI
 	webHandler := web.New(database, basePath)
 	webHandler.Agents = registry
+	webHandler.TelegramConfigured = telegram.Configured
 	webHandler.RegisterRoutes(mux)
 
 	// Authentication: everything behind a password when one is configured.
@@ -117,9 +132,6 @@ func main() {
 
 	// Shut down cleanly on SIGINT/SIGTERM so in-flight builds are not left
 	// stuck in "running".
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	go func() {
 		<-ctx.Done()
 		log.Println("Shutting down...")
@@ -141,6 +153,9 @@ func main() {
 	// Cancel any in-flight build. It is handed back to the queue (not failed)
 	// and resumes after the restart; see Runner.runBuild's shutdown branch.
 	r.Stop()
+	if notificationsDone != nil {
+		<-notificationsDone
+	}
 	log.Println("Shutdown complete")
 }
 

@@ -60,6 +60,9 @@ type Handler struct {
 	// Agents is the in-memory record of which agents have been in touch.
 	// Optional; the agents page 503s without it.
 	Agents *agents.Registry
+	// TelegramConfigured reports a verified dedicated group route, not merely
+	// a configured key file. Optional: nil means not connected.
+	TelegramConfigured func() bool
 }
 
 func New(database *db.DB, basePath string) *Handler {
@@ -177,6 +180,10 @@ func (h *Handler) handleProject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
+	if auth.IsAgent(r.Context()) {
+		http.Error(w, "agent credentials cannot manage project settings", 403)
+		return
+	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		http.Error(w, "invalid id", 400)
@@ -222,6 +229,7 @@ func (h *Handler) handleProjectSettings(w http.ResponseWriter, r *http.Request) 
 		"HasCloneToken":       hasCloneToken,
 		"MinPollIntervalSecs": models.MinPollIntervalSecs,
 		"Queues":              queues,
+		"TelegramConfigured":  h.TelegramConfigured != nil && h.TelegramConfigured(),
 	})
 }
 

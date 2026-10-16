@@ -381,6 +381,10 @@ func TestBuildLogLenCountsBytesNotCharacters(t *testing.T) {
 // A DB created before the agent columns existed must migrate in place.
 func TestMigrationAddsAgentColumns(t *testing.T) {
 	d := openTestDB(t)
+	// A pre-agent schema has no terminal-observation triggers.
+	if _, err := d.conn.Exec(`DROP TRIGGER notification_build_insert; DROP TRIGGER notification_build_update`); err != nil {
+		t.Fatal(err)
+	}
 	for _, col := range []struct{ table, name string }{
 		{"projects", "executor"},
 		{"builds", "agent"},

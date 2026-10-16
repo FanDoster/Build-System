@@ -63,6 +63,7 @@ func (d *DB) migrate() error {
 			webhook_secret TEXT NOT NULL DEFAULT '',
 			clone_token TEXT NOT NULL DEFAULT '',
 			no_cache INTEGER NOT NULL DEFAULT 0,
+			telegram_notifications INTEGER NOT NULL DEFAULT 1,
 			poll_enabled INTEGER NOT NULL DEFAULT 0,
 			poll_interval_secs INTEGER NOT NULL DEFAULT 60,
 			last_polled_sha TEXT NOT NULL DEFAULT '',
@@ -126,6 +127,7 @@ func (d *DB) migrate() error {
 	// columns must be added explicitly and idempotently.
 	for _, c := range []struct{ table, column, decl string }{
 		{"projects", "no_cache", "INTEGER NOT NULL DEFAULT 0"},
+		{"projects", "telegram_notifications", "INTEGER NOT NULL DEFAULT 1"},
 		{"projects", "poll_enabled", "INTEGER NOT NULL DEFAULT 0"},
 		{"projects", "poll_interval_secs", "INTEGER NOT NULL DEFAULT 60"},
 		{"projects", "last_polled_sha", "TEXT NOT NULL DEFAULT ''"},
@@ -168,7 +170,10 @@ func (d *DB) migrate() error {
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_builds_project_number
 		ON builds(project_id, project_build_number);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	return d.migrateNotifications()
 }
 
 // addColumnIfMissing runs ALTER TABLE ADD COLUMN only when the column is
@@ -220,7 +225,7 @@ func (d *DB) SetSetting(key, value string) error {
 // projectCols is the full read column list, kept in one place so the several
 // project SELECTs and scanProject can never drift apart.
 const projectCols = `id, name, repo_url, branch, dockerfile_path, image_name,
-	deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache,
+	deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache, telegram_notifications,
 	poll_enabled, poll_interval_secs, last_polled_sha, last_polled_at, last_poll_error,
 	executor, build_command, build_path, upload_script, executor_profiles, created_at, updated_at`
 
@@ -231,7 +236,7 @@ func scanProject(s scanner) (*models.Project, error) {
 	p := &models.Project{}
 	var profiles string
 	err := s.Scan(&p.ID, &p.Name, &p.RepoURL, &p.Branch, &p.DockerfilePath, &p.ImageName,
-		&p.DeployComposePath, &p.DeployServiceName, &p.WebhookSecret, &p.CloneToken, &p.NoCache,
+		&p.DeployComposePath, &p.DeployServiceName, &p.WebhookSecret, &p.CloneToken, &p.NoCache, &p.TelegramNotifications,
 		&p.PollEnabled, &p.PollIntervalSecs, &p.LastPolledSHA, &p.LastPolledAt, &p.LastPollError,
 		&p.Executor, &p.BuildCommand, &p.BuildPath, &p.UploadScript, &profiles,
 		&p.CreatedAt, &p.UpdatedAt)
@@ -267,10 +272,10 @@ func (d *DB) CreateProject(p *models.Project) error {
 		p.Executor = models.ExecutorLocal
 	}
 	res, err := d.conn.Exec(
-		`INSERT INTO projects (name, repo_url, branch, dockerfile_path, image_name, deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache, poll_enabled, poll_interval_secs, executor, build_command, build_path, upload_script, executor_profiles, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO projects (name, repo_url, branch, dockerfile_path, image_name, deploy_compose_path, deploy_service_name, webhook_secret, clone_token, no_cache, telegram_notifications, poll_enabled, poll_interval_secs, executor, build_command, build_path, upload_script, executor_profiles, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.Name, p.RepoURL, p.Branch, p.DockerfilePath, p.ImageName,
-		p.DeployComposePath, p.DeployServiceName, p.WebhookSecret, p.CloneToken, p.NoCache,
+		p.DeployComposePath, p.DeployServiceName, p.WebhookSecret, p.CloneToken, p.NoCache, p.TelegramNotifications,
 		p.PollEnabled, p.PollIntervalSecs, p.Executor,
 		p.BuildCommand, p.BuildPath, p.UploadScript, profiles,
 		p.CreatedAt, p.UpdatedAt,
@@ -327,11 +332,11 @@ func (d *DB) UpdateProject(p *models.Project) error {
 	}
 	_, err = d.conn.Exec(
 		`UPDATE projects SET name=?, repo_url=?, branch=?, dockerfile_path=?, image_name=?,
-		 deploy_compose_path=?, deploy_service_name=?, webhook_secret=?, clone_token=?, no_cache=?,
+		 deploy_compose_path=?, deploy_service_name=?, webhook_secret=?, clone_token=?, no_cache=?, telegram_notifications=?,
 		 poll_enabled=?, poll_interval_secs=?, executor=?, build_command=?, build_path=?, upload_script=?, executor_profiles=?, updated_at=?
 		 WHERE id=?`,
 		p.Name, p.RepoURL, p.Branch, p.DockerfilePath, p.ImageName,
-		p.DeployComposePath, p.DeployServiceName, p.WebhookSecret, p.CloneToken, p.NoCache,
+		p.DeployComposePath, p.DeployServiceName, p.WebhookSecret, p.CloneToken, p.NoCache, p.TelegramNotifications,
 		p.PollEnabled, p.PollIntervalSecs, p.Executor,
 		p.BuildCommand, p.BuildPath, p.UploadScript, profiles,
 		p.UpdatedAt, p.ID,

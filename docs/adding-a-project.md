@@ -81,7 +81,7 @@ Existing histories are numbered from oldest to newest during the database migrat
 
 ## Step 1: create the project
 
-Easiest by hand: the web UI, then fill in the rest under **Settings**.
+Create the project through the API, then fill in the rest under **Settings** in the web UI.
 
 From a script, write the payload to a file rather than fighting three levels of shell
 quoting — this form is verified working:
@@ -120,6 +120,7 @@ their current value, so you can send just the one you're changing.
 | `build_command` | `""` | Public static Unity method sent to a remote agent. Ignored by the local runner. |
 | `build_path` | `""` | Player output directory passed to the Unity method. Relative paths start at the checkout. |
 | `upload_script` | `""` | Executable repository-relative post-build script. Empty means build without uploading. |
+| `telegram_notifications` | `true` | Send build results and related agent issues to the configured Telegram group. Explicit `false` mutes this project; email is unchanged. Requires server setup below. |
 | `poll_enabled` | `false` | Git polling as an alternative to webhooks. |
 | `poll_interval_secs` | `60` | Floored at **30**; anything lower is rejected with a 400. |
 
@@ -467,7 +468,7 @@ Two settings in `/opt/docker/builds/docker-compose.yml` control it:
 
 | Variable | Effect |
 | --- | --- |
-| `BUILDS_NOTIFY_EMAIL` | Recipient. **Unset or empty disables all notifications.** |
+| `BUILDS_NOTIFY_EMAIL` | Recipient. **Unset or empty disables email only.** |
 | `BUILDS_PUBLIC_URL` | Base URL for the `View:` link, e.g. `https://fandoster.com/builds`. Unset just omits the line — the server has no way to know its own external address. |
 
 Two failure modes worth recognising, because neither is visible from the build itself
@@ -488,6 +489,30 @@ Two failure modes worth recognising, because neither is visible from the build i
 
 ---
 
+## Telegram notifications
+
+**Settings → Notifications → Telegram notifications** controls build results and
+related agent issues for that project. Uncheck and save to mute; check and save to
+unmute. Email is unchanged. API creation defaults the setting to `true`; explicit
+`false` starts muted. Later `PUT` requests preserve it when omitted. Muting atomically
+cancels unsent pending outbox events; unmuting does not replay them. Relay-accepted or
+in-flight messages cannot be recalled through this checkbox. Stale in-memory work
+cannot revive canceled events. Initial migration does not notify pre-existing terminal
+build history. A missing key or an explicit disabled/wrong-scope/title-preserving route
+suppresses unsent intents; initial connection does not replay that backlog. Temporary
+network/429/5xx failures retain retryable intent for up to 24 hours.
+
+Delivery also needs a server-only `BUILDS_TELEGRAM_KEY_FILE` and a verified dedicated
+group route on `BUILDS_TELEGRAM_URL` (default `https://notify.fandoster.com`). The owner
+must create the group and add the bot. The relay identity is group-only, never a
+personal-chat fallback. Enabling the checkbox without setup does not deliver messages.
+Project settings shows readiness and setup help; no key, key path or recipient ID is
+shown. Relay acceptance means queued, not yet accepted by Telegram; a `sent` receipt
+confirms Telegram acceptance, not a human read. [Telegram setup](telegram-notifications.md)
+covers local relay commands, readiness and the full operator procedure.
+
+---
+
 ## API cheat sheet
 
 All paths are relative to `https://fandoster.com/builds` (or `http://127.0.0.1:8080`
@@ -496,6 +521,7 @@ inside the container). `†` = requires `X-Builds-Csrf: 1`.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/health` | Version + liveness. No auth. |
+| `GET` | `/api/notifications/telegram` | Operator-only group-route readiness boolean. No secrets or recipient details. |
 | `GET` | `/api/projects` | List projects (secrets stripped). |
 | `POST` | `/api/projects` † | Create a project. |
 | `GET` | `/api/projects/{id}` | One project. |

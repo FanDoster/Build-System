@@ -18,7 +18,7 @@ FROM alpine:3.20
 # on 2026-07-30; this is the quiet one.
 RUN apk add --no-cache git git-lfs openssh-client docker-cli docker-cli-compose ca-certificates curl \
  && git lfs install --system \
- && mkdir -p /run/builds-ssh \
+ && mkdir -p /run/builds-ssh /run/builds-notify \
  && addgroup -S -g 10001 builds \
  && adduser -S -D -H -u 10001 -G builds -h /tmp -s /sbin/nologin builds
 
