@@ -1,0 +1,7 @@
+# Specific rules MUST override the repository-root ignore rules.
+**
+!go.mod
+!tests/
+!tests/broker-probe/
+!tests/broker-probe/**
+tests/broker-probe/fixtures/ignored.marker
